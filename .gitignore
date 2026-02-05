@@ -1,0 +1,16 @@
+dataset/
+model/
+
+# Python编译文件
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 包分发
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+.eggs/
+
