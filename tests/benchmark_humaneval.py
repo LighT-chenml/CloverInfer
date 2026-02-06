@@ -39,11 +39,12 @@ def main():
 
     # Setup for OPT-125M (Code generation might be poor but we are testing pipeline)
     cluster_conf = ClusterConfig(
-        num_prefill_workers=1,
-        num_decode_nodes=1 
+        num_prefill_workers=1
+        # num_decode_layers is default 2, unused by current hardcoded scheduler
     )
     model_conf = ModelConfig(
-        model_name=model_path,
+        model_name="opt-125m",
+        model_path=model_path,
         max_seq_len=2048,
         dtype="float16"
     )

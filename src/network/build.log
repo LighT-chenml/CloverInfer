@@ -1,0 +1,182 @@
+running build_ext
+building 'clover_net' extension
+[1/1] g++-9 -MMD -MF /home/cml/CloverInfer/src/network/build/temp.linux-x86_64-cpython-310/csrc/clover_transport.o.d -Wno-unused-result -Wsign-compare -DNDEBUG -fwrapv -O2 -Wall -fPIC -O2 -isystem /home/cml/anaconda3/envs/clover_infer/include -fPIC -O2 -isystem /home/cml/anaconda3/envs/clover_infer/include -fPIC -I/home/cml/.local/lib/python3.10/site-packages/torch/include -I/home/cml/.local/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/home/cml/anaconda3/envs/clover_infer/include/python3.10 -c -c /home/cml/CloverInfer/src/network/csrc/clover_transport.cpp -o /home/cml/CloverInfer/src/network/build/temp.linux-x86_64-cpython-310/csrc/clover_transport.o -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=clover_net -std=c++17
+FAILED: [code=1] /home/cml/CloverInfer/src/network/build/temp.linux-x86_64-cpython-310/csrc/clover_transport.o 
+g++-9 -MMD -MF /home/cml/CloverInfer/src/network/build/temp.linux-x86_64-cpython-310/csrc/clover_transport.o.d -Wno-unused-result -Wsign-compare -DNDEBUG -fwrapv -O2 -Wall -fPIC -O2 -isystem /home/cml/anaconda3/envs/clover_infer/include -fPIC -O2 -isystem /home/cml/anaconda3/envs/clover_infer/include -fPIC -I/home/cml/.local/lib/python3.10/site-packages/torch/include -I/home/cml/.local/lib/python3.10/site-packages/torch/include/torch/csrc/api/include -I/home/cml/anaconda3/envs/clover_infer/include/python3.10 -c -c /home/cml/CloverInfer/src/network/csrc/clover_transport.cpp -o /home/cml/CloverInfer/src/network/build/temp.linux-x86_64-cpython-310/csrc/clover_transport.o -DTORCH_API_INCLUDE_EXTENSION_H -DTORCH_EXTENSION_NAME=clover_net -std=c++17
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:20:36: error: ISO C++ forbids declaration of ‘RDMAEndpoint’ with no type [-fpermissive]
+   20 |     RDMAEndpoint(RDMAContext* r_ctx) : r_ctx(r_ctx) {
+      |                                    ^
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:47:5: error: ‘ConnectionInfo’ does not name a type
+   47 |     ConnectionInfo get_info() {
+      |     ^~~~~~~~~~~~~~
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp: In member function ‘int RDMAContext::RDMAEndpoint(RDMAContext*)’:
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:20:40: error: only constructors take member initializers
+   20 |     RDMAEndpoint(RDMAContext* r_ctx) : r_ctx(r_ctx) {
+      |                                        ^~~~~
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:20:40: error: class ‘RDMAContext’ does not have any field named ‘r_ctx’
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:21:9: error: ‘cq’ was not declared in this scope
+   21 |         cq = ibv_create_cq(r_ctx->ctx, 128, nullptr, nullptr, 0);
+      |         ^~
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:21:35: error: ‘class RDMAContext’ has no member named ‘ctx’
+   21 |         cq = ibv_create_cq(r_ctx->ctx, 128, nullptr, nullptr, 0);
+      |                                   ^~~
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:33:9: error: ‘qp’ was not declared in this scope
+   33 |         qp = ibv_create_qp(r_ctx->pd, &attr);
+      |         ^~
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:33:35: error: ‘class RDMAContext’ has no member named ‘pd’
+   33 |         qp = ibv_create_qp(r_ctx->pd, &attr);
+      |                                   ^~
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp: In member function ‘void RDMAContext::connect(uint32_t, uint16_t)’:
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:69:35: error: ‘qp’ was not declared in this scope
+   69 |         CHECK_VERBS(ibv_modify_qp(qp, &attr,
+      |                                   ^~
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:10:16: note: in definition of macro ‘CHECK_VERBS’
+   10 |     int ret = (stmt); \
+      |                ^~~~
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:81:35: error: ‘qp’ was not declared in this scope
+   81 |         CHECK_VERBS(ibv_modify_qp(qp, &attr,
+      |                                   ^~
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:10:16: note: in definition of macro ‘CHECK_VERBS’
+   10 |     int ret = (stmt); \
+      |                ^~~~
+In file included from /home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:2:
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp: In member function ‘int64_t RDMAContext::register_mr(at::Tensor)’:
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:94:41: error: ‘r_ctx’ was not declared in this scope
+   94 |          struct ibv_mr* mr = ibv_reg_mr(r_ctx->pd, ptr, size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+      |                                         ^~~~~
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp: In member function ‘void RDMAContext::post_send(int64_t, at::Tensor)’:
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:114:35: error: ‘qp’ was not declared in this scope
+  114 |         CHECK_VERBS(ibv_post_send(qp, &wr, &bad_wr));
+      |                                   ^~
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:10:16: note: in definition of macro ‘CHECK_VERBS’
+   10 |     int ret = (stmt); \
+      |                ^~~~
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp: In member function ‘void RDMAContext::post_recv(int64_t, at::Tensor)’:
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:130:35: error: ‘qp’ was not declared in this scope
+  130 |         CHECK_VERBS(ibv_post_recv(qp, &wr, &bad_wr));
+      |                                   ^~
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:10:16: note: in definition of macro ‘CHECK_VERBS’
+   10 |     int ret = (stmt); \
+      |                ^~~~
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp: In member function ‘void RDMAContext::poll()’:
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:136:27: error: ‘cq’ was not declared in this scope
+  136 |         while(ibv_poll_cq(cq, 1, &wc) == 0) {
+      |                           ^~
+In file included from /home/cml/.local/lib/python3.10/site-packages/torch/include/torch/csrc/Exceptions.h:12,
+                 from /home/cml/.local/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h:11,
+                 from /home/cml/.local/lib/python3.10/site-packages/torch/include/torch/extension.h:9,
+                 from /home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:1:
+/home/cml/.local/lib/python3.10/site-packages/torch/include/pybind11/pybind11.h: In instantiation of ‘class pybind11::class_<RDMAContext>’:
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:148:45:   required from here
+/home/cml/.local/lib/python3.10/site-packages/torch/include/pybind11/pybind11.h:2041:7: warning: ‘pybind11::class_<RDMAContext>’ declared with greater visibility than its base ‘pybind11::detail::generic_type’ [-Wattributes]
+ 2041 | class class_ : public detail::generic_type {
+      |       ^~~~~~
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp: In function ‘void pybind11_init_clover_net(pybind11::module_&)’:
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:151:16: error: ‘RDMAEndpoint’ was not declared in this scope
+  151 |     py::class_<RDMAEndpoint>(m, "RDMAEndpoint")
+      |                ^~~~~~~~~~~~
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:151:28: error: template argument 1 is invalid
+  151 |     py::class_<RDMAEndpoint>(m, "RDMAEndpoint")
+      |                            ^
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:153:29: error: ‘RDMAEndpoint’ is not a type
+  153 |         .def("get_info", [](RDMAEndpoint& self) {
+      |                             ^~~~~~~~~~~~
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp: In lambda function:
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:154:30: error: request for member ‘get_info’ in ‘self’, which is of non-class type ‘int’
+  154 |             auto info = self.get_info();
+      |                              ^~~~~~~~
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp: In function ‘void pybind11_init_clover_net(pybind11::module_&)’:
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:157:26: error: ‘RDMAEndpoint’ is not a class, namespace, or enumeration
+  157 |         .def("connect", &RDMAEndpoint::connect)
+      |                          ^~~~~~~~~~~~
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:158:30: error: ‘RDMAEndpoint’ is not a class, namespace, or enumeration
+  158 |         .def("register_mr", &RDMAEndpoint::register_mr)
+      |                              ^~~~~~~~~~~~
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:159:28: error: ‘RDMAEndpoint’ is not a class, namespace, or enumeration
+  159 |         .def("post_send", &RDMAEndpoint::post_send)
+      |                            ^~~~~~~~~~~~
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:160:28: error: ‘RDMAEndpoint’ is not a class, namespace, or enumeration
+  160 |         .def("post_recv", &RDMAEndpoint::post_recv)
+      |                            ^~~~~~~~~~~~
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:161:23: error: ‘RDMAEndpoint’ is not a class, namespace, or enumeration
+  161 |         .def("poll", &RDMAEndpoint::poll);
+      |                       ^~~~~~~~~~~~
+In file included from /home/cml/.local/lib/python3.10/site-packages/torch/include/torch/csrc/Exceptions.h:12,
+                 from /home/cml/.local/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h:11,
+                 from /home/cml/.local/lib/python3.10/site-packages/torch/include/torch/extension.h:9,
+                 from /home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:1:
+/home/cml/.local/lib/python3.10/site-packages/torch/include/pybind11/pybind11.h: In instantiation of ‘pybind11::class_< <template-parameter-1-1>, <template-parameter-1-2> >::class_(pybind11::handle, const char*, const Extra& ...) [with Extra = {}; type_ = RDMAContext; options = {}]’:
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:148:45:   required from here
+/home/cml/.local/lib/python3.10/site-packages/torch/include/pybind11/pybind11.h:2139:28: warning: ‘pybind11::class_< <template-parameter-1-1>, <template-parameter-1-2> >::class_(pybind11::handle, const char*, const Extra& ...) [with Extra = {}; type_ = RDMAContext; options = {}]::<lambda(pybind11::detail::internals&)>’ declared with greater visibility than the type of its field ‘pybind11::class_< <template-parameter-1-1>, <template-parameter-1-2> >::class_(pybind11::handle, const char*, const Extra& ...) [with Extra = {}; type_ = RDMAContext; options = {}]::<lambda(pybind11::detail::internals&)>::<record capture>’ [-Wattributes]
+ 2139 |             with_internals([&](internals &internals) {
+      |                            ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 2140 |                 auto &instances = record.module_local ? get_local_internals().registered_types_cpp
+      |                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 2141 |                                                       : internals.registered_types_cpp;
+      |                                                       ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 2142 |                 instances[std::type_index(typeid(type_alias))]
+      |                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 2143 |                     = instances[std::type_index(typeid(type))];
+      |                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 2144 |             });
+      |             ~               
+In file included from /home/cml/.local/lib/python3.10/site-packages/torch/include/pybind11/pybind11.h:16,
+                 from /home/cml/.local/lib/python3.10/site-packages/torch/include/torch/csrc/Exceptions.h:12,
+                 from /home/cml/.local/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/python.h:11,
+                 from /home/cml/.local/lib/python3.10/site-packages/torch/include/torch/extension.h:9,
+                 from /home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:1:
+/home/cml/.local/lib/python3.10/site-packages/torch/include/pybind11/detail/init.h: In instantiation of ‘Class* pybind11::detail::initimpl::construct_or_initialize(Args&& ...) [with Class = RDMAContext; Args = {const std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >&}; typename std::enable_if<(! std::is_constructible<_Tp, _Args>::value), int>::type <anonymous> = 0]’:
+/home/cml/.local/lib/python3.10/site-packages/torch/include/pybind11/detail/init.h:301:70:   required from ‘static void pybind11::detail::initimpl::constructor<Args>::execute(Class&, const Extra& ...) [with Class = pybind11::class_<RDMAContext>; Extra = {}; typename std::enable_if<(! Class::has_alias), int>::type <anonymous> = 0; Args = {const std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >&}]’
+/home/cml/.local/lib/python3.10/site-packages/torch/include/pybind11/pybind11.h:2199:9:   required from ‘pybind11::class_< <template-parameter-1-1>, <template-parameter-1-2> >& pybind11::class_< <template-parameter-1-1>, <template-parameter-1-2> >::def(const pybind11::detail::initimpl::constructor<Args ...>&, const Extra& ...) [with Args = {const std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >&}; Extra = {}; type_ = RDMAContext; options = {}]’
+/home/cml/CloverInfer/src/network/csrc/clover_transport.cpp:149:44:   required from here
+/home/cml/.local/lib/python3.10/site-packages/torch/include/pybind11/detail/init.h:83:12: error: could not convert ‘{std::forward<const std::__cxx11::basic_string<char>&>((* & args#0))}’ from ‘<brace-enclosed initializer list>’ to ‘RDMAContext’
+   83 |     return new Class{std::forward<Args>(args)...};
+      |            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+      |            |
+      |            <brace-enclosed initializer list>
+ninja: build stopped: subcommand failed.
+Traceback (most recent call last):
+  File "/home/cml/.local/lib/python3.10/site-packages/torch/utils/cpp_extension.py", line 2597, in _run_ninja_build
+    subprocess.run(
+  File "/home/cml/anaconda3/envs/clover_infer/lib/python3.10/subprocess.py", line 526, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['ninja', '-v']' returned non-zero exit status 1.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/cml/CloverInfer/src/network/setup.py", line 4, in <module>
+    setup(
+  File "/home/cml/anaconda3/envs/clover_infer/lib/python3.10/site-packages/setuptools/__init__.py", line 117, in setup
+    return distutils.core.setup(**attrs)  # type: ignore[return-value]
+  File "/home/cml/anaconda3/envs/clover_infer/lib/python3.10/site-packages/setuptools/_distutils/core.py", line 186, in setup
+    return run_commands(dist)
+  File "/home/cml/anaconda3/envs/clover_infer/lib/python3.10/site-packages/setuptools/_distutils/core.py", line 202, in run_commands
+    dist.run_commands()
+  File "/home/cml/anaconda3/envs/clover_infer/lib/python3.10/site-packages/setuptools/_distutils/dist.py", line 1002, in run_commands
+    self.run_command(cmd)
+  File "/home/cml/anaconda3/envs/clover_infer/lib/python3.10/site-packages/setuptools/dist.py", line 1107, in run_command
+    super().run_command(command)
+  File "/home/cml/anaconda3/envs/clover_infer/lib/python3.10/site-packages/setuptools/_distutils/dist.py", line 1021, in run_command
+    cmd_obj.run()
+  File "/home/cml/anaconda3/envs/clover_infer/lib/python3.10/site-packages/setuptools/command/build_ext.py", line 97, in run
+    _build_ext.run(self)
+  File "/home/cml/anaconda3/envs/clover_infer/lib/python3.10/site-packages/setuptools/_distutils/command/build_ext.py", line 368, in run
+    self.build_extensions()
+  File "/home/cml/.local/lib/python3.10/site-packages/torch/utils/cpp_extension.py", line 1082, in build_extensions
+    build_ext.build_extensions(self)
+  File "/home/cml/anaconda3/envs/clover_infer/lib/python3.10/site-packages/setuptools/_distutils/command/build_ext.py", line 484, in build_extensions
+    self._build_extensions_serial()
+  File "/home/cml/anaconda3/envs/clover_infer/lib/python3.10/site-packages/setuptools/_distutils/command/build_ext.py", line 510, in _build_extensions_serial
+    self.build_extension(ext)
+  File "/home/cml/anaconda3/envs/clover_infer/lib/python3.10/site-packages/setuptools/command/build_ext.py", line 262, in build_extension
+    _build_ext.build_extension(self, ext)
+  File "/home/cml/anaconda3/envs/clover_infer/lib/python3.10/site-packages/setuptools/_distutils/command/build_ext.py", line 565, in build_extension
+    objects = self.compiler.compile(
+  File "/home/cml/.local/lib/python3.10/site-packages/torch/utils/cpp_extension.py", line 866, in unix_wrap_ninja_compile
+    _write_ninja_file_and_compile_objects(
+  File "/home/cml/.local/lib/python3.10/site-packages/torch/utils/cpp_extension.py", line 2223, in _write_ninja_file_and_compile_objects
+    _run_ninja_build(
+  File "/home/cml/.local/lib/python3.10/site-packages/torch/utils/cpp_extension.py", line 2614, in _run_ninja_build
+    raise RuntimeError(message) from e
+RuntimeError: Error compiling objects for extension

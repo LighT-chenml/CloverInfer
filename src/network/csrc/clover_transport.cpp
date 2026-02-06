@@ -5,8 +5,11 @@
 #include <stdexcept>
 
 // Minimal Error Checking Macro
+// Minimal Error Checking Macro
 #define CHECK_VERBS(stmt) do { \
-    if ((stmt) < 0) { \
+    int ret = (stmt); \
+    if (ret != 0) { \
+        std::cerr << "Verbs Error: " << ret << std::endl; \
         throw std::runtime_error("Verbs Error"); \
     } \
 } while(0)
@@ -55,14 +58,14 @@ public:
     };
 
     RDMAEndpoint(RDMAContext* r_ctx) : r_ctx(r_ctx) {
-        cq = ibv_create_cq(r_ctx->ctx, 10, nullptr, nullptr, 0); 
+        cq = ibv_create_cq(r_ctx->ctx, 128, nullptr, nullptr, 0); 
         if (!cq) throw std::runtime_error("Failed to create CQ");
 
         struct ibv_qp_init_attr attr = {};
         attr.send_cq = cq;
         attr.recv_cq = cq;
-        attr.cap.max_send_wr = 10;
-        attr.cap.max_recv_wr = 10;
+        attr.cap.max_send_wr = 128;
+        attr.cap.max_recv_wr = 128;
         attr.cap.max_send_sge = 1;
         attr.cap.max_recv_sge = 1;
         attr.qp_type = IBV_QPT_RC;

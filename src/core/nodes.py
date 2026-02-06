@@ -31,7 +31,8 @@ class AttnNode:
         self.node_id = node_id
         self.config = config
         self.rdma_ctx = None
-        self.endpoint = None
+        self.endpoints = {} # local_qpn -> Endpoint
+        self.peers = {} # remote_qpn -> Endpoint (connected to that peer)
         self.kv_managers = []
         self.pending_rdma = {}
         
@@ -59,7 +60,6 @@ class AttnNode:
         
     def init_infra(self):
         # 1. KV Manager
-        # One per layer (memory intensive but simple for V1)
         self.kv_managers = []
         for _ in range(self.config.num_layers):
             mgr = KVCacheManager(
@@ -72,24 +72,32 @@ class AttnNode:
             )
             self.kv_managers.append(mgr)
         
-        # 2. RDMA
-        device_name = "mlx5_0" # Hardcoded for V100 Env
+        # 2. RDMA Context Only
+        device_name = "mlx5_0" 
         if clover_net:
             try:
                 self.rdma_ctx = clover_net.RDMAContext(device_name)
-                self.endpoint = clover_net.RDMAEndpoint(self.rdma_ctx)
-                print(f"AttnNode {self.node_id} RDMA initialized.")
-                info = self.endpoint.get_info()
-                return info # (qpn, lid)
+                print(f"AttnNode {self.node_id} RDMA Context initialized.")
+                return True
             except Exception as e:
                 print(f"RDMA Init failed: {e}")
-                return None
-        return None
+                return False
+        return False
 
-    def connect_peer(self, qpn, lid):
-        if self.endpoint:
-            self.endpoint.connect(qpn, lid)
-            print(f"AttnNode {self.node_id} connected to peer QPN {qpn}")
+    def create_endpoint(self):
+        if not self.rdma_ctx: return None
+        ep = clover_net.RDMAEndpoint(self.rdma_ctx)
+        info = ep.get_info()
+        self.endpoints[info[0]] = ep
+        return info # (qpn, lid)
+
+    def connect_endpoint(self, local_qpn, remote_qpn, remote_lid):
+        if local_qpn in self.endpoints:
+            self.endpoints[local_qpn].connect(remote_qpn, remote_lid)
+            self.peers[remote_qpn] = self.endpoints[local_qpn]
+            print(f"AttnNode {self.node_id} connected local QP {local_qpn} to peer {remote_qpn}")
+            return True
+        return False
             
     def allocate_request(self, request_id: str, seq_len: int):
         print(f"Allocating KV for {request_id} len {seq_len}")
@@ -121,20 +129,16 @@ class AttnNode:
         Step 1: Allocate buffers and Post Recvs.
         Must be called BEFORE sender sends.
         """
-        if not self.endpoint:
-            print("RDMA Endpoint not initialized.")
-            return False
-            
-        print(f"AttnNode connecting to Source QPN {src_qpn}...")
-        self.endpoint.connect(src_qpn, src_lid)
+        if src_qpn not in self.peers:
+             print(f"No connection to peer QPN {src_qpn}")
+             return False
+             
+        kv_endpoint = self.peers[src_qpn]
         
         # 1. Allocate KV Slots
         self.allocate_request(request_id, seq_len)
         
         # 2. Allocate Temp Contiguous Buffers (CPU)
-        # Match PrefillWorker: [Seq, Heads, Dim]
-        # We need config to know Head/Dim? 
-        # self.config has it.
         num_heads = self.config.num_heads
         head_dim = self.config.hidden_size // self.config.num_heads
         
@@ -149,21 +153,21 @@ class AttnNode:
                 v_buf = torch.zeros((seq_len, num_heads, head_dim), dtype=torch.float16)
                 
                 # Register & Post Recv
-                mr_k = self.endpoint.register_mr(k_buf)
-                self.endpoint.post_recv(mr_k, k_buf)
+                mr_k = kv_endpoint.register_mr(k_buf)
+                kv_endpoint.post_recv(mr_k, k_buf)
                 mrs.append(mr_k)
                 
-                mr_v = self.endpoint.register_mr(v_buf)
-                self.endpoint.post_recv(mr_v, v_buf)
+                mr_v = kv_endpoint.register_mr(v_buf)
+                kv_endpoint.post_recv(mr_v, v_buf)
                 mrs.append(mr_v)
                 
                 tmp_k_list.append(k_buf)
                 tmp_v_list.append(v_buf)
                 
-            # Store pending state
+            # Store pending state AND the endpoint
             if not hasattr(self, 'pending_rdma'): self.pending_rdma = {}
-            self.pending_rdma[request_id] = (tmp_k_list, tmp_v_list, mrs)
-            print(f"AttnNode Posted Recvs for {len(tmp_k_list)} layers.")
+            self.pending_rdma[request_id] = (tmp_k_list, tmp_v_list, mrs, kv_endpoint)
+            print(f"AttnNode Posted Recvs for req {request_id}")
             return True
             
         except Exception as e:
@@ -180,15 +184,15 @@ class AttnNode:
             print(f"No pending RDMA for {request_id}")
             return False
             
-        tmp_k_list, tmp_v_list, mrs = self.pending_rdma[request_id]
+        tmp_k_list, tmp_v_list, mrs, kv_endpoint = self.pending_rdma[request_id]
         
-        print("AttnNode polling for completions...")
+        print(f"AttnNode polling for completions on QP {kv_endpoint.get_info()[0]}...")
         # We expect 2 completions per layer
         expected_completions = self.config.num_layers * 2
         
         try:
             for _ in range(expected_completions):
-                self.endpoint.poll()
+                kv_endpoint.poll()
                 
             print("RDMA Transfer Complete. Populating Cache...")
             
@@ -196,15 +200,14 @@ class AttnNode:
             for i, (k, v) in enumerate(zip(tmp_k_list, tmp_v_list)):
                  # Assuming i matches layer index
                  # Move to Device? load_initial_kv handles .to(device)
-                 self.kv_managers[i].load_initial_kv(request_id, k, v)
+                 if i < len(self.kv_managers):
+                    self.kv_managers[i].load_initial_kv(request_id, k, v)
                  
             # Cleanup
             del self.pending_rdma[request_id]
-            # MRs will be freed? No explicit deregw in API yet.
-            # Python GC might handle if wrapper owns it?
-            # clover_transport register_mr just wrapper. 
-            # Ideally we should deregister. But for V1 leak is acceptable?
-            # Or rely on Process exit.
+            # kv_endpoint will be GC'd? 
+            # Ideally close connection? Protocol doesn't specify logic for temporary QP.
+            # Destroying QP is good practice. But C++ destructor handles it.
             
             return True
         except Exception as e:
@@ -307,7 +310,8 @@ class FFNNode:
         self.node_id = node_id
         self.config = config
         self.rdma_ctx = None
-        self.endpoint = None
+        self.endpoints = {}
+        self.peers = {}
         
         logging.disable_progress_bar()
         logging.set_verbosity_error()
@@ -363,19 +367,27 @@ class FFNNode:
         if clover_net:
             try:
                 self.rdma_ctx = clover_net.RDMAContext(device_name)
-                self.endpoint = clover_net.RDMAEndpoint(self.rdma_ctx)
-                print(f"FFNNode {self.node_id} RDMA initialized.")
-                info = self.endpoint.get_info()
-                return info
+                print(f"FFNNode {self.node_id} RDMA Context initialized.")
+                return True
             except Exception as e:
                 print(f"RDMA Init failed: {e}")
-                return None
-        return None
+                return False
+        return False
 
-    def connect_peer(self, qpn, lid):
-        if self.endpoint:
-            self.endpoint.connect(qpn, lid)
-            print(f"FFNNode {self.node_id} connected to peer QPN {qpn}")
+    def create_endpoint(self):
+        if not self.rdma_ctx: return None
+        ep = clover_net.RDMAEndpoint(self.rdma_ctx)
+        info = ep.get_info()
+        self.endpoints[info[0]] = ep
+        return info
+
+    def connect_endpoint(self, local_qpn, remote_qpn, remote_lid):
+        if local_qpn in self.endpoints:
+            self.endpoints[local_qpn].connect(remote_qpn, remote_lid)
+            self.peers[remote_qpn] = self.endpoints[local_qpn]
+            print(f"FFNNode {self.node_id} connected local QP {local_qpn} to peer {remote_qpn}")
+            return True
+        return False
 
 @ray.remote
 class PrefillWorker:
@@ -387,7 +399,9 @@ class PrefillWorker:
         print(f"PrefillWorker {worker_id} loading model from {config.model_path}...")
         self.local_kv_cache = {}
         self.rdma_ctx = None
-        self.endpoint = None
+        self.endpoints = {}
+        self.peers = {} # remote_qpn -> Endpoint
+        
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(config.model_path, local_files_only=True)
             self.model = OPTForCausalLM.from_pretrained(config.model_path, local_files_only=True, torch_dtype=torch.float16)
@@ -406,34 +420,44 @@ class PrefillWorker:
         if clover_net:
             try:
                 self.rdma_ctx = clover_net.RDMAContext(device_name)
-                self.endpoint = clover_net.RDMAEndpoint(self.rdma_ctx)
-                print(f"PrefillWorker {self.worker_id} RDMA initialized.")
-                info = self.endpoint.get_info()
-                return info
+                print(f"PrefillWorker {self.worker_id} RDMA Context initialized.")
+                return True
             except Exception as e:
                 print(f"PrefillWorker RDMA Init failed: {e}")
-                return None
-        return None
+                return False
+        return False
+
+    def create_endpoint(self):
+        if not self.rdma_ctx: return None
+        ep = clover_net.RDMAEndpoint(self.rdma_ctx)
+        info = ep.get_info()
+        self.endpoints[info[0]] = ep
+        return info
+
+    def connect_endpoint(self, local_qpn, remote_qpn, remote_lid):
+        if local_qpn in self.endpoints:
+            self.endpoints[local_qpn].connect(remote_qpn, remote_lid)
+            self.peers[remote_qpn] = self.endpoints[local_qpn]
+            print(f"PrefillWorker {self.worker_id} connected local QP {local_qpn} to peer {remote_qpn}")
+            return True
+        return False
 
     def send_kv_rdma(self, request_id: str, dest_qpn: int, dest_lid: int):
         """
         Sends stored KV tensors to destination via RDMA.
-        Assumes destination has posted Recvs in matching order.
-        Order: Layer 0 K, Layer 0 V, Layer 1 K, Layer 1 V, ...
+        Uses existing persistent connection for dest_qpn.
         """
-        if not self.endpoint:
-            print("RDMA Endpoint not initialized.")
-            return False
-            
         if request_id not in self.local_kv_cache:
             print(f"Request {request_id} not found in local cache.")
             return False
             
         k_caches, v_caches = self.local_kv_cache[request_id]
+
+        if dest_qpn not in self.peers:
+            print(f"No connection to peer {dest_qpn}")
+            return False
         
-        # Connect
-        print(f"PrefillWorker connecting to QPN {dest_qpn}...")
-        self.endpoint.connect(dest_qpn, dest_lid)
+        endpoint = self.peers[dest_qpn]
         
         # Send Loop
         # We need to keep MRs alive until send completes? 
@@ -454,20 +478,22 @@ class PrefillWorker:
                 if not v.is_contiguous(): v = v.contiguous()
                 
                 # K
-                mr_k = self.endpoint.register_mr(k)
+                mr_k = endpoint.register_mr(k)
                 mrs.append(mr_k)
-                self.endpoint.post_send(mr_k, k)
+                endpoint.post_send(mr_k, k)
                 
                 # V
-                mr_v = self.endpoint.register_mr(v)
+                mr_v = endpoint.register_mr(v)
                 mrs.append(mr_v)
-                self.endpoint.post_send(mr_v, v)
+                endpoint.post_send(mr_v, v)
                 
                 # Poll completion for every X sends to avoid Queue Full?
-                # QP depth is 10 in C++.
-                # So we MUST poll.
-                self.endpoint.poll() # K
-                self.endpoint.poll() # V
+                # QP depth is 128 now. 24 sends is fine.
+                # But we should poll eventually.
+                # Simplified: Poll after each pair? Or Poll all at end?
+                # C++ Logic: poll CQ.
+                endpoint.poll() # K
+                endpoint.poll() # V
                 
             print(f"PrefillWorker sent {len(k_caches)} layers KV to {dest_qpn}")
             return True

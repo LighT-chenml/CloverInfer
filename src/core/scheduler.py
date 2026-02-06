@@ -32,22 +32,73 @@ class GlobalScheduler:
         self.attn_nodes = [AttnNode.options(num_gpus=gpu_per_worker).remote(0, self.model_config)]
         self.ffn_nodes = [FFNNode.options(num_gpus=gpu_per_worker).remote(0, self.model_config)]
         
-        # Setup RDMA Mesh for Layer 0
-        # Attn[0] <-> FFN[0]
-        attn_ref = self.attn_nodes[0]
-        ffn_ref = self.ffn_nodes[0]
+        # 1. Initialize RDMA Contexts
+        print("Initializing RDMA Contexts...")
+        for worker in self.prefill_workers: await worker.init_infra.remote()
+        for node in self.attn_nodes: await node.init_infra.remote()
+        for node in self.ffn_nodes: await node.init_infra.remote()
+            
+        # 2. Setup Prefill <-> Attn Mesh (Persistent)
+        # For V1: Connect Prefill[0] <-> Attn[0]
+        print("Establishing RDMA Connection: Prefill <-> Attn...")
         
-        # Get Info
-        attn_info = await attn_ref.init_infra.remote() # Returns (qpn, lid) or None
-        ffn_info = await ffn_ref.init_infra.remote()
+        # Create Endpoints
+        p_info = await self.prefill_workers[0].create_endpoint.remote() # (qpn, lid)
+        a_info_p = await self.attn_nodes[0].create_endpoint.remote()   # (qpn, lid) for Prefill link
         
-        if attn_info and ffn_info:
-            print(f"Connecting Attn (QPN:{attn_info[0]}) <-> FFN (QPN:{ffn_info[0]})")
-            await attn_ref.connect_peer.remote(ffn_info[0], ffn_info[1])
-            await ffn_ref.connect_peer.remote(attn_info[0], attn_info[1])
-            print("RDMA Connection Established.")
+        if p_info and a_info_p:
+            p_qpn, p_lid = p_info
+            a_qpn, a_lid = a_info_p
+            
+            # Connect
+            await self.prefill_workers[0].connect_endpoint.remote(p_qpn, a_qpn, a_lid)
+            await self.attn_nodes[0].connect_endpoint.remote(a_qpn, p_qpn, p_lid)
+            
+            # Store Info for Request Dispatch
+            # We need to know: When using Prefill[0] and Attn[0], 
+            # Prefill uses local QP p_qpn (to send to a_qpn) ?? 
+            # Wait, send_kv_rdma takes DEST QPN. 
+            # So Prefill needs to know a_qpn.
+            # prepare_recv_kv takes SRC QPN.
+            # So Attn needs to know p_qpn.
+            
+            self.rdma_map = {
+                "prefill_0_attn_0": {
+                    "prefill_qpn": p_qpn, # Source QPN
+                    "attn_qpn": a_qpn     # Dest QPN
+                }
+            }
+            print(f"Connected Prefill(QP:{p_qpn}) <-> Attn(QP:{a_qpn})")
         else:
-            print("RDMA Initialization Failed (or missing hardware).")
+            print("Failed to create endpoints for Prefill-Attn.")
+            self.rdma_map = {}
+
+        # 3. Setup Attn <-> FFN Mesh (Persistent)
+        # Attn[0] <-> FFN[0]
+        print("Establishing RDMA Connection: Attn <-> FFN...")
+        a_info_f = await self.attn_nodes[0].create_endpoint.remote() # QP for FFN
+        f_info = await self.ffn_nodes[0].create_endpoint.remote()    # QP for Attn
+        
+        if a_info_f and f_info:
+             a_qpn, a_lid = a_info_f
+             f_qpn, f_lid = f_info
+             
+             await self.attn_nodes[0].connect_endpoint.remote(a_qpn, f_qpn, f_lid)
+             await self.ffn_nodes[0].connect_endpoint.remote(f_qpn, a_qpn, a_lid)
+             print(f"Connected Attn(QP:{a_qpn}) <-> FFN(QP:{f_qpn})")
+             
+             # Store if needed (AttnNode/FFNNode store peers internally?)
+             # They store by remote QPN.
+             # AttnNode needs to know FFN QPN to send? 
+             # Current code logic for Attn-FFN is not fully visible here but assuming nodes handle it?
+             # Actually `AttnNode` doesn't have `send_rdma` to FFN yet?
+             # Wait, the task was about KV Transfer. FFN connection was pre-existing?
+             # The existing code had:
+             # await attn_ref.connect_peer(ffn_info...)
+             # My refactor replaced connect_peer with connect_endpoint.
+             # So this setup is correct.
+        else:
+             print("Failed to create endpoints for Attn-FFN.")
 
         print(f"Started {len(self.prefill_workers)} Prefill, {len(self.attn_nodes)} Attn, {len(self.ffn_nodes)} FFN nodes.")
 
@@ -57,25 +108,50 @@ class GlobalScheduler:
         req_start_time = time.time()
         
         # 1. Dispatch to Prefill
-        worker = self.prefill_workers[0]
-        req_id = f"req_{int(time.time_ns())}"
+        worker_idx = 0 
+        worker = self.prefill_workers[worker_idx]
         
         # Exec Prefill
         prefill_out = await worker.process_prompt.remote(prompt)
-        # prefill_out = {seq_len, k_caches, v_caches, first_token_id}
         
+        req_id = prefill_out["req_id"]
         seq_len = prefill_out["seq_len"]
-        k_ref = prefill_out["k_ref"]
-        v_ref = prefill_out["v_ref"]
         first_token = prefill_out["first_token_id"]
         
-        print(f"Prefill Done. SeqLen: {seq_len}, First Token: {first_token}")
+        print(f"Prefill Done. ReqID: {req_id}, SeqLen: {seq_len}, First Token: {first_token}")
         
-        # 2. Handoff to AttnNode
-        # Allocate
-        await self.attn_nodes[0].allocate_request.remote(req_id, seq_len)
-        # Load KV (List of Tensors REF)
-        await self.attn_nodes[0].init_kv_from_prefill.remote(req_id, k_ref, v_ref)
+        # 2. Handoff to AttnNode via RDMA
+        attn_idx = 0
+        attn_node = self.attn_nodes[attn_idx]
+        
+        link_key = f"prefill_{worker_idx}_attn_{attn_idx}"
+        
+        if link_key in self.rdma_map:
+            conn_info = self.rdma_map[link_key]
+            p_qpn = conn_info["prefill_qpn"]
+            a_qpn = conn_info["attn_qpn"]
+            
+            print(f"Initiating RDMA Transfer. Src:{p_qpn} -> Dst:{a_qpn}")
+            
+            # A. Prepare Recv on Destination (Expect from p_qpn)
+            ready = await attn_node.prepare_recv_kv.remote(req_id, seq_len, p_qpn, 0) # LID unused if connected
+            if not ready: raise RuntimeError("AttnNode failed to prepare recv")
+            
+            # B. Send from Source (Send to a_qpn)
+            sent = await worker.send_kv_rdma.remote(req_id, a_qpn, 0) # LID unused if connected
+            if not sent: raise RuntimeError("PrefillWorker failed to send")
+            
+            # C. Finalize (Poll & Copy)
+            finalized = await attn_node.finalize_rdma_transfer.remote(req_id)
+            if not finalized: raise RuntimeError("AttnNode failed to finalize RDMA")
+            
+            print("RDMA Transfer & Cache Loading Complete.")
+            
+        else:
+            print("WARNING: RDMA link not found. Using Ray Fallback.")
+            k_ref = prefill_out["k_ref"]
+            v_ref = prefill_out["v_ref"]
+            await attn_node.init_kv_from_prefill.remote(req_id, k_ref, v_ref)
         
         # 3. Decoding Loop
         generated_text, first_token_time, num_gen_tokens = await self.run_generation_loop(req_id, first_token, seq_len)

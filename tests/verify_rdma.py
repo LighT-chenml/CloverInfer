@@ -55,12 +55,12 @@ def test_coordinator():
     # 4. RDMA Handshake
     # Step A: AttnNode Posts Recvs
     print("Step A: AttnNode Prepare Recv...")
-    ready = ray.get(attn_node.prepare_recv_kv.remote(req_id, seq_len, w_qpn, w_lid))
-    assert ready, "AttnNode failed to prepare recv"
+    kv_qpn = ray.get(attn_node.prepare_recv_kv.remote(req_id, seq_len, w_qpn, w_lid))
+    assert kv_qpn, "AttnNode failed to prepare recv"
     
     # Step B: PrefillWorker Sends
-    print("Step B: PrefillWorker Send...")
-    sent = ray.get(worker.send_kv_rdma.remote(req_id, a_qpn, a_lid))
+    print(f"Step B: PrefillWorker Send to QPN {kv_qpn}...")
+    sent = ray.get(worker.send_kv_rdma.remote(req_id, kv_qpn, a_lid))
     assert sent, "PrefillWorker failed to send"
     
     # Step C: AttnNode Finalize
