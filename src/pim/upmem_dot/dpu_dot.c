@@ -1,7 +1,7 @@
 #include <alloc.h>
 #include <barrier.h>
 #include <defs.h>
-#include <mram_unaligned.h>
+#include <mram.h>
 #include <perfcounter.h>
 #include <stdint.h>
 
@@ -36,14 +36,23 @@ int main(void)
     if (length > MAX_ELEMS_PER_DPU) {
         length = MAX_ELEMS_PER_DPU;
     }
+    length = (length / 2) * 2;
 
     int64_t local_sum = 0;
-    for (uint32_t idx = tasklet_id; idx < length; idx += NR_TASKLETS) {
-        int32_t a;
-        int32_t b;
-        mram_read_unaligned(&input_a[idx], &a, sizeof(a));
-        mram_read_unaligned(&input_b[idx], &b, sizeof(b));
-        local_sum += (int64_t)a * (int64_t)b;
+    uint32_t pair_count = length / 2;
+    for (uint32_t pair_idx = tasklet_id; pair_idx < pair_count; pair_idx += NR_TASKLETS) {
+        uint32_t elem_idx = pair_idx * 2;
+        uint64_t packed_a;
+        uint64_t packed_b;
+        mram_read(&input_a[elem_idx], &packed_a, sizeof(packed_a));
+        mram_read(&input_b[elem_idx], &packed_b, sizeof(packed_b));
+
+        int32_t a0 = (int32_t)(packed_a & 0xffffffffu);
+        int32_t a1 = (int32_t)(packed_a >> 32);
+        int32_t b0 = (int32_t)(packed_b & 0xffffffffu);
+        int32_t b1 = (int32_t)(packed_b >> 32);
+        local_sum += (int64_t)a0 * (int64_t)b0;
+        local_sum += (int64_t)a1 * (int64_t)b1;
     }
     partial_sums[tasklet_id] = local_sum;
     barrier_wait(&dot_barrier);

@@ -31,9 +31,9 @@ int main(int argc, char **argv)
     if (argc >= 3) {
         length = (uint32_t)strtoul(argv[2], NULL, 10);
     }
-    if (requested_dpus == 0 || length == 0 || length > MAX_ELEMS_PER_DPU) {
+    if (requested_dpus == 0 || length == 0 || length > MAX_ELEMS_PER_DPU || (length % 2) != 0) {
         usage(argv[0]);
-        fprintf(stderr, "num_dpus must be > 0 and length_per_dpu must be in [1, %u]\n", MAX_ELEMS_PER_DPU);
+        fprintf(stderr, "num_dpus must be > 0 and length_per_dpu must be an even value in [2, %u]\n", MAX_ELEMS_PER_DPU);
         return 2;
     }
 
