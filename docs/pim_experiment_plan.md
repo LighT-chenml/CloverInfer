@@ -286,6 +286,12 @@ Recommended decomposition for the first UPMEM-backed baseline:
 This staged path is acceptable for the naive baseline as long as the framework
 can switch between `cpu` and `pim_naive` under the same scheduler logic.
 
+Current implementation note:
+- `pim_naive` QK mixed-path parameters are exposed through `ClusterConfig` and
+  `tests/verify_cluster_placement.py`, so experiments can sweep
+  `pim_num_dpus`, `pim_qk_mixed_enabled`, `pim_qk_mixed_heads`,
+  `pim_qk_mixed_window`, and `pim_length` without editing backend code.
+
 ### UPMEM-Oriented Implementation Sketch
 
 The likely implementation split is:

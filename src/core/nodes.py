@@ -99,15 +99,22 @@ class PrefillNode:
 
 @ray.remote
 class AttentionNode:
-    def __init__(self, node_id: int, config: ModelConfig, backend: str = "cpu"):
+    def __init__(
+        self,
+        node_id: int,
+        config: ModelConfig,
+        backend: str = "cpu",
+        backend_kwargs: Dict[str, object] | None = None,
+    ):
         self.node_id = node_id
         self.config = config
         self.backend_name = backend
         self.device = "cpu"
+        backend_kwargs = backend_kwargs or {}
         if backend == "cpu":
             self.backend = CpuAttentionBackend()
         elif backend == "pim_naive":
-            self.backend = PimNaiveAttentionBackend()
+            self.backend = PimNaiveAttentionBackend(**backend_kwargs)
         else:
             raise ValueError(f"Unsupported attention backend for now: {backend}")
         print(f"AttentionNode {node_id} initialized with {backend} backend")

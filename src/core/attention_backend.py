@@ -105,6 +105,9 @@ class PimNaiveAttentionBackend:
         length: int = 128,
         qk_check_interval: int = 1,
         qk_check_limit: int = 1,
+        qk_mixed_enabled: bool = True,
+        qk_mixed_heads: int = 2,
+        qk_mixed_window: int = 128,
     ):
         self.repo_root = repo_root or os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         self.num_dpus = num_dpus
@@ -119,9 +122,9 @@ class PimNaiveAttentionBackend:
         self.qk_last_output = ""
         self.qk_shadow_max_abs_diff = 0
         self.qk_shadow_last_scores = []
-        self.qk_mixed_enabled = True
-        self.qk_mixed_heads = 2
-        self.qk_mixed_window = 128
+        self.qk_mixed_enabled = bool(qk_mixed_enabled)
+        self.qk_mixed_heads = max(0, int(qk_mixed_heads))
+        self.qk_mixed_window = max(1, int(qk_mixed_window))
         self.qk_mixed_count = 0
         self.qk_mixed_last_max_abs_diff = 0.0
         self.qk_mixed_last_head_diffs = []

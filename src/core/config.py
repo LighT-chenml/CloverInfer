@@ -21,6 +21,11 @@ class ClusterConfig(BaseModel):
     use_gpu_for_prefill: bool = True
     use_gpu_for_decode_dense: bool = True
     attention_backend: str = "cpu"
+    pim_num_dpus: int = 4
+    pim_qk_mixed_enabled: bool = True
+    pim_qk_mixed_heads: int = 2
+    pim_qk_mixed_window: int = 128
+    pim_length: int = 128
 
 class ModelConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")

@@ -34,6 +34,15 @@ class GlobalScheduler:
     async def initialize_cluster(self):
         gpu_prefill = 1 if self.cluster_config.use_gpu_for_prefill else 0
         gpu_dense = 1 if self.cluster_config.use_gpu_for_decode_dense else 0
+        attention_backend_kwargs = {}
+        if self.cluster_config.attention_backend == "pim_naive":
+            attention_backend_kwargs = {
+                "num_dpus": int(self.cluster_config.pim_num_dpus),
+                "length": int(self.cluster_config.pim_length),
+                "qk_mixed_enabled": bool(self.cluster_config.pim_qk_mixed_enabled),
+                "qk_mixed_heads": int(self.cluster_config.pim_qk_mixed_heads),
+                "qk_mixed_window": int(self.cluster_config.pim_qk_mixed_window),
+            }
 
         self.prefill_nodes = [
             PrefillNode.options(
@@ -45,7 +54,12 @@ class GlobalScheduler:
         self.attention_nodes = [
             AttentionNode.options(
                 **_actor_options(self.cluster_config.attention_resource, 0)
-            ).remote(i, self.model_config, self.cluster_config.attention_backend)
+            ).remote(
+                i,
+                self.model_config,
+                self.cluster_config.attention_backend,
+                attention_backend_kwargs,
+            )
             for i in range(self.cluster_config.num_attention_nodes)
         ]
 
