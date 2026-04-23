@@ -119,6 +119,11 @@ class PimNaiveAttentionBackend:
         self.qk_last_output = ""
         self.qk_shadow_max_abs_diff = 0
         self.qk_shadow_last_scores = []
+        self.qk_mixed_enabled = True
+        self.qk_mixed_head = 0
+        self.qk_mixed_window = 128
+        self.qk_mixed_count = 0
+        self.qk_mixed_last_max_abs_diff = 0.0
         self._run_dot_smoke_test()
 
     def _run_make_smoke(self, subdir: str, env_overrides: Dict[str, str]) -> str:
@@ -163,7 +168,7 @@ class PimNaiveAttentionBackend:
         )
         self.qk_check_count += 1
 
-    def _run_qk_scores(self, query: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
+    def _run_qk_scores(self, query: torch.Tensor, keys: torch.Tensor) -> tuple[torch.Tensor, float]:
         q = query.detach().cpu().float().contiguous()
         k = keys.detach().cpu().float().contiguous()
         if q.dim() != 1:
@@ -230,7 +235,7 @@ class PimNaiveAttentionBackend:
         if diff != 0:
             raise RuntimeError(f"UPMEM qk score mismatch max_abs_diff={diff}, max_cycles={max_cycles}")
         self.qk_check_count += 1
-        return actual
+        return actual.float() / (scale * scale), scale
 
     def _run_smoke_test(self) -> None:
         # Backwards-compatible alias for older interactive sessions.
@@ -265,28 +270,51 @@ class PimNaiveAttentionBackend:
         key: torch.Tensor,
         value: torch.Tensor,
     ) -> torch.Tensor:
-        should_run_qk_check = (
-            self.qk_check_interval > 0
-            and self.qk_check_count < self.qk_check_limit
-            and (self.qk_check_count % self.qk_check_interval) == 0
+        if request_id not in self.cpu_backend.k_cache:
+            raise KeyError(f"Unknown request {request_id}")
+
+        q = query.detach().cpu().contiguous()
+        k_new = key.detach().cpu().contiguous()
+        v_new = value.detach().cpu().contiguous()
+
+        if q.dim() == 3:
+            q = q.squeeze(0)
+        if k_new.dim() == 3:
+            k_new = k_new.squeeze(0)
+        if v_new.dim() == 3:
+            v_new = v_new.squeeze(0)
+
+        self.cpu_backend.k_cache[request_id][layer_idx] = torch.cat(
+            [self.cpu_backend.k_cache[request_id][layer_idx], k_new.unsqueeze(0)], dim=0
         )
-        if should_run_qk_check:
+        self.cpu_backend.v_cache[request_id][layer_idx] = torch.cat(
+            [self.cpu_backend.v_cache[request_id][layer_idx], v_new.unsqueeze(0)], dim=0
+        )
+
+        keys = self.cpu_backend.k_cache[request_id][layer_idx]
+        values = self.cpu_backend.v_cache[request_id][layer_idx]
+
+        scores = torch.einsum("hd,lhd->hl", q.float(), keys.float())
+        if self.qk_mixed_enabled and self.qk_mixed_head < scores.shape[0]:
             try:
-                q = query.detach().cpu()
-                if q.dim() == 3:
-                    q = q.squeeze(0)
-                k_new = key.detach().cpu()
-                if k_new.dim() == 3:
-                    k_new = k_new.squeeze(0)
-                keys = torch.cat(
-                    [self.cpu_backend.k_cache[request_id][layer_idx], k_new.unsqueeze(0)],
-                    dim=0,
-                )
-                self._run_qk_scores(q[0], keys[:, 0, :])
+                window = min(self.qk_mixed_window, keys.shape[0])
+                head = self.qk_mixed_head
+                pim_scores, _ = self._run_qk_scores(q[head], keys[-window:, head, :])
+                cpu_window_scores = scores[head, -window:].clone()
+                self.qk_mixed_last_max_abs_diff = float(torch.max(torch.abs(pim_scores - cpu_window_scores)).item())
+                scores[head, -window:] = pim_scores.to(scores.dtype)
+                self.qk_mixed_count += 1
             except Exception:
                 self.qk_check_failures += 1
                 raise
-        return self.cpu_backend.decode_layer(request_id, layer_idx, query, key, value)
+
+        weights = torch.softmax(scores, dim=-1)
+        context = torch.einsum("hl,lhd->hd", weights, values.float()).to(query.dtype)
+
+        if layer_idx == len(self.cpu_backend.k_cache[request_id]) - 1:
+            self.cpu_backend.context_lens[request_id] += 1
+
+        return context.unsqueeze(0)
 
     def get_context_len(self, request_id: str) -> int:
         return self.cpu_backend.get_context_len(request_id)
@@ -307,4 +335,9 @@ class PimNaiveAttentionBackend:
             "qk_last_output": self.qk_last_output,
             "qk_shadow_max_abs_diff": self.qk_shadow_max_abs_diff,
             "qk_shadow_last_scores": self.qk_shadow_last_scores,
+            "qk_mixed_enabled": self.qk_mixed_enabled,
+            "qk_mixed_head": self.qk_mixed_head,
+            "qk_mixed_window": self.qk_mixed_window,
+            "qk_mixed_count": self.qk_mixed_count,
+            "qk_mixed_last_max_abs_diff": self.qk_mixed_last_max_abs_diff,
         }
