@@ -1,6 +1,11 @@
 import argparse
 import os
+import sys
 import ray
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 from src.core.config import ClusterConfig, ModelConfig
 from src.core.scheduler import GlobalScheduler
@@ -21,10 +26,9 @@ def parse_args():
 
 def main():
     args = parse_args()
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     ray.init(
         address=args.address,
-        runtime_env={"env_vars": {"PYTHONPATH": repo_root}},
+        runtime_env={"env_vars": {"PYTHONPATH": REPO_ROOT}},
     )
 
     cluster = ClusterConfig(
