@@ -32,7 +32,7 @@ def _actor_info(node_id: int, role: str, device: str) -> Dict[str, str]:
         "node_id": str(node_id),
         "role": role,
         "hostname": socket.gethostname(),
-        "ip": socket.gethostbyname(socket.gethostname()),
+        "ip": ray.util.get_node_ip_address(),
         "device": device,
     }
 
