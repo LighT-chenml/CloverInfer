@@ -1,4 +1,3 @@
-
 import ray
 import sys
 import os
@@ -11,28 +10,35 @@ from src.core.scheduler import GlobalScheduler
 from src.core.config import ClusterConfig, ModelConfig
 
 async def test_decoding_flow():
-    # 1. Setup
     if not ray.is_initialized():
-        ray.init(ignore_reinit_error=True)
-        
-    cluster_conf = ClusterConfig(num_prefill_workers=1, num_decode_nodes=1)
-    model_conf = ModelConfig(model_name="test-model")
-    
-    # 2. Init Scheduler
+        ray.init(ignore_reinit_error=True, runtime_env={"env_vars": {"PYTHONPATH": os.getcwd()}})
+
+    cluster_conf = ClusterConfig(
+        num_prefill_workers=1,
+        num_attention_nodes=1,
+        num_decode_dense_nodes=1,
+        use_gpu_for_prefill=False,
+        use_gpu_for_decode_dense=False,
+    )
+    model_conf = ModelConfig(
+        model_name="opt-125m",
+        model_path=os.path.abspath("model/opt-125m"),
+        max_new_tokens=2,
+    )
+
     scheduler = GlobalScheduler.remote(cluster_conf, model_conf)
-    await scheduler.initialize_cluster.remote()
-    
-    # 3. Submit Request
-    output = await scheduler.submit_request.remote("Test Prompt")
-    
+    cluster_info = await scheduler.initialize_cluster.remote()
+    output, metrics = await scheduler.submit_request.remote("Test Prompt", return_metrics=True, max_new_tokens=2)
+
+    print(f"Cluster Info: {cluster_info}")
     print(f"Test Output: {output}")
-    
-    # 4. Verify
-    assert "tok_9" in output
-    assert "Generation Complete" in output or True # Output from print checks
-    
+    print(f"Metrics: {metrics}")
+
+    assert isinstance(output, str)
+    assert cluster_info["attention"]["backend"] == "cpu"
+    assert metrics["total_tokens"] >= 1
+    assert metrics["latency"] >= metrics["ttft"] >= 0
+
 if __name__ == "__main__":
-    # Manual run
-    import asyncio
     loop = asyncio.get_event_loop()
     loop.run_until_complete(test_decoding_flow())
