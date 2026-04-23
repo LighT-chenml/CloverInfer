@@ -10,7 +10,7 @@ import torch
 from transformers import AutoTokenizer, OPTForCausalLM
 from transformers.utils import logging
 
-from .attention_backend import CpuAttentionBackend
+from .attention_backend import CpuAttentionBackend, PimNaiveAttentionBackend
 from .config import ModelConfig
 
 logging.disable_progress_bar()
@@ -100,18 +100,23 @@ class PrefillNode:
 @ray.remote
 class AttentionNode:
     def __init__(self, node_id: int, config: ModelConfig, backend: str = "cpu"):
-        if backend != "cpu":
-            raise ValueError(f"Unsupported attention backend for now: {backend}")
         self.node_id = node_id
         self.config = config
         self.backend_name = backend
-        self.backend = CpuAttentionBackend()
         self.device = "cpu"
+        if backend == "cpu":
+            self.backend = CpuAttentionBackend()
+        elif backend == "pim_naive":
+            self.backend = PimNaiveAttentionBackend()
+        else:
+            raise ValueError(f"Unsupported attention backend for now: {backend}")
         print(f"AttentionNode {node_id} initialized with {backend} backend")
 
     def get_info(self):
         info = _actor_info(self.node_id, "attention", self.device)
         info["backend"] = self.backend_name
+        if hasattr(self.backend, "get_debug_info"):
+            info["backend_debug"] = self.backend.get_debug_info()
         return info
 
     def init_request(self, request_id: str, initial_kv):

@@ -18,6 +18,7 @@ def parse_args():
     parser.add_argument("--prompt", default="Hello CloverInfer")
     parser.add_argument("--max-new-tokens", type=int, default=2)
     parser.add_argument("--skip-generation", action="store_true")
+    parser.add_argument("--attention-backend", default="cpu", choices=["cpu", "pim_naive"])
     parser.add_argument("--expected-prefill-ip", default="192.168.123.3")
     parser.add_argument("--expected-dense-ip", default="192.168.123.4")
     parser.add_argument("--expected-attention-ip", default="192.168.123.7")
@@ -40,7 +41,7 @@ def main():
         attention_resource="attention_pim",
         use_gpu_for_prefill=True,
         use_gpu_for_decode_dense=True,
-        attention_backend="cpu",
+        attention_backend=args.attention_backend,
     )
     model = ModelConfig(model_path=args.model, max_new_tokens=args.max_new_tokens)
 
@@ -54,6 +55,7 @@ def main():
     assert info["prefill"]["device"] == "cuda", info
     assert info["decode_dense"]["device"] == "cuda", info
     assert info["attention"]["device"] == "cpu", info
+    assert info["attention"]["backend"] == args.attention_backend, info
 
     if not args.skip_generation:
         output, metrics = ray.get(
