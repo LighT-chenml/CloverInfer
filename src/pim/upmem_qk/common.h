@@ -5,6 +5,7 @@
 
 #define MAX_HEAD_DIM 128
 #define MAX_KEYS_PER_DPU 128
+#define QK_IO_MAGIC 0x514B494FU
 
 typedef struct {
     uint32_t head_dim;
@@ -16,5 +17,12 @@ typedef struct {
 typedef struct {
     uint64_t cycles;
 } qk_meta_t;
+
+typedef struct {
+    uint32_t magic;
+    uint32_t head_dim;
+    uint32_t num_keys;
+    uint32_t reserved;
+} qk_io_header_t;
 
 #endif

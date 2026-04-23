@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import math
 import os
+import struct
 import subprocess
+import tempfile
 from typing import Dict, List
 
 import torch
@@ -115,6 +117,8 @@ class PimNaiveAttentionBackend:
         self.qk_check_count = 0
         self.qk_check_failures = 0
         self.qk_last_output = ""
+        self.qk_shadow_max_abs_diff = 0
+        self.qk_shadow_last_scores = []
         self._run_dot_smoke_test()
 
     def _run_make_smoke(self, subdir: str, env_overrides: Dict[str, str]) -> str:
@@ -159,6 +163,75 @@ class PimNaiveAttentionBackend:
         )
         self.qk_check_count += 1
 
+    def _run_qk_scores(self, query: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
+        q = query.detach().cpu().float().contiguous()
+        k = keys.detach().cpu().float().contiguous()
+        if q.dim() != 1:
+            raise ValueError(f"q must be 1D, got shape {tuple(q.shape)}")
+        if k.dim() != 2:
+            raise ValueError(f"keys must be 2D, got shape {tuple(k.shape)}")
+
+        head_dim = min(128, int(q.shape[0]), int(k.shape[1]))
+        if head_dim < 2:
+            raise ValueError("head_dim must be at least 2 for UPMEM QK")
+        if head_dim % 2 != 0:
+            head_dim -= 1
+        num_keys = min(128, int(k.shape[0]))
+
+        scale = 1024.0
+        q_i32 = torch.clamp(torch.round(q[:head_dim] * scale), -2**31, 2**31 - 1).to(torch.int32)
+        k_i32 = torch.clamp(torch.round(k[:num_keys, :head_dim] * scale), -2**31, 2**31 - 1).to(torch.int32)
+        expected = torch.matmul(k_i32.to(torch.int64), q_i32.to(torch.int64))
+
+        header = struct.pack("<IIII", 0x514B494F, head_dim, num_keys, 0)
+        qk_dir = os.path.join(self.repo_root, "src", "pim", "upmem_qk")
+        binary_path = os.path.join(qk_dir, "build", "host_qk")
+        if not os.path.exists(binary_path):
+            build = subprocess.run(
+                ["make", "all"],
+                cwd=qk_dir,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if build.returncode != 0:
+                raise RuntimeError((build.stdout + build.stderr).strip())
+
+        with tempfile.TemporaryDirectory(prefix="clover_qk_") as tmpdir:
+            input_path = os.path.join(tmpdir, "input.bin")
+            output_path = os.path.join(tmpdir, "output.bin")
+            with open(input_path, "wb") as f:
+                f.write(header)
+                f.write(q_i32.numpy().tobytes(order="C"))
+                f.write(k_i32.numpy().tobytes(order="C"))
+
+            completed = subprocess.run(
+                [binary_path, "--input", input_path, "--output", output_path, "--num-dpus", str(min(self.num_dpus, num_keys))],
+                cwd=qk_dir,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.qk_last_output = (completed.stdout + completed.stderr).strip()
+            if completed.returncode != 0:
+                raise RuntimeError(f"UPMEM qk runner failed:\n{self.qk_last_output}")
+
+            with open(output_path, "rb") as f:
+                out_header = f.read(16)
+                magic, out_head_dim, out_num_keys, max_cycles = struct.unpack("<IIII", out_header)
+                if magic != 0x514B494F or out_head_dim != head_dim or out_num_keys != num_keys:
+                    raise RuntimeError("UPMEM qk runner returned an invalid header")
+                raw_scores = f.read(num_keys * 8)
+
+        actual = torch.tensor(struct.unpack(f"<{num_keys}q", raw_scores), dtype=torch.int64)
+        diff = torch.max(torch.abs(actual - expected)).item() if num_keys > 0 else 0
+        self.qk_shadow_max_abs_diff = max(self.qk_shadow_max_abs_diff, int(diff))
+        self.qk_shadow_last_scores = actual[: min(8, num_keys)].tolist()
+        if diff != 0:
+            raise RuntimeError(f"UPMEM qk score mismatch max_abs_diff={diff}, max_cycles={max_cycles}")
+        self.qk_check_count += 1
+        return actual
+
     def _run_smoke_test(self) -> None:
         # Backwards-compatible alias for older interactive sessions.
         smoke_dir = os.path.join(self.repo_root, "src", "pim", "upmem_dot")
@@ -202,8 +275,14 @@ class PimNaiveAttentionBackend:
                 q = query.detach().cpu()
                 if q.dim() == 3:
                     q = q.squeeze(0)
-                keys_per_dpu = min(8, self.cpu_backend.k_cache[request_id][layer_idx].shape[0] + 1)
-                self._run_qk_smoke_test(head_dim=q.shape[-1], keys_per_dpu=keys_per_dpu)
+                k_new = key.detach().cpu()
+                if k_new.dim() == 3:
+                    k_new = k_new.squeeze(0)
+                keys = torch.cat(
+                    [self.cpu_backend.k_cache[request_id][layer_idx], k_new.unsqueeze(0)],
+                    dim=0,
+                )
+                self._run_qk_scores(q[0], keys[:, 0, :])
             except Exception:
                 self.qk_check_failures += 1
                 raise
@@ -226,4 +305,6 @@ class PimNaiveAttentionBackend:
             "qk_check_count": self.qk_check_count,
             "qk_check_failures": self.qk_check_failures,
             "qk_last_output": self.qk_last_output,
+            "qk_shadow_max_abs_diff": self.qk_shadow_max_abs_diff,
+            "qk_shadow_last_scores": self.qk_shadow_last_scores,
         }

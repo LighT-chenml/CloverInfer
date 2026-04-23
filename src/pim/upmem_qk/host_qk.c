@@ -14,6 +14,222 @@
 static void usage(const char *prog)
 {
     fprintf(stderr, "Usage: %s [num_dpus] [head_dim] [keys_per_dpu]\n", prog);
+    fprintf(stderr, "       %s --input qk_input.bin --output scores.bin [--num-dpus N]\n", prog);
+}
+
+static int run_dpu_qk(
+    uint32_t requested_dpus,
+    uint32_t head_dim,
+    uint32_t keys_per_dpu,
+    const int32_t *all_queries,
+    const int32_t *all_keys,
+    int64_t *all_scores,
+    uint64_t *max_cycles_out)
+{
+    struct dpu_set_t dpu_set;
+    struct dpu_set_t dpu;
+    uint32_t each_dpu;
+    uint32_t nr_dpus = 0;
+
+    DPU_ASSERT(dpu_alloc(requested_dpus, NULL, &dpu_set));
+    DPU_ASSERT(dpu_get_nr_dpus(dpu_set, &nr_dpus));
+    DPU_ASSERT(dpu_load(dpu_set, DPU_BINARY, NULL));
+
+    if (nr_dpus != requested_dpus) {
+        fprintf(stderr, "Requested %u DPUs, allocated %u DPUs\n", requested_dpus, nr_dpus);
+        dpu_free(dpu_set);
+        return 1;
+    }
+
+    qk_meta_t *metas = calloc(nr_dpus, sizeof(*metas));
+    if (metas == NULL) {
+        fprintf(stderr, "Failed to allocate metadata buffers\n");
+        dpu_free(dpu_set);
+        return 1;
+    }
+
+    size_t query_elems = head_dim;
+    size_t key_elems = (size_t)keys_per_dpu * head_dim;
+
+    qk_args_t args = {
+        .head_dim = head_dim,
+        .num_keys = keys_per_dpu,
+        .key_stride = head_dim,
+        .reserved = 0,
+    };
+    DPU_ASSERT(dpu_broadcast_to(dpu_set, "qk_args", 0, &args, sizeof(args), DPU_XFER_DEFAULT));
+
+    DPU_FOREACH(dpu_set, dpu, each_dpu)
+    {
+        DPU_ASSERT(dpu_prepare_xfer(dpu, (void *)&all_queries[(size_t)each_dpu * query_elems]));
+    }
+    DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU, "query", 0, query_elems * sizeof(int32_t), DPU_XFER_DEFAULT));
+
+    DPU_FOREACH(dpu_set, dpu, each_dpu)
+    {
+        DPU_ASSERT(dpu_prepare_xfer(dpu, (void *)&all_keys[(size_t)each_dpu * key_elems]));
+    }
+    DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU, "keys", 0, key_elems * sizeof(int32_t), DPU_XFER_DEFAULT));
+
+    DPU_ASSERT(dpu_launch(dpu_set, DPU_SYNCHRONOUS));
+
+    DPU_FOREACH(dpu_set, dpu, each_dpu)
+    {
+        DPU_ASSERT(dpu_prepare_xfer(dpu, &all_scores[(size_t)each_dpu * keys_per_dpu]));
+    }
+    DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_FROM_DPU, "scores", 0, keys_per_dpu * sizeof(int64_t), DPU_XFER_DEFAULT));
+
+    DPU_FOREACH(dpu_set, dpu, each_dpu)
+    {
+        DPU_ASSERT(dpu_prepare_xfer(dpu, &metas[each_dpu]));
+    }
+    DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_FROM_DPU, "qk_meta", 0, sizeof(qk_meta_t), DPU_XFER_DEFAULT));
+
+    uint64_t max_cycles = 0;
+    for (uint32_t dpu_idx = 0; dpu_idx < nr_dpus; ++dpu_idx) {
+        if (metas[dpu_idx].cycles > max_cycles) {
+            max_cycles = metas[dpu_idx].cycles;
+        }
+    }
+    if (max_cycles_out != NULL) {
+        *max_cycles_out = max_cycles;
+    }
+
+    free(metas);
+    dpu_free(dpu_set);
+    return 0;
+}
+
+static int read_exact(FILE *file, void *dst, size_t bytes)
+{
+    return fread(dst, 1, bytes, file) == bytes ? 0 : 1;
+}
+
+static int write_exact(FILE *file, const void *src, size_t bytes)
+{
+    return fwrite(src, 1, bytes, file) == bytes ? 0 : 1;
+}
+
+static int run_file_mode(const char *input_path, const char *output_path, uint32_t requested_dpus)
+{
+    FILE *input = fopen(input_path, "rb");
+    if (input == NULL) {
+        perror("fopen input");
+        return 1;
+    }
+
+    qk_io_header_t header;
+    if (read_exact(input, &header, sizeof(header)) != 0) {
+        fprintf(stderr, "Failed to read qk input header\n");
+        fclose(input);
+        return 1;
+    }
+    if (header.magic != QK_IO_MAGIC || header.head_dim == 0 || header.num_keys == 0 || header.head_dim > MAX_HEAD_DIM || header.num_keys > MAX_KEYS_PER_DPU || (header.head_dim % 2) != 0) {
+        fprintf(stderr, "Invalid qk input header\n");
+        fclose(input);
+        return 1;
+    }
+
+    uint32_t head_dim = header.head_dim;
+    uint32_t total_keys = header.num_keys;
+    uint32_t num_dpus = requested_dpus;
+    if (num_dpus == 0) {
+        num_dpus = 1;
+    }
+    if (num_dpus > total_keys) {
+        num_dpus = total_keys;
+    }
+    uint32_t keys_per_dpu = (total_keys + num_dpus - 1) / num_dpus;
+    if (keys_per_dpu > MAX_KEYS_PER_DPU) {
+        fprintf(stderr, "Too many keys per DPU after partitioning: %u\n", keys_per_dpu);
+        fclose(input);
+        return 1;
+    }
+
+    int32_t *query = calloc(head_dim, sizeof(*query));
+    int32_t *keys_in = calloc((size_t)total_keys * head_dim, sizeof(*keys_in));
+    int32_t *queries = calloc((size_t)num_dpus * head_dim, sizeof(*queries));
+    int32_t *keys_partitioned = calloc((size_t)num_dpus * keys_per_dpu * head_dim, sizeof(*keys_partitioned));
+    int64_t *scores_partitioned = calloc((size_t)num_dpus * keys_per_dpu, sizeof(*scores_partitioned));
+    int64_t *scores_out = calloc(total_keys, sizeof(*scores_out));
+    if (!query || !keys_in || !queries || !keys_partitioned || !scores_partitioned || !scores_out) {
+        fprintf(stderr, "Failed to allocate file-mode buffers\n");
+        fclose(input);
+        free(query);
+        free(keys_in);
+        free(queries);
+        free(keys_partitioned);
+        free(scores_partitioned);
+        free(scores_out);
+        return 1;
+    }
+
+    if (read_exact(input, query, head_dim * sizeof(int32_t)) != 0
+        || read_exact(input, keys_in, (size_t)total_keys * head_dim * sizeof(int32_t)) != 0) {
+        fprintf(stderr, "Failed to read qk input payload\n");
+        fclose(input);
+        free(query);
+        free(keys_in);
+        free(queries);
+        free(keys_partitioned);
+        free(scores_partitioned);
+        free(scores_out);
+        return 1;
+    }
+    fclose(input);
+
+    for (uint32_t dpu_idx = 0; dpu_idx < num_dpus; ++dpu_idx) {
+        memcpy(&queries[(size_t)dpu_idx * head_dim], query, head_dim * sizeof(int32_t));
+        for (uint32_t local_key = 0; local_key < keys_per_dpu; ++local_key) {
+            uint32_t global_key = dpu_idx * keys_per_dpu + local_key;
+            if (global_key < total_keys) {
+                memcpy(
+                    &keys_partitioned[((size_t)dpu_idx * keys_per_dpu + local_key) * head_dim],
+                    &keys_in[(size_t)global_key * head_dim],
+                    head_dim * sizeof(int32_t));
+            }
+        }
+    }
+
+    uint64_t max_cycles = 0;
+    int rc = run_dpu_qk(num_dpus, head_dim, keys_per_dpu, queries, keys_partitioned, scores_partitioned, &max_cycles);
+    if (rc == 0) {
+        for (uint32_t dpu_idx = 0; dpu_idx < num_dpus; ++dpu_idx) {
+            for (uint32_t local_key = 0; local_key < keys_per_dpu; ++local_key) {
+                uint32_t global_key = dpu_idx * keys_per_dpu + local_key;
+                if (global_key < total_keys) {
+                    scores_out[global_key] = scores_partitioned[(size_t)dpu_idx * keys_per_dpu + local_key];
+                }
+            }
+        }
+    }
+
+    FILE *output = fopen(output_path, "wb");
+    if (output == NULL) {
+        perror("fopen output");
+        rc = 1;
+    } else {
+        qk_io_header_t out_header = {
+            .magic = QK_IO_MAGIC,
+            .head_dim = head_dim,
+            .num_keys = total_keys,
+            .reserved = (uint32_t)(max_cycles & 0xffffffffu),
+        };
+        if (write_exact(output, &out_header, sizeof(out_header)) != 0
+            || write_exact(output, scores_out, total_keys * sizeof(int64_t)) != 0) {
+            fprintf(stderr, "Failed to write qk output\n");
+            rc = 1;
+        }
+        fclose(output);
+    }
+
+    free(query);
+    free(keys_in);
+    free(queries);
+    free(keys_partitioned);
+    free(scores_partitioned);
+    free(scores_out);
+    return rc;
 }
 
 int main(int argc, char **argv)
@@ -21,6 +237,25 @@ int main(int argc, char **argv)
     uint32_t requested_dpus = 2;
     uint32_t head_dim = 64;
     uint32_t keys_per_dpu = 8;
+    const char *input_path = NULL;
+    const char *output_path = NULL;
+
+    for (int idx = 1; idx < argc; ++idx) {
+        if (strcmp(argv[idx], "--input") == 0 && idx + 1 < argc) {
+            input_path = argv[++idx];
+        } else if (strcmp(argv[idx], "--output") == 0 && idx + 1 < argc) {
+            output_path = argv[++idx];
+        } else if (strcmp(argv[idx], "--num-dpus") == 0 && idx + 1 < argc) {
+            requested_dpus = (uint32_t)strtoul(argv[++idx], NULL, 10);
+        }
+    }
+    if (input_path != NULL || output_path != NULL) {
+        if (input_path == NULL || output_path == NULL) {
+            usage(argv[0]);
+            return 2;
+        }
+        return run_file_mode(input_path, output_path, requested_dpus);
+    }
 
     if (argc > 4) {
         usage(argv[0]);
@@ -41,36 +276,24 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    struct dpu_set_t dpu_set;
-    struct dpu_set_t dpu;
-    uint32_t each_dpu;
-    uint32_t nr_dpus = 0;
-
-    DPU_ASSERT(dpu_alloc(requested_dpus, NULL, &dpu_set));
-    DPU_ASSERT(dpu_get_nr_dpus(dpu_set, &nr_dpus));
-    DPU_ASSERT(dpu_load(dpu_set, DPU_BINARY, NULL));
-
     size_t query_elems = head_dim;
-    size_t key_elems = (size_t)keys_per_dpu * head_dim;
-    int32_t *queries = calloc((size_t)nr_dpus * query_elems, sizeof(*queries));
-    int32_t *keys = calloc((size_t)nr_dpus * key_elems, sizeof(*keys));
-    int64_t *scores = calloc((size_t)nr_dpus * keys_per_dpu, sizeof(*scores));
-    qk_meta_t *metas = calloc(nr_dpus, sizeof(*metas));
-    int64_t *expected = calloc((size_t)nr_dpus * keys_per_dpu, sizeof(*expected));
-    if (!queries || !keys || !scores || !metas || !expected) {
+    size_t key_elems_per_dpu = (size_t)keys_per_dpu * head_dim;
+    int32_t *queries = calloc((size_t)requested_dpus * query_elems, sizeof(*queries));
+    int32_t *keys = calloc((size_t)requested_dpus * key_elems_per_dpu, sizeof(*keys));
+    int64_t *scores = calloc((size_t)requested_dpus * keys_per_dpu, sizeof(*scores));
+    int64_t *expected = calloc((size_t)requested_dpus * keys_per_dpu, sizeof(*expected));
+    if (!queries || !keys || !scores || !expected) {
         fprintf(stderr, "Failed to allocate host buffers\n");
-        dpu_free(dpu_set);
         free(queries);
         free(keys);
         free(scores);
-        free(metas);
         free(expected);
         return 1;
     }
 
-    for (uint32_t dpu_idx = 0; dpu_idx < nr_dpus; ++dpu_idx) {
+    for (uint32_t dpu_idx = 0; dpu_idx < requested_dpus; ++dpu_idx) {
         int32_t *q = &queries[(size_t)dpu_idx * query_elems];
-        int32_t *k = &keys[(size_t)dpu_idx * key_elems];
+        int32_t *k = &keys[(size_t)dpu_idx * key_elems_per_dpu];
         for (uint32_t dim = 0; dim < head_dim; ++dim) {
             q[dim] = (int32_t)((int)dpu_idx + 3 - (int)(dim % 13));
         }
@@ -85,46 +308,18 @@ int main(int argc, char **argv)
         }
     }
 
-    qk_args_t args = {
-        .head_dim = head_dim,
-        .num_keys = keys_per_dpu,
-        .key_stride = head_dim,
-        .reserved = 0,
-    };
-    DPU_ASSERT(dpu_broadcast_to(dpu_set, "qk_args", 0, &args, sizeof(args), DPU_XFER_DEFAULT));
-
-    DPU_FOREACH(dpu_set, dpu, each_dpu)
-    {
-        DPU_ASSERT(dpu_prepare_xfer(dpu, &queries[(size_t)each_dpu * query_elems]));
-    }
-    DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU, "query", 0, query_elems * sizeof(int32_t), DPU_XFER_DEFAULT));
-
-    DPU_FOREACH(dpu_set, dpu, each_dpu)
-    {
-        DPU_ASSERT(dpu_prepare_xfer(dpu, &keys[(size_t)each_dpu * key_elems]));
-    }
-    DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_TO_DPU, "keys", 0, key_elems * sizeof(int32_t), DPU_XFER_DEFAULT));
-
-    DPU_ASSERT(dpu_launch(dpu_set, DPU_SYNCHRONOUS));
-
-    DPU_FOREACH(dpu_set, dpu, each_dpu)
-    {
-        DPU_ASSERT(dpu_prepare_xfer(dpu, &scores[(size_t)each_dpu * keys_per_dpu]));
-    }
-    DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_FROM_DPU, "scores", 0, keys_per_dpu * sizeof(int64_t), DPU_XFER_DEFAULT));
-
-    DPU_FOREACH(dpu_set, dpu, each_dpu)
-    {
-        DPU_ASSERT(dpu_prepare_xfer(dpu, &metas[each_dpu]));
-    }
-    DPU_ASSERT(dpu_push_xfer(dpu_set, DPU_XFER_FROM_DPU, "qk_meta", 0, sizeof(qk_meta_t), DPU_XFER_DEFAULT));
-
     uint64_t max_cycles = 0;
+    int rc = run_dpu_qk(requested_dpus, head_dim, keys_per_dpu, queries, keys, scores, &max_cycles);
+    if (rc != 0) {
+        free(queries);
+        free(keys);
+        free(scores);
+        free(expected);
+        return rc;
+    }
+
     int ok = 1;
-    for (uint32_t dpu_idx = 0; dpu_idx < nr_dpus; ++dpu_idx) {
-        if (metas[dpu_idx].cycles > max_cycles) {
-            max_cycles = metas[dpu_idx].cycles;
-        }
+    for (uint32_t dpu_idx = 0; dpu_idx < requested_dpus; ++dpu_idx) {
         for (uint32_t key_idx = 0; key_idx < keys_per_dpu; ++key_idx) {
             size_t off = (size_t)dpu_idx * keys_per_dpu + key_idx;
             if (scores[off] != expected[off]) {
@@ -136,15 +331,13 @@ int main(int argc, char **argv)
 
     printf("UPMEM qk smoke test\n");
     printf("binary=%s\n", DPU_BINARY);
-    printf("dpus=%u head_dim=%u keys_per_dpu=%u\n", nr_dpus, head_dim, keys_per_dpu);
+    printf("dpus=%u head_dim=%u keys_per_dpu=%u\n", requested_dpus, head_dim, keys_per_dpu);
     printf("max_dpu_cycles=%" PRIu64 "\n", max_cycles);
     printf("status=%s\n", ok ? "PASS" : "FAIL");
 
-    dpu_free(dpu_set);
     free(queries);
     free(keys);
     free(scores);
-    free(metas);
     free(expected);
     return ok ? 0 : 1;
 }
