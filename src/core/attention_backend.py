@@ -120,10 +120,11 @@ class PimNaiveAttentionBackend:
         self.qk_shadow_max_abs_diff = 0
         self.qk_shadow_last_scores = []
         self.qk_mixed_enabled = True
-        self.qk_mixed_head = 0
+        self.qk_mixed_heads = 2
         self.qk_mixed_window = 128
         self.qk_mixed_count = 0
         self.qk_mixed_last_max_abs_diff = 0.0
+        self.qk_mixed_last_head_diffs = []
         self._run_dot_smoke_test()
 
     def _run_make_smoke(self, subdir: str, env_overrides: Dict[str, str]) -> str:
@@ -295,15 +296,20 @@ class PimNaiveAttentionBackend:
         values = self.cpu_backend.v_cache[request_id][layer_idx]
 
         scores = torch.einsum("hd,lhd->hl", q.float(), keys.float())
-        if self.qk_mixed_enabled and self.qk_mixed_head < scores.shape[0]:
+        if self.qk_mixed_enabled:
             try:
                 window = min(self.qk_mixed_window, keys.shape[0])
-                head = self.qk_mixed_head
-                pim_scores, _ = self._run_qk_scores(q[head], keys[-window:, head, :])
-                cpu_window_scores = scores[head, -window:].clone()
-                self.qk_mixed_last_max_abs_diff = float(torch.max(torch.abs(pim_scores - cpu_window_scores)).item())
-                scores[head, -window:] = pim_scores.to(scores.dtype)
-                self.qk_mixed_count += 1
+                mixed_heads = min(self.qk_mixed_heads, scores.shape[0])
+                head_diffs = []
+                for head in range(mixed_heads):
+                    pim_scores, _ = self._run_qk_scores(q[head], keys[-window:, head, :])
+                    cpu_window_scores = scores[head, -window:].clone()
+                    diff = float(torch.max(torch.abs(pim_scores - cpu_window_scores)).item())
+                    head_diffs.append(diff)
+                    scores[head, -window:] = pim_scores.to(scores.dtype)
+                self.qk_mixed_last_head_diffs = head_diffs
+                self.qk_mixed_last_max_abs_diff = max(head_diffs) if head_diffs else 0.0
+                self.qk_mixed_count += mixed_heads
             except Exception:
                 self.qk_check_failures += 1
                 raise
@@ -336,8 +342,9 @@ class PimNaiveAttentionBackend:
             "qk_shadow_max_abs_diff": self.qk_shadow_max_abs_diff,
             "qk_shadow_last_scores": self.qk_shadow_last_scores,
             "qk_mixed_enabled": self.qk_mixed_enabled,
-            "qk_mixed_head": self.qk_mixed_head,
+            "qk_mixed_heads": self.qk_mixed_heads,
             "qk_mixed_window": self.qk_mixed_window,
             "qk_mixed_count": self.qk_mixed_count,
             "qk_mixed_last_max_abs_diff": self.qk_mixed_last_max_abs_diff,
+            "qk_mixed_last_head_diffs": self.qk_mixed_last_head_diffs,
         }
