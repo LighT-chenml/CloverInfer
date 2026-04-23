@@ -118,6 +118,7 @@ class GlobalScheduler:
                 "throughput": throughput,
                 "total_tokens": total_tokens,
             }
+            metrics["attention_backend"] = await attention.get_info.remote()
             return generated_text, metrics
 
         return generated_text
