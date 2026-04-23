@@ -14,7 +14,7 @@ class ClusterConfig(BaseModel):
     num_attention_nodes: int = 1
     num_decode_dense_nodes: int = 1
     head_node_ip: str = "localhost"
-    redis_port: int = 6379
+    redis_port: int = 26379
     prefill_resource: Optional[str] = None
     decode_dense_resource: Optional[str] = None
     attention_resource: Optional[str] = None

@@ -8,7 +8,7 @@ from src.core.scheduler import GlobalScheduler
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--address", default="192.168.123.4:6379")
+    parser.add_argument("--address", default="192.168.123.4:26379")
     parser.add_argument("--model", default="/home/cml/CloverInfer/model/opt-125m")
     parser.add_argument("--prompt", default="Hello CloverInfer")
     parser.add_argument("--max-new-tokens", type=int, default=2)

@@ -57,17 +57,17 @@ Example Ray resource layout:
 
 ```bash
 # 192.168.123.4: Ray head and decode dense GPU node
-ray start --head --node-ip-address=192.168.123.4 --port=6379 \
+ray start --head --node-ip-address=192.168.123.4 --port=26379 \
   --num-gpus=1 \
   --resources='{"decode_dense_gpu": 1}'
 
 # 192.168.123.3: prefill GPU node
-ray start --address=192.168.123.4:6379 --node-ip-address=192.168.123.3 \
+ray start --address=192.168.123.4:26379 --node-ip-address=192.168.123.3 \
   --num-gpus=1 \
   --resources='{"prefill_gpu": 1}'
 
 # 192.168.123.7: CPU/PIM attention node
-ray start --address=192.168.123.4:6379 --node-ip-address=192.168.123.7 \
+ray start --address=192.168.123.4:26379 --node-ip-address=192.168.123.7 \
   --num-gpus=0 \
   --resources='{"attention_pim": 1}'
 ```
