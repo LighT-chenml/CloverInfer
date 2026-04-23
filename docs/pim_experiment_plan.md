@@ -247,6 +247,102 @@ Key metrics:
 - KV cache memory footprint
 - bytes transferred per token and per request
 
+## Naive PIM Baseline
+
+The first PIM version should be a correctness-first baseline, not an optimized
+implementation. It should stay simple enough to serve as a long-term comparison
+point for later PIM optimizations.
+
+Definition:
+
+- Keep the current three-node topology unchanged.
+- Keep the scheduler, actor placement, and message flow unchanged.
+- Replace only the attention backend on `192.168.123.7`.
+- Preserve `CpuAttentionBackend` as the correctness oracle.
+- Add `PimNaiveAttentionBackend` with the same public interface.
+
+Naive baseline requirements:
+
+- No overlap between transport and PIM compute.
+- No decode batching beyond the current correctness path.
+- No KV compression, paging, or speculative cache policy.
+- No fusion across layers or tokens.
+- One synchronous backend call per decode layer per token.
+- Prefer the simplest tensor layout that is easy to validate and measure.
+
+Recommended decomposition for the first UPMEM-backed baseline:
+
+- `AttentionNode` still owns KV cache lifecycle.
+- Host CPU on `192.168.123.7` is responsible for orchestration, data marshaling,
+  and result collection.
+- DPU code handles the smallest useful kernel first, even if the host still does
+  part of the attention computation.
+- If full attention is too much for the first step, use staged milestones:
+  - Stage A: DPU computes dot products or partial `QK^T`.
+  - Stage B: host CPU performs softmax.
+  - Stage C: DPU computes weighted value accumulation.
+  - Stage D: revisit whether softmax should also move to PIM.
+
+This staged path is acceptable for the naive baseline as long as the framework
+can switch between `cpu` and `pim_naive` under the same scheduler logic.
+
+### UPMEM-Oriented Implementation Sketch
+
+The likely implementation split is:
+
+- Host side:
+  - `dpu_alloc`
+  - `dpu_load`
+  - transfer inputs with host-to-DPU copy APIs
+  - `dpu_launch`
+  - transfer outputs back
+  - maintain DPU group/rank ownership and error handling
+- DPU side:
+  - C kernel compiled with the UPMEM toolchain
+  - explicit WRAM/MRAM layout
+  - tasklet-level work partitioning
+  - simple reductions and profiling hooks
+
+The framework should isolate this into a backend-specific module so the rest of
+the codebase never directly depends on raw UPMEM host/runtime APIs.
+
+### Planned Comparisons Involving Naive PIM
+
+- CPU attention baseline vs naive PIM baseline:
+  same transport, same scheduler, same actor layout
+- naive PIM baseline vs optimized PIM backend:
+  isolates gains from layout, overlap, batching, and cache policy
+- monolithic GPU vs naive PIM baseline:
+  shows the total cost/benefit of the full design
+
+### Expected Challenges To Measure Explicitly
+
+- Host-to-DPU and DPU-to-host transfer overhead
+- KV cache placement and update policy on the attention node
+- Whether softmax on host dominates overall layer latency
+- Per-layer launch overhead on the DPU runtime
+- Head-level or token-level work partition granularity
+- Precision and numerical drift relative to the CPU backend
+- Capacity limits when context length grows
+- Whether long-context decode is needed before PIM benefits appear
+
+These should be reported as measured bottlenecks rather than guessed ones.
+
+## UPMEM Readiness Notes
+
+Before writing the production `PimNaiveAttentionBackend`, confirm:
+
+- exact SDK version and driver version on `192.168.123.7`
+- available number of ranks/DPUs
+- working host compile path for `libdpu`
+- working DPU compile path for the device kernel
+- whether the backend will use a C/C++ extension, subprocess wrapper, or a thin
+  standalone helper binary
+
+The first milestone does not need to integrate directly with PyTorch custom ops.
+A standalone backend wrapper that exchanges plain buffers is acceptable if it is
+easier to validate and profile.
+
 ## Immediate Refactor Checklist
 
 - Rename or replace `FFNNode` with `DecodeDenseNode`.
