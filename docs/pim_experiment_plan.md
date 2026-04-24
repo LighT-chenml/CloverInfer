@@ -223,15 +223,15 @@ decode.
 
 ### Current Qwen-1_8B Snapshot
 
-First small real-model comparison on `dataset/humaneval.jsonl` with `limit=2`
-and `max_new_tokens=3`:
+Refreshed small real-model comparison on `dataset/humaneval.jsonl` with
+`limit=5` and `max_new_tokens=3`:
 
 | Baseline | Avg Latency (s) | Avg Throughput (tok/s) |
 | --- | ---: | ---: |
-| `monolithic_gpu` | `0.242` | `22.59` |
-| `split_gpu_full_decode` | `0.841` | `4.21` |
-| `disagg_cpu` | `2.224` | `1.39` |
-| `disagg_pim_naive` | `5.764` | `0.52` |
+| `monolithic_gpu` | `0.292` | `15.66` |
+| `split_gpu_full_decode` | `0.739` | `4.86` |
+| `disagg_cpu` | `2.143` | `1.43` |
+| `disagg_pim_naive` | `2.425` | `1.27` |
 
 Immediate takeaway:
 
@@ -239,8 +239,8 @@ Immediate takeaway:
   remote-attention baselines are.
 - The dominant extra overhead currently appears after the attention path is
   moved off the dense GPU node.
-- `pim_naive` is functioning as a correctness/challenge baseline, not a
-  competitive performance point.
+- after host-side batching and persistent-helper reuse, `pim_naive` is now much
+  closer to `disagg_cpu` than before, though it is still slower.
 
 This is still a useful result. It means the experimental framework is already
 able to separate:
@@ -249,8 +249,28 @@ able to separate:
 - remote-attention overhead
 - naive-PIM-specific overhead
 
+Updated interpretation:
+
+- the original naive PIM gap was heavily inflated by host orchestration
+- the current helper-based naive PIM path is now a credible baseline for the
+  next design step: resident KV placement on DPUs
+
 That separation is important both for optimization work and for paper-quality
 analysis.
+
+### Next Design Step
+
+The next implementation target is defined in:
+
+- `docs/pim_resident_kv_baseline_design_20260424.md`
+
+Summary:
+
+- keep DPU runtime persistent
+- move from helper-based QK offload toward resident KV placement on the PIM
+  node
+- use head-wise or head-group-wise sharding first
+- keep softmax and `AV` on the host for the first resident-KV baseline
 
 ## Experiment Matrix
 
@@ -385,6 +405,9 @@ systems contribution even before the optimized PIM backend is finished.
 For a paper-oriented bottleneck writeup based on current measurements, see:
 
 - `docs/pim_challenge_analysis_20260424.md`
+- `docs/pim_optimization_roadmap_20260424.md`
+- `docs/pim_batched_qk_round3_20260424.md`
+- `docs/pim_stdio_helper_round4_20260424.md`
 
 ## UPMEM Readiness Notes
 

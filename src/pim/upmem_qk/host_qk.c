@@ -15,6 +15,7 @@ static void usage(const char *prog)
 {
     fprintf(stderr, "Usage: %s [num_dpus] [head_dim] [keys_per_dpu]\n", prog);
     fprintf(stderr, "       %s --input qk_input.bin --output scores.bin [--num-dpus N]\n", prog);
+    fprintf(stderr, "       %s --stdio [--num-dpus N]\n", prog);
 }
 
 typedef struct {
@@ -131,6 +132,154 @@ static int read_exact(FILE *file, void *dst, size_t bytes)
 static int write_exact(FILE *file, const void *src, size_t bytes)
 {
     return fwrite(src, 1, bytes, file) == bytes ? 0 : 1;
+}
+
+static int flush_exact(FILE *file)
+{
+    return fflush(file) == 0 ? 0 : 1;
+}
+
+static int run_stdio_mode(uint32_t requested_dpus)
+{
+    qk_runner_t runner;
+    int rc = qk_runner_init(&runner, requested_dpus);
+    if (rc != 0) {
+        return rc;
+    }
+
+    for (;;) {
+        qk_io_header_t header;
+        if (read_exact(stdin, &header, sizeof(header)) != 0) {
+            if (feof(stdin)) {
+                rc = 0;
+            } else {
+                fprintf(stderr, "Failed to read stdio header\n");
+                rc = 1;
+            }
+            break;
+        }
+
+        if (header.magic != QK_IO_MAGIC) {
+            fprintf(stderr, "Invalid stdio magic\n");
+            rc = 1;
+            break;
+        }
+        if (header.head_dim == 0 || header.num_keys == 0 || header.head_dim > MAX_HEAD_DIM || header.num_keys > MAX_KEYS_PER_DPU || (header.head_dim % 2) != 0) {
+            fprintf(stderr, "Invalid stdio header parameters\n");
+            rc = 1;
+            break;
+        }
+
+        uint32_t head_dim = header.head_dim;
+        uint32_t total_keys = header.num_keys;
+        uint32_t num_queries = header.reserved == 0 ? 1 : header.reserved;
+        uint32_t num_dpus = runner.nr_dpus;
+        if (num_dpus > total_keys) {
+            num_dpus = total_keys;
+        }
+        uint32_t keys_per_dpu = (total_keys + num_dpus - 1) / num_dpus;
+        if (keys_per_dpu > MAX_KEYS_PER_DPU) {
+            fprintf(stderr, "Too many keys per DPU after partitioning: %u\n", keys_per_dpu);
+            rc = 1;
+            break;
+        }
+
+        int32_t *queries_in = calloc((size_t)num_queries * head_dim, sizeof(*queries_in));
+        int32_t *keys_in = calloc((size_t)num_queries * total_keys * head_dim, sizeof(*keys_in));
+        int32_t *queries = calloc((size_t)num_dpus * head_dim, sizeof(*queries));
+        int32_t *keys_partitioned = calloc((size_t)num_dpus * keys_per_dpu * head_dim, sizeof(*keys_partitioned));
+        int64_t *scores_partitioned = calloc((size_t)num_dpus * keys_per_dpu, sizeof(*scores_partitioned));
+        int64_t *scores_out = calloc((size_t)num_queries * total_keys, sizeof(*scores_out));
+        if (!queries_in || !keys_in || !queries || !keys_partitioned || !scores_partitioned || !scores_out) {
+            fprintf(stderr, "Failed to allocate stdio buffers\n");
+            free(queries_in);
+            free(keys_in);
+            free(queries);
+            free(keys_partitioned);
+            free(scores_partitioned);
+            free(scores_out);
+            rc = 1;
+            break;
+        }
+
+        if (read_exact(stdin, queries_in, (size_t)num_queries * head_dim * sizeof(int32_t)) != 0
+            || read_exact(stdin, keys_in, (size_t)num_queries * total_keys * head_dim * sizeof(int32_t)) != 0) {
+            fprintf(stderr, "Failed to read stdio payload\n");
+            free(queries_in);
+            free(keys_in);
+            free(queries);
+            free(keys_partitioned);
+            free(scores_partitioned);
+            free(scores_out);
+            rc = 1;
+            break;
+        }
+
+        for (uint32_t query_idx = 0; query_idx < num_queries && rc == 0; ++query_idx) {
+            memset(queries, 0, (size_t)num_dpus * head_dim * sizeof(*queries));
+            memset(keys_partitioned, 0, (size_t)num_dpus * keys_per_dpu * head_dim * sizeof(*keys_partitioned));
+            memset(scores_partitioned, 0, (size_t)num_dpus * keys_per_dpu * sizeof(*scores_partitioned));
+
+            const int32_t *query = &queries_in[(size_t)query_idx * head_dim];
+            const int32_t *query_keys = &keys_in[(size_t)query_idx * total_keys * head_dim];
+
+            for (uint32_t dpu_idx = 0; dpu_idx < num_dpus; ++dpu_idx) {
+                memcpy(&queries[(size_t)dpu_idx * head_dim], query, head_dim * sizeof(int32_t));
+                for (uint32_t local_key = 0; local_key < keys_per_dpu; ++local_key) {
+                    uint32_t global_key = dpu_idx * keys_per_dpu + local_key;
+                    if (global_key < total_keys) {
+                        memcpy(
+                            &keys_partitioned[((size_t)dpu_idx * keys_per_dpu + local_key) * head_dim],
+                            &query_keys[(size_t)global_key * head_dim],
+                            head_dim * sizeof(int32_t));
+                    }
+                }
+            }
+
+            uint64_t query_cycles = 0;
+            rc = qk_runner_run(&runner, head_dim, keys_per_dpu, queries, keys_partitioned, scores_partitioned, &query_cycles);
+            if (rc == 0) {
+                for (uint32_t dpu_idx = 0; dpu_idx < num_dpus; ++dpu_idx) {
+                    for (uint32_t local_key = 0; local_key < keys_per_dpu; ++local_key) {
+                        uint32_t global_key = dpu_idx * keys_per_dpu + local_key;
+                        if (global_key < total_keys) {
+                            scores_out[(size_t)query_idx * total_keys + global_key] =
+                                scores_partitioned[(size_t)dpu_idx * keys_per_dpu + local_key];
+                        }
+                    }
+                }
+            }
+        }
+
+        if (rc == 0) {
+            qk_io_header_t out_header = {
+                .magic = QK_IO_MAGIC,
+                .head_dim = head_dim,
+                .num_keys = total_keys,
+                .reserved = num_queries,
+            };
+            if (write_exact(stdout, &out_header, sizeof(out_header)) != 0
+                || write_exact(stdout, scores_out, (size_t)num_queries * total_keys * sizeof(int64_t)) != 0
+                || flush_exact(stdout) != 0) {
+                fprintf(stderr, "Failed to write stdio output\n");
+                rc = 1;
+            }
+        }
+
+        free(queries_in);
+        free(keys_in);
+        free(queries);
+        free(keys_partitioned);
+        free(scores_partitioned);
+        free(scores_out);
+
+        if (rc != 0) {
+            break;
+        }
+    }
+
+    qk_runner_destroy(&runner);
+    return rc;
 }
 
 static int run_file_mode(const char *input_path, const char *output_path, uint32_t requested_dpus)
@@ -290,6 +439,7 @@ int main(int argc, char **argv)
     uint32_t keys_per_dpu = 8;
     const char *input_path = NULL;
     const char *output_path = NULL;
+    int stdio_mode = 0;
 
     for (int idx = 1; idx < argc; ++idx) {
         if (strcmp(argv[idx], "--input") == 0 && idx + 1 < argc) {
@@ -298,7 +448,12 @@ int main(int argc, char **argv)
             output_path = argv[++idx];
         } else if (strcmp(argv[idx], "--num-dpus") == 0 && idx + 1 < argc) {
             requested_dpus = (uint32_t)strtoul(argv[++idx], NULL, 10);
+        } else if (strcmp(argv[idx], "--stdio") == 0) {
+            stdio_mode = 1;
         }
+    }
+    if (stdio_mode) {
+        return run_stdio_mode(requested_dpus);
     }
     if (input_path != NULL || output_path != NULL) {
         if (input_path == NULL || output_path == NULL) {

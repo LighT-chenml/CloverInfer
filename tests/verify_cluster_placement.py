@@ -20,6 +20,7 @@ def parse_args():
     parser.add_argument("--skip-generation", action="store_true")
     parser.add_argument("--attention-backend", default="cpu", choices=["cpu", "pim_naive"])
     parser.add_argument("--pim-num-dpus", type=int, default=4)
+    parser.add_argument("--pim-resident-store-backend", default="host", choices=["host", "upmem_kvslot"])
     parser.add_argument("--pim-qk-mixed-enabled", action="store_true")
     parser.add_argument("--no-pim-qk-mixed-enabled", action="store_true")
     parser.add_argument("--pim-qk-mixed-heads", type=int, default=2)
@@ -55,6 +56,7 @@ def main():
         use_gpu_for_decode_dense=True,
         attention_backend=args.attention_backend,
         pim_num_dpus=args.pim_num_dpus,
+        pim_resident_store_backend=args.pim_resident_store_backend,
         pim_qk_mixed_enabled=pim_qk_mixed_enabled,
         pim_qk_mixed_heads=args.pim_qk_mixed_heads,
         pim_qk_mixed_window=args.pim_qk_mixed_window,
@@ -77,9 +79,12 @@ def main():
         debug = info["attention"]["backend_debug"]
         assert debug["num_dpus"] == args.pim_num_dpus, debug
         assert debug["length"] == args.pim_length, debug
+        assert debug["resident_store_backend"] == args.pim_resident_store_backend, debug
         assert debug["qk_mixed_enabled"] == pim_qk_mixed_enabled, debug
         assert debug["qk_mixed_heads"] == args.pim_qk_mixed_heads, debug
         assert debug["qk_mixed_window"] == args.pim_qk_mixed_window, debug
+        assert debug["resident_metadata_enabled"] is True, debug
+        assert debug["resident_compute_enabled"] is True, debug
 
     if not args.skip_generation:
         output, metrics = ray.get(
@@ -97,6 +102,18 @@ def main():
         assert stage_timing["counts"]["decode_layers"] >= stage_timing["counts"]["decode_steps"]
         assert stage_timing["scheduler"]["total_rpc_s"] >= 0
         assert stage_timing["actors"]["total_compute_s"] >= 0
+        if args.attention_backend == "pim_naive":
+            debug = metrics["attention_backend"]["backend_debug"]
+            assert debug["resident_append_ops"] > 0, debug
+            assert debug["resident_materialize_ops"] > 0, debug
+            assert debug["resident_shadow_max_abs_diff"] == 0.0, debug
+            assert debug["resident_last_freed_request_id"], debug
+            assert debug["resident_request_count"] == 0, debug
+            if args.pim_resident_store_backend == "upmem_kvslot":
+                store_debug = debug["resident_store_debug"]
+                assert store_debug["backend"] == "upmem_kvslot_store", store_debug
+                assert store_debug["dpu_allocations"] > 0, store_debug
+                assert store_debug["helper_restarts"] >= 1, store_debug
 
     print("Placement verification passed.")
 

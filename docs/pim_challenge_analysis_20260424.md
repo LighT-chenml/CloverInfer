@@ -21,9 +21,15 @@ The key rule in this document is:
 - Naive PIM mixed-head sweep:
   - `docs/pim_attention_sweep_round1.md`
   - `artifacts/attention_sweep_heads_timing.jsonl`
+- Post-stdio mixed-head sweep:
+  - `docs/pim_attention_sweep_after_stdio_round5_20260424.md`
+  - `artifacts/attention_sweep_heads_stdio_round4.jsonl`
 - Naive PIM context sweep:
   - `docs/pim_context_sweep_round2.md`
   - `artifacts/context_sweep_round2.jsonl`
+- Post-stdio context sweep:
+  - `docs/pim_context_sweep_after_stdio_round5_20260424.md`
+  - `artifacts/context_sweep_after_stdio_round5.jsonl`
 
 ## Main Baseline Matrix
 
@@ -181,6 +187,29 @@ Priority 1:
 - Replace repeated subprocess / file-based QK execution with a more persistent
   or batched path
 
+Status update:
+
+- a first batched mixed-head host-path optimization was implemented and
+  validated in `docs/pim_batched_qk_round3_20260424.md`
+- this reduced `disagg_pim_naive` average latency from about `5.764s` to about
+  `4.117s` on the current two-sample Qwen smoke comparison
+- the result strengthens the conclusion that invocation granularity was a real
+  bottleneck rather than a speculative one
+- a second optimization replaced temporary-file/process-heavy QK execution with
+  a persistent stdio helper, recorded in
+  `docs/pim_stdio_helper_round4_20260424.md`
+- in a `limit=5` Qwen comparison, this brought `disagg_pim_naive` down to about
+  `2.518s`, versus about `2.159s` for `disagg_cpu`
+- this further strengthens the conclusion that host-side orchestration was a
+  first-order bottleneck
+- a post-stdio mixed-head sweep, recorded in
+  `docs/pim_attention_sweep_after_stdio_round5_20260424.md`, showed that the
+  previous latency explosion versus `mixed_heads` was dramatically reduced
+- for example, at `mixed_heads = 12`, average latency dropped from about
+  `31.455s` in round 1 to about `3.731s` after batching + persistent helper
+- this indicates the original mixed-head scaling was dominated far more by
+  invocation granularity than by unavoidable DPU-side arithmetic cost
+
 Priority 2:
 
 - Batch more work into each attention-side call
@@ -190,6 +219,12 @@ Priority 3:
 
 - Re-evaluate longer contexts after host-side batching is improved
 - The current `16-512` token sweep is still dominated by fixed overhead
+- a post-stdio context sweep, recorded in
+  `docs/pim_context_sweep_after_stdio_round5_20260424.md`, shows that naive PIM
+  is now more context-sensitive than before, but still remains slower than the
+  remote CPU baseline in the tested `16-512` token range
+- this suggests the system is finally approaching a regime where actual KV/QK
+  work is visible again, although no PIM advantage is yet exposed at this scale
 
 Priority 4:
 

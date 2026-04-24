@@ -69,6 +69,7 @@ class GlobalScheduler:
             attention_backend_kwargs = {
                 "num_dpus": int(self.cluster_config.pim_num_dpus),
                 "length": int(self.cluster_config.pim_length),
+                "resident_store_backend": str(self.cluster_config.pim_resident_store_backend),
                 "qk_mixed_enabled": bool(self.cluster_config.pim_qk_mixed_enabled),
                 "qk_mixed_heads": int(self.cluster_config.pim_qk_mixed_heads),
                 "qk_mixed_window": int(self.cluster_config.pim_qk_mixed_window),
