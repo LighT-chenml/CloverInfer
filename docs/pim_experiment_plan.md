@@ -291,6 +291,10 @@ Current implementation note:
   `tests/verify_cluster_placement.py`, so experiments can sweep
   `pim_num_dpus`, `pim_qk_mixed_enabled`, `pim_qk_mixed_heads`,
   `pim_qk_mixed_window`, and `pim_length` without editing backend code.
+- Structured sweep support is available via
+  `tests/benchmark_attention_sweep.py` and
+  `scripts/pim/run_attention_sweep.sh` for CPU-vs-PIM and multi-head QK
+  experiments with JSONL output.
 
 ### UPMEM-Oriented Implementation Sketch
 
