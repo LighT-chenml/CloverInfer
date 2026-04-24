@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import math
+import time
 from typing import Dict, List
 
 import torch
@@ -200,6 +201,22 @@ class CausalModelAdapter:
             return value[0].contiguous().cpu()
         raise ValueError(f"Unsupported model type for cache normalization: {self.model_type}")
 
+    def _denormalize_past_key_values(self, initial_kv: List[Dict[str, torch.Tensor]]):
+        past_key_values = []
+        for layer_kv in initial_kv:
+            key = layer_kv["key"].to(self.device)
+            value = layer_kv["value"].to(self.device)
+            if self.model_type == "opt":
+                key = key.permute(1, 0, 2).unsqueeze(0).contiguous()
+                value = value.permute(1, 0, 2).unsqueeze(0).contiguous()
+            elif self.model_type == "qwen":
+                key = key.unsqueeze(0).contiguous()
+                value = value.unsqueeze(0).contiguous()
+            else:
+                raise ValueError(f"Unsupported model type for cache restore: {self.model_type}")
+            past_key_values.append((key, value))
+        return tuple(past_key_values)
+
     def start_token(self, token_id: int, position: int) -> torch.Tensor:
         input_ids = torch.tensor([[token_id]], dtype=torch.long, device=self.device)
         if self.model_type == "opt":
@@ -361,6 +378,113 @@ class CausalModelAdapter:
 
     def decode_tokens(self, token_ids: List[int]) -> str:
         return self.tokenizer.decode(token_ids, skip_special_tokens=True)
+
+    def greedy_generate(self, prompt: str, max_new_tokens: int) -> Dict[str, object]:
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be positive")
+
+        inputs = self._tokenize_prompt(prompt)
+        model_inputs = {
+            key: value.to(self.device)
+            for key, value in inputs.items()
+        }
+        prompt_len = int(model_inputs["input_ids"].shape[1])
+
+        started_at = time.perf_counter()
+        with torch.no_grad():
+            outputs = self.model(**model_inputs, use_cache=True)
+            first_token_id = int(torch.argmax(outputs.logits[:, -1, :], dim=-1).item())
+            first_token_at = time.perf_counter()
+
+            generated_ids = [first_token_id]
+            current_token_id = first_token_id
+            past_key_values = outputs.past_key_values
+
+            for step in range(1, max_new_tokens):
+                total_len = prompt_len + step
+                decode_inputs = {
+                    "input_ids": torch.tensor([[current_token_id]], dtype=torch.long, device=self.device),
+                    "attention_mask": torch.ones((1, total_len), dtype=torch.long, device=self.device),
+                    "past_key_values": past_key_values,
+                    "use_cache": True,
+                }
+                outputs = self.model(**decode_inputs)
+                current_token_id = int(torch.argmax(outputs.logits[:, -1, :], dim=-1).item())
+                past_key_values = outputs.past_key_values
+                generated_ids.append(current_token_id)
+
+        finished_at = time.perf_counter()
+        latency = float(finished_at - started_at)
+        ttft = float(first_token_at - started_at)
+        total_tokens = len(generated_ids)
+        tpot = float((latency - ttft) / max(total_tokens - 1, 1))
+        throughput = float(total_tokens / latency) if latency > 0 else 0.0
+
+        return {
+            "prompt_len": prompt_len,
+            "generated_ids": generated_ids,
+            "text": self.decode_tokens(generated_ids),
+            "metrics": {
+                "ttft": ttft,
+                "tpot": tpot,
+                "latency": latency,
+                "throughput": throughput,
+                "total_tokens": total_tokens,
+            },
+        }
+
+    def continue_greedy_generate(
+        self,
+        initial_kv: List[Dict[str, torch.Tensor]],
+        prompt_len: int,
+        first_token_id: int,
+        max_new_tokens: int,
+    ) -> Dict[str, object]:
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be positive")
+
+        started_at = time.perf_counter()
+        generated_ids = [int(first_token_id)]
+
+        if max_new_tokens == 1:
+            finished_at = time.perf_counter()
+            latency = float(finished_at - started_at)
+            return {
+                "generated_ids": generated_ids,
+                "text": self.decode_tokens(generated_ids),
+                "metrics": {
+                    "latency": latency,
+                    "generated_tokens_after_prefill": 0,
+                },
+            }
+
+        with torch.no_grad():
+            past_key_values = self._denormalize_past_key_values(initial_kv)
+            current_token_id = int(first_token_id)
+
+            for step in range(1, max_new_tokens):
+                total_len = int(prompt_len) + step
+                decode_inputs = {
+                    "input_ids": torch.tensor([[current_token_id]], dtype=torch.long, device=self.device),
+                    "attention_mask": torch.ones((1, total_len), dtype=torch.long, device=self.device),
+                    "past_key_values": past_key_values,
+                    "use_cache": True,
+                }
+                outputs = self.model(**decode_inputs)
+                current_token_id = int(torch.argmax(outputs.logits[:, -1, :], dim=-1).item())
+                past_key_values = outputs.past_key_values
+                generated_ids.append(current_token_id)
+
+        finished_at = time.perf_counter()
+        latency = float(finished_at - started_at)
+        return {
+            "generated_ids": generated_ids,
+            "text": self.decode_tokens(generated_ids),
+            "metrics": {
+                "latency": latency,
+                "generated_tokens_after_prefill": max(0, len(generated_ids) - 1),
+            },
+        }
 
     def _patch_qwen_runtime_compatibility(self, model):
         backbone = getattr(model, "transformer", None)

@@ -221,6 +221,37 @@ attention/PIM because communication overhead can dominate. The design is more
 likely to show benefits for longer contexts, larger KV cache reads, and batched
 decode.
 
+### Current Qwen-1_8B Snapshot
+
+First small real-model comparison on `dataset/humaneval.jsonl` with `limit=2`
+and `max_new_tokens=3`:
+
+| Baseline | Avg Latency (s) | Avg Throughput (tok/s) |
+| --- | ---: | ---: |
+| `monolithic_gpu` | `0.242` | `22.59` |
+| `split_gpu_full_decode` | `0.841` | `4.21` |
+| `disagg_cpu` | `2.224` | `1.39` |
+| `disagg_pim_naive` | `5.764` | `0.52` |
+
+Immediate takeaway:
+
+- `split_gpu_full_decode` is much closer to the monolithic baseline than the
+  remote-attention baselines are.
+- The dominant extra overhead currently appears after the attention path is
+  moved off the dense GPU node.
+- `pim_naive` is functioning as a correctness/challenge baseline, not a
+  competitive performance point.
+
+This is still a useful result. It means the experimental framework is already
+able to separate:
+
+- prefill/decode disaggregation overhead
+- remote-attention overhead
+- naive-PIM-specific overhead
+
+That separation is important both for optimization work and for paper-quality
+analysis.
+
 ## Experiment Matrix
 
 Start small and increase scale only after correctness is stable.
@@ -337,6 +368,23 @@ the codebase never directly depends on raw UPMEM host/runtime APIs.
 - Whether long-context decode is needed before PIM benefits appear
 
 These should be reported as measured bottlenecks rather than guessed ones.
+
+## Writing Guidance
+
+Given the current measurements, the safest and most honest paper framing is:
+
+- first show that the three-way split is implementable and measurable on real
+  hardware
+- then show that remote attention is the dominant current bottleneck
+- then position PIM as a candidate mechanism for addressing that bottleneck,
+  rather than claiming the present naive implementation is already superior
+
+This framing is stronger than overclaiming. It lets the paper make a precise
+systems contribution even before the optimized PIM backend is finished.
+
+For a paper-oriented bottleneck writeup based on current measurements, see:
+
+- `docs/pim_challenge_analysis_20260424.md`
 
 ## UPMEM Readiness Notes
 

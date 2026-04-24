@@ -212,6 +212,20 @@ class DecodeDenseNode:
             },
         }
 
+    def continue_full_decode(self, initial_kv, prompt_len: int, first_token_id: int, max_new_tokens: int):
+        started_at = time.perf_counter()
+        result = self.adapter.continue_greedy_generate(
+            initial_kv=initial_kv,
+            prompt_len=int(prompt_len),
+            first_token_id=int(first_token_id),
+            max_new_tokens=int(max_new_tokens),
+        )
+        finished_at = time.perf_counter()
+        result["profile"] = {
+            "compute_s": float(finished_at - started_at),
+        }
+        return result
+
 
 # Compatibility names for older scripts. RDMA-specific methods are intentionally
 # not preserved in the correctness-first refactor.
