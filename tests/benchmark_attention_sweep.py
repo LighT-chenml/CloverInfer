@@ -4,9 +4,10 @@ import os
 import statistics
 import sys
 import time
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import ray
+from transformers import AutoTokenizer
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
@@ -76,6 +77,29 @@ def summarize_stage_timing(stage_timing: Dict[str, object]) -> Dict[str, float]:
     }
 
 
+def build_prompt_for_target_tokens(tokenizer, target_tokens: int) -> Tuple[str, int]:
+    if target_tokens <= 0:
+        raise ValueError("target token length must be positive")
+
+    prefix_ids = tokenizer.encode("Context:", add_special_tokens=False)
+    filler_ids = tokenizer.encode(" clover", add_special_tokens=False)
+    if not prefix_ids or not filler_ids:
+        raise ValueError("failed to build prompt tokens for sweep")
+
+    token_ids = list(prefix_ids)
+    while len(token_ids) < target_tokens:
+        token_ids.extend(filler_ids)
+    token_ids = token_ids[:target_tokens]
+
+    prompt = tokenizer.decode(token_ids, clean_up_tokenization_spaces=False)
+    actual_ids = tokenizer.encode(prompt, add_special_tokens=False)
+
+    # Decode/encode is expected to round-trip cleanly for the local tokenizer.
+    # Keep the actual length in the record either way, so experiments remain
+    # explicit even if tokenizer normalization changes in the future.
+    return prompt, len(actual_ids)
+
+
 def make_scheduler(args, attention_backend: str, mixed_heads: int) -> ray.actor.ActorHandle:
     cluster = ClusterConfig(
         num_prefill_workers=1,
@@ -97,7 +121,13 @@ def make_scheduler(args, attention_backend: str, mixed_heads: int) -> ray.actor.
     return GlobalScheduler.remote(cluster, model)
 
 
-def run_case(args, attention_backend: str, mixed_heads: int) -> Dict[str, object]:
+def run_case(
+    args,
+    attention_backend: str,
+    mixed_heads: int,
+    prompt: str,
+    prompt_token_length: int,
+) -> Dict[str, object]:
     scheduler = make_scheduler(args, attention_backend, mixed_heads)
     info = ray.get(scheduler.initialize_cluster.remote())
 
@@ -112,7 +142,6 @@ def run_case(args, attention_backend: str, mixed_heads: int) -> Dict[str, object
     stage_summaries = []
 
     for repeat_idx in range(args.repeats):
-        prompt = args.prompt
         started_at = time.time()
         output, metrics = ray.get(
             scheduler.submit_request.remote(
@@ -142,6 +171,7 @@ def run_case(args, attention_backend: str, mixed_heads: int) -> Dict[str, object
                 "pim_num_dpus": int(args.pim_num_dpus),
                 "pim_length": int(args.pim_length),
                 "max_new_tokens": int(args.max_new_tokens),
+                "prompt_token_length": int(prompt_token_length),
                 "repeat_idx": int(repeat_idx),
             },
             "placement": info,
@@ -157,6 +187,7 @@ def run_case(args, attention_backend: str, mixed_heads: int) -> Dict[str, object
         "attention_backend": attention_backend,
         "pim_qk_mixed_enabled": bool(args.pim_qk_mixed_enabled),
         "pim_qk_mixed_heads": int(mixed_heads),
+        "prompt_token_length": int(prompt_token_length),
         "repeats": int(args.repeats),
         "avg_ttft": statistics.mean(ttfts),
         "avg_tpot": statistics.mean(tpots),
@@ -179,6 +210,7 @@ def main():
     parser.add_argument("--address", default="192.168.123.4:26379")
     parser.add_argument("--model", default="/home/cml/CloverInfer/model/opt-125m")
     parser.add_argument("--prompt", default="Hello CloverInfer")
+    parser.add_argument("--prompt-token-lengths", type=parse_int_list, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--attention-backends", type=parse_str_list, default=["cpu", "pim_naive"])
@@ -203,6 +235,19 @@ def main():
 
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
 
+    tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
+    prompt_cases = [
+        (
+            args.prompt,
+            len(tokenizer.encode(args.prompt, add_special_tokens=False)),
+        )
+    ]
+    if args.prompt_token_lengths:
+        prompt_cases = []
+        for target_tokens in args.prompt_token_lengths:
+            prompt, actual_tokens = build_prompt_for_target_tokens(tokenizer, target_tokens)
+            prompt_cases.append((prompt, actual_tokens))
+
     ray.init(
         address=args.address,
         runtime_env={"env_vars": {"PYTHONPATH": REPO_ROOT}},
@@ -210,15 +255,16 @@ def main():
 
     summaries = []
     with open(args.output, "w", encoding="utf-8") as f:
-        for backend in args.attention_backends:
-            mixed_heads_list = args.pim_qk_mixed_heads_list if backend == "pim_naive" else [0]
-            for mixed_heads in mixed_heads_list:
-                result = run_case(args, backend, mixed_heads)
-                for record in result["records"]:
-                    f.write(json.dumps({"type": "record", **record}) + "\n")
-                f.write(json.dumps({"type": "summary", **result["summary"]}) + "\n")
-                summaries.append(result["summary"])
-                print(json.dumps(result["summary"], ensure_ascii=True))
+        for prompt, prompt_token_length in prompt_cases:
+            for backend in args.attention_backends:
+                mixed_heads_list = args.pim_qk_mixed_heads_list if backend == "pim_naive" else [0]
+                for mixed_heads in mixed_heads_list:
+                    result = run_case(args, backend, mixed_heads, prompt, prompt_token_length)
+                    for record in result["records"]:
+                        f.write(json.dumps({"type": "record", **record}) + "\n")
+                    f.write(json.dumps({"type": "summary", **result["summary"]}) + "\n")
+                    summaries.append(result["summary"])
+                    print(json.dumps(result["summary"], ensure_ascii=True))
 
     print(f"Saved benchmark records to {args.output}")
 
