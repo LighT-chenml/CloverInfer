@@ -43,6 +43,7 @@ class CpuAttentionBackend:
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        score_scale: float = 1.0,
     ) -> torch.Tensor:
         if request_id not in self.k_cache:
             raise KeyError(f"Unknown request {request_id}")
@@ -69,7 +70,7 @@ class CpuAttentionBackend:
         values = self.v_cache[request_id][layer_idx]
 
         # q: [heads, dim], keys/values: [seq, heads, dim]
-        scores = torch.einsum("hd,lhd->hl", q.float(), keys.float())
+        scores = torch.einsum("hd,lhd->hl", q.float(), keys.float()) * float(score_scale)
         weights = torch.softmax(scores, dim=-1)
         context = torch.einsum("hl,lhd->hd", weights, values.float()).to(query.dtype)
 
@@ -273,6 +274,7 @@ class PimNaiveAttentionBackend:
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        score_scale: float = 1.0,
     ) -> torch.Tensor:
         if request_id not in self.cpu_backend.k_cache:
             raise KeyError(f"Unknown request {request_id}")
@@ -298,7 +300,7 @@ class PimNaiveAttentionBackend:
         keys = self.cpu_backend.k_cache[request_id][layer_idx]
         values = self.cpu_backend.v_cache[request_id][layer_idx]
 
-        scores = torch.einsum("hd,lhd->hl", q.float(), keys.float())
+        scores = torch.einsum("hd,lhd->hl", q.float(), keys.float()) * float(score_scale)
         if self.qk_mixed_enabled:
             try:
                 window = min(self.qk_mixed_window, keys.shape[0])
@@ -306,6 +308,7 @@ class PimNaiveAttentionBackend:
                 head_diffs = []
                 for head in range(mixed_heads):
                     pim_scores, _ = self._run_qk_scores(q[head], keys[-window:, head, :])
+                    pim_scores = pim_scores * float(score_scale)
                     cpu_window_scores = scores[head, -window:].clone()
                     diff = float(torch.max(torch.abs(pim_scores - cpu_window_scores)).item())
                     head_diffs.append(diff)

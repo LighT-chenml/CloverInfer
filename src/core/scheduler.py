@@ -152,7 +152,7 @@ class GlobalScheduler:
                     stage_timing["counts"]["decode_layers"] += 1
 
                     rpc_started = time.perf_counter()
-                    prepared = await dense.prepare_attention.remote(hidden, layer_idx, request_id)
+                    prepared = await dense.prepare_attention.remote(hidden, layer_idx, request_id, prompt_len + step)
                     stage_timing["scheduler"]["prepare_attention_rpc_s"] += time.perf_counter() - rpc_started
                     stage_timing["actors"]["dense_prepare_attention_compute_s"] += float(
                         prepared.get("profile", {}).get("compute_s", 0.0)
