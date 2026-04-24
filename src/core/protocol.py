@@ -28,3 +28,4 @@ class GenerationMetrics:
     latency: float
     throughput: float
     total_tokens: int
+    stage_timing: Dict[str, object]

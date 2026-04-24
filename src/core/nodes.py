@@ -67,6 +67,7 @@ class PrefillNode:
         }
 
     def process_prompt(self, prompt: str):
+        started_at = time.perf_counter()
         request_id = f"req_{time.time_ns()}"
         inputs = self.tokenizer(prompt, return_tensors="pt")
         input_ids = inputs.input_ids.to(self.device)
@@ -89,11 +90,15 @@ class PrefillNode:
                 }
             )
 
+        finished_at = time.perf_counter()
         return {
             "request_id": request_id,
             "prompt_len": int(input_ids.shape[1]),
             "first_token_id": first_token_id,
             "initial_kv": initial_kv,
+            "profile": {
+                "compute_s": float(finished_at - started_at),
+            },
         }
 
 
@@ -127,16 +132,32 @@ class AttentionNode:
         return info
 
     def init_request(self, request_id: str, initial_kv):
-        return self.backend.init_request(request_id, initial_kv)
+        started_at = time.perf_counter()
+        context_len = self.backend.init_request(request_id, initial_kv)
+        finished_at = time.perf_counter()
+        return {
+            "context_len": int(context_len),
+            "profile": {
+                "compute_s": float(finished_at - started_at),
+            },
+        }
 
     def decode_layer(self, payload):
-        return self.backend.decode_layer(
+        started_at = time.perf_counter()
+        context = self.backend.decode_layer(
             payload["request_id"],
             int(payload["layer_idx"]),
             payload["query"],
             payload["key"],
             payload["value"],
         )
+        finished_at = time.perf_counter()
+        return {
+            "context": context,
+            "profile": {
+                "compute_s": float(finished_at - started_at),
+            },
+        }
 
     def get_context_len(self, request_id: str):
         return self.backend.get_context_len(request_id)
@@ -181,14 +202,22 @@ class DecodeDenseNode:
         }
 
     def start_token(self, token_id: int, position: int):
+        started_at = time.perf_counter()
         input_ids = torch.tensor([[token_id]], dtype=torch.long, device=self.device)
         position_ids = torch.tensor([[position]], dtype=torch.long, device=self.device)
         attention_mask = torch.ones((1, 1), dtype=torch.long, device=self.device)
         hidden = self.decoder.embed_tokens(input_ids)
         hidden = hidden + self.decoder.embed_positions(attention_mask, position_ids=position_ids)
-        return hidden.detach().cpu()
+        finished_at = time.perf_counter()
+        return {
+            "hidden": hidden.detach().cpu(),
+            "profile": {
+                "compute_s": float(finished_at - started_at),
+            },
+        }
 
     def prepare_attention(self, hidden_state, layer_idx: int, request_id: str):
+        started_at = time.perf_counter()
         layer = self.layers[layer_idx]
         hidden = hidden_state.to(self.device)
         residual = hidden
@@ -209,6 +238,7 @@ class DecodeDenseNode:
         key = key.view(batch, seq_len, self.num_heads, self.head_dim).squeeze(1)
         value = value.view(batch, seq_len, self.num_heads, self.head_dim).squeeze(1)
 
+        finished_at = time.perf_counter()
         return {
             "request_id": request_id,
             "layer_idx": int(layer_idx),
@@ -216,9 +246,13 @@ class DecodeDenseNode:
             "query": query.detach().cpu(),
             "key": key.detach().cpu(),
             "value": value.detach().cpu(),
+            "profile": {
+                "compute_s": float(finished_at - started_at),
+            },
         }
 
     def finish_layer(self, residual, attention_context, layer_idx: int):
+        started_at = time.perf_counter()
         layer = self.layers[layer_idx]
         residual = residual.to(self.device)
         context = attention_context.to(self.device)
@@ -248,18 +282,40 @@ class DecodeDenseNode:
         if not layer.do_layer_norm_before:
             hidden = layer.final_layer_norm(hidden)
 
-        return hidden.detach().cpu()
+        finished_at = time.perf_counter()
+        return {
+            "hidden": hidden.detach().cpu(),
+            "profile": {
+                "compute_s": float(finished_at - started_at),
+            },
+        }
 
     def sample_next_token(self, hidden_state):
+        started_at = time.perf_counter()
         hidden = hidden_state.to(self.device)
         final_norm = getattr(self.decoder, "final_layer_norm", None)
         if final_norm is not None:
             hidden = final_norm(hidden)
         logits = self.model.lm_head(hidden)
-        return int(torch.argmax(logits[:, -1, :], dim=-1).item())
+        token_id = int(torch.argmax(logits[:, -1, :], dim=-1).item())
+        finished_at = time.perf_counter()
+        return {
+            "token_id": token_id,
+            "profile": {
+                "compute_s": float(finished_at - started_at),
+            },
+        }
 
     def decode_tokens(self, token_ids: List[int]) -> str:
-        return self.tokenizer.decode(token_ids, skip_special_tokens=True)
+        started_at = time.perf_counter()
+        text = self.tokenizer.decode(token_ids, skip_special_tokens=True)
+        finished_at = time.perf_counter()
+        return {
+            "text": text,
+            "profile": {
+                "compute_s": float(finished_at - started_at),
+            },
+        }
 
 
 # Compatibility names for older scripts. RDMA-specific methods are intentionally

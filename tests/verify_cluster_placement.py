@@ -92,6 +92,11 @@ def main():
         print("Output:", repr(output))
         print("Metrics:", metrics)
         assert metrics["total_tokens"] >= 1
+        stage_timing = metrics["stage_timing"]
+        assert stage_timing["counts"]["decode_steps"] >= 1
+        assert stage_timing["counts"]["decode_layers"] >= stage_timing["counts"]["decode_steps"]
+        assert stage_timing["scheduler"]["total_rpc_s"] >= 0
+        assert stage_timing["actors"]["total_compute_s"] >= 0
 
     print("Placement verification passed.")
 

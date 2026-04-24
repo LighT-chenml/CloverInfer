@@ -42,6 +42,7 @@ def test_integration():
         assert isinstance(output, str)
         assert cluster_info["attention"]["backend"] == "cpu"
         assert metrics["total_tokens"] >= 1
+        assert metrics["stage_timing"]["actors"]["total_compute_s"] >= 0
     finally:
         ray.shutdown()
 

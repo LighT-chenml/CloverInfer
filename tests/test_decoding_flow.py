@@ -38,6 +38,8 @@ async def test_decoding_flow():
     assert cluster_info["attention"]["backend"] == "cpu"
     assert metrics["total_tokens"] >= 1
     assert metrics["latency"] >= metrics["ttft"] >= 0
+    assert metrics["stage_timing"]["counts"]["decode_steps"] >= 1
+    assert metrics["stage_timing"]["scheduler"]["total_rpc_s"] >= 0
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()

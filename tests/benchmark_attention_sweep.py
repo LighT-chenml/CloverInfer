@@ -53,6 +53,29 @@ def percentile(values: List[float], pct: float) -> float:
     return float(ordered[lower] * (1.0 - weight) + ordered[upper] * weight)
 
 
+def summarize_stage_timing(stage_timing: Dict[str, object]) -> Dict[str, float]:
+    scheduler = stage_timing["scheduler"]
+    actors = stage_timing["actors"]
+    counts = stage_timing["counts"]
+    return {
+        "prefill_rpc_s": float(scheduler["prefill_rpc_s"]),
+        "attention_decode_rpc_s": float(scheduler["attention_decode_rpc_s"]),
+        "prepare_attention_rpc_s": float(scheduler["prepare_attention_rpc_s"]),
+        "finish_layer_rpc_s": float(scheduler["finish_layer_rpc_s"]),
+        "sample_next_token_rpc_s": float(scheduler["sample_next_token_rpc_s"]),
+        "total_rpc_s": float(scheduler["total_rpc_s"]),
+        "prefill_compute_s": float(actors["prefill_compute_s"]),
+        "attention_decode_compute_s": float(actors["attention_decode_compute_s"]),
+        "dense_prepare_attention_compute_s": float(actors["dense_prepare_attention_compute_s"]),
+        "dense_finish_layer_compute_s": float(actors["dense_finish_layer_compute_s"]),
+        "dense_sample_next_token_compute_s": float(actors["dense_sample_next_token_compute_s"]),
+        "total_compute_s": float(actors["total_compute_s"]),
+        "decode_steps": float(counts["decode_steps"]),
+        "decode_layers": float(counts["decode_layers"]),
+        "scheduler_overhead_s": float(stage_timing["scheduler_overhead_s"]),
+    }
+
+
 def make_scheduler(args, attention_backend: str, mixed_heads: int) -> ray.actor.ActorHandle:
     cluster = ClusterConfig(
         num_prefill_workers=1,
@@ -86,6 +109,7 @@ def run_case(args, attention_backend: str, mixed_heads: int) -> Dict[str, object
     qk_diffs = []
     qk_counts = []
     qk_failures = []
+    stage_summaries = []
 
     for repeat_idx in range(args.repeats):
         prompt = args.prompt
@@ -107,6 +131,7 @@ def run_case(args, attention_backend: str, mixed_heads: int) -> Dict[str, object
         qk_diffs.append(float(backend_debug.get("qk_mixed_last_max_abs_diff", 0.0)))
         qk_counts.append(int(backend_debug.get("qk_mixed_count", 0)))
         qk_failures.append(int(backend_debug.get("qk_check_failures", 0)))
+        stage_summaries.append(summarize_stage_timing(metrics["stage_timing"]))
 
         record = {
             "case": {
@@ -141,6 +166,10 @@ def run_case(args, attention_backend: str, mixed_heads: int) -> Dict[str, object
         "max_qk_mixed_last_abs_diff": max(qk_diffs) if qk_diffs else 0.0,
         "final_qk_mixed_count": qk_counts[-1] if qk_counts else 0,
         "final_qk_check_failures": qk_failures[-1] if qk_failures else 0,
+        "avg_stage_timing": {
+            key: statistics.mean([stage[key] for stage in stage_summaries])
+            for key in stage_summaries[0]
+        } if stage_summaries else {},
     }
     return {"records": records, "summary": summary}
 
