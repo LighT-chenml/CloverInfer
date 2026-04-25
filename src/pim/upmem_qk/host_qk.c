@@ -173,11 +173,11 @@ static int run_stdio_mode(uint32_t requested_dpus)
         uint32_t head_dim = header.head_dim;
         uint32_t total_keys = header.num_keys;
         uint32_t num_queries = header.reserved == 0 ? 1 : header.reserved;
-        uint32_t num_dpus = runner.nr_dpus;
-        if (num_dpus > total_keys) {
-            num_dpus = total_keys;
+        uint32_t active_dpus = runner.nr_dpus;
+        if (active_dpus > total_keys) {
+            active_dpus = total_keys;
         }
-        uint32_t keys_per_dpu = (total_keys + num_dpus - 1) / num_dpus;
+        uint32_t keys_per_dpu = (total_keys + active_dpus - 1) / active_dpus;
         if (keys_per_dpu > MAX_KEYS_PER_DPU) {
             fprintf(stderr, "Too many keys per DPU after partitioning: %u\n", keys_per_dpu);
             rc = 1;
@@ -186,9 +186,9 @@ static int run_stdio_mode(uint32_t requested_dpus)
 
         int32_t *queries_in = calloc((size_t)num_queries * head_dim, sizeof(*queries_in));
         int32_t *keys_in = calloc((size_t)num_queries * total_keys * head_dim, sizeof(*keys_in));
-        int32_t *queries = calloc((size_t)num_dpus * head_dim, sizeof(*queries));
-        int32_t *keys_partitioned = calloc((size_t)num_dpus * keys_per_dpu * head_dim, sizeof(*keys_partitioned));
-        int64_t *scores_partitioned = calloc((size_t)num_dpus * keys_per_dpu, sizeof(*scores_partitioned));
+        int32_t *queries = calloc((size_t)runner.nr_dpus * head_dim, sizeof(*queries));
+        int32_t *keys_partitioned = calloc((size_t)runner.nr_dpus * keys_per_dpu * head_dim, sizeof(*keys_partitioned));
+        int64_t *scores_partitioned = calloc((size_t)runner.nr_dpus * keys_per_dpu, sizeof(*scores_partitioned));
         int64_t *scores_out = calloc((size_t)num_queries * total_keys, sizeof(*scores_out));
         if (!queries_in || !keys_in || !queries || !keys_partitioned || !scores_partitioned || !scores_out) {
             fprintf(stderr, "Failed to allocate stdio buffers\n");
@@ -216,14 +216,14 @@ static int run_stdio_mode(uint32_t requested_dpus)
         }
 
         for (uint32_t query_idx = 0; query_idx < num_queries && rc == 0; ++query_idx) {
-            memset(queries, 0, (size_t)num_dpus * head_dim * sizeof(*queries));
-            memset(keys_partitioned, 0, (size_t)num_dpus * keys_per_dpu * head_dim * sizeof(*keys_partitioned));
-            memset(scores_partitioned, 0, (size_t)num_dpus * keys_per_dpu * sizeof(*scores_partitioned));
+            memset(queries, 0, (size_t)runner.nr_dpus * head_dim * sizeof(*queries));
+            memset(keys_partitioned, 0, (size_t)runner.nr_dpus * keys_per_dpu * head_dim * sizeof(*keys_partitioned));
+            memset(scores_partitioned, 0, (size_t)runner.nr_dpus * keys_per_dpu * sizeof(*scores_partitioned));
 
             const int32_t *query = &queries_in[(size_t)query_idx * head_dim];
             const int32_t *query_keys = &keys_in[(size_t)query_idx * total_keys * head_dim];
 
-            for (uint32_t dpu_idx = 0; dpu_idx < num_dpus; ++dpu_idx) {
+            for (uint32_t dpu_idx = 0; dpu_idx < active_dpus; ++dpu_idx) {
                 memcpy(&queries[(size_t)dpu_idx * head_dim], query, head_dim * sizeof(int32_t));
                 for (uint32_t local_key = 0; local_key < keys_per_dpu; ++local_key) {
                     uint32_t global_key = dpu_idx * keys_per_dpu + local_key;
@@ -239,7 +239,7 @@ static int run_stdio_mode(uint32_t requested_dpus)
             uint64_t query_cycles = 0;
             rc = qk_runner_run(&runner, head_dim, keys_per_dpu, queries, keys_partitioned, scores_partitioned, &query_cycles);
             if (rc == 0) {
-                for (uint32_t dpu_idx = 0; dpu_idx < num_dpus; ++dpu_idx) {
+                for (uint32_t dpu_idx = 0; dpu_idx < active_dpus; ++dpu_idx) {
                     for (uint32_t local_key = 0; local_key < keys_per_dpu; ++local_key) {
                         uint32_t global_key = dpu_idx * keys_per_dpu + local_key;
                         if (global_key < total_keys) {
@@ -305,14 +305,14 @@ static int run_file_mode(const char *input_path, const char *output_path, uint32
     uint32_t head_dim = header.head_dim;
     uint32_t total_keys = header.num_keys;
     uint32_t num_queries = header.reserved == 0 ? 1 : header.reserved;
-    uint32_t num_dpus = requested_dpus;
-    if (num_dpus == 0) {
-        num_dpus = 1;
+    uint32_t active_dpus = requested_dpus;
+    if (active_dpus == 0) {
+        active_dpus = 1;
     }
-    if (num_dpus > total_keys) {
-        num_dpus = total_keys;
+    if (active_dpus > total_keys) {
+        active_dpus = total_keys;
     }
-    uint32_t keys_per_dpu = (total_keys + num_dpus - 1) / num_dpus;
+    uint32_t keys_per_dpu = (total_keys + active_dpus - 1) / active_dpus;
     if (keys_per_dpu > MAX_KEYS_PER_DPU) {
         fprintf(stderr, "Too many keys per DPU after partitioning: %u\n", keys_per_dpu);
         fclose(input);
@@ -321,18 +321,15 @@ static int run_file_mode(const char *input_path, const char *output_path, uint32
 
     int32_t *queries_in = calloc((size_t)num_queries * head_dim, sizeof(*queries_in));
     int32_t *keys_in = calloc((size_t)num_queries * total_keys * head_dim, sizeof(*keys_in));
-    int32_t *queries = calloc((size_t)num_dpus * head_dim, sizeof(*queries));
-    int32_t *keys_partitioned = calloc((size_t)num_dpus * keys_per_dpu * head_dim, sizeof(*keys_partitioned));
-    int64_t *scores_partitioned = calloc((size_t)num_dpus * keys_per_dpu, sizeof(*scores_partitioned));
+    int32_t *queries = NULL;
+    int32_t *keys_partitioned = NULL;
+    int64_t *scores_partitioned = NULL;
     int64_t *scores_out = calloc((size_t)num_queries * total_keys, sizeof(*scores_out));
-    if (!queries_in || !keys_in || !queries || !keys_partitioned || !scores_partitioned || !scores_out) {
+    if (!queries_in || !keys_in || !scores_out) {
         fprintf(stderr, "Failed to allocate file-mode buffers\n");
         fclose(input);
         free(queries_in);
         free(keys_in);
-        free(queries);
-        free(keys_partitioned);
-        free(scores_partitioned);
         free(scores_out);
         return 1;
     }
@@ -352,27 +349,39 @@ static int run_file_mode(const char *input_path, const char *output_path, uint32
     fclose(input);
 
     qk_runner_t runner;
-    int rc = qk_runner_init(&runner, num_dpus);
+    int rc = qk_runner_init(&runner, active_dpus);
     if (rc != 0) {
+        free(queries_in);
+        free(keys_in);
+        free(scores_out);
+        return rc;
+    }
+
+    queries = calloc((size_t)runner.nr_dpus * head_dim, sizeof(*queries));
+    keys_partitioned = calloc((size_t)runner.nr_dpus * keys_per_dpu * head_dim, sizeof(*keys_partitioned));
+    scores_partitioned = calloc((size_t)runner.nr_dpus * keys_per_dpu, sizeof(*scores_partitioned));
+    if (!queries || !keys_partitioned || !scores_partitioned) {
+        fprintf(stderr, "Failed to allocate file-mode DPU buffers\n");
+        qk_runner_destroy(&runner);
         free(queries_in);
         free(keys_in);
         free(queries);
         free(keys_partitioned);
         free(scores_partitioned);
         free(scores_out);
-        return rc;
+        return 1;
     }
 
     uint64_t max_cycles = 0;
     for (uint32_t query_idx = 0; query_idx < num_queries && rc == 0; ++query_idx) {
-        memset(queries, 0, (size_t)num_dpus * head_dim * sizeof(*queries));
-        memset(keys_partitioned, 0, (size_t)num_dpus * keys_per_dpu * head_dim * sizeof(*keys_partitioned));
-        memset(scores_partitioned, 0, (size_t)num_dpus * keys_per_dpu * sizeof(*scores_partitioned));
+        memset(queries, 0, (size_t)runner.nr_dpus * head_dim * sizeof(*queries));
+        memset(keys_partitioned, 0, (size_t)runner.nr_dpus * keys_per_dpu * head_dim * sizeof(*keys_partitioned));
+        memset(scores_partitioned, 0, (size_t)runner.nr_dpus * keys_per_dpu * sizeof(*scores_partitioned));
 
         const int32_t *query = &queries_in[(size_t)query_idx * head_dim];
         const int32_t *query_keys = &keys_in[(size_t)query_idx * total_keys * head_dim];
 
-        for (uint32_t dpu_idx = 0; dpu_idx < num_dpus; ++dpu_idx) {
+        for (uint32_t dpu_idx = 0; dpu_idx < active_dpus; ++dpu_idx) {
             memcpy(&queries[(size_t)dpu_idx * head_dim], query, head_dim * sizeof(int32_t));
             for (uint32_t local_key = 0; local_key < keys_per_dpu; ++local_key) {
                 uint32_t global_key = dpu_idx * keys_per_dpu + local_key;
@@ -391,7 +400,7 @@ static int run_file_mode(const char *input_path, const char *output_path, uint32
             max_cycles = query_cycles;
         }
         if (rc == 0) {
-            for (uint32_t dpu_idx = 0; dpu_idx < num_dpus; ++dpu_idx) {
+            for (uint32_t dpu_idx = 0; dpu_idx < active_dpus; ++dpu_idx) {
                 for (uint32_t local_key = 0; local_key < keys_per_dpu; ++local_key) {
                     uint32_t global_key = dpu_idx * keys_per_dpu + local_key;
                     if (global_key < total_keys) {

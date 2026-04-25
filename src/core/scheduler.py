@@ -70,6 +70,10 @@ class GlobalScheduler:
                 "num_dpus": int(self.cluster_config.pim_num_dpus),
                 "length": int(self.cluster_config.pim_length),
                 "resident_store_backend": str(self.cluster_config.pim_resident_store_backend),
+                "max_resident_groups_per_layer": int(self.cluster_config.pim_max_resident_groups_per_layer),
+                "head_grouping_policy": str(self.cluster_config.pim_head_grouping_policy),
+                "dpu_placement_policy": str(self.cluster_config.pim_dpu_placement_policy),
+                "resident_kv_dtype": str(self.cluster_config.pim_resident_kv_dtype),
                 "qk_mixed_enabled": bool(self.cluster_config.pim_qk_mixed_enabled),
                 "qk_mixed_heads": int(self.cluster_config.pim_qk_mixed_heads),
                 "qk_mixed_window": int(self.cluster_config.pim_qk_mixed_window),
@@ -126,16 +130,20 @@ class GlobalScheduler:
         first_token = int(prefill_out["first_token_id"])
         first_token_time = time.time()
 
+        generated_ids: List[int] = [first_token]
+        current_token = first_token
+        max_tokens = int(max_new_tokens or self.model_config.max_new_tokens)
+
         rpc_started = time.perf_counter()
-        init_result = await attention.init_request.remote(request_id, prefill_out["initial_kv"])
+        init_result = await attention.init_request.remote(
+            request_id,
+            prefill_out["initial_kv"],
+            max_tokens,
+        )
         stage_timing["scheduler"]["attention_init_rpc_s"] += time.perf_counter() - rpc_started
         stage_timing["actors"]["attention_init_compute_s"] += float(
             init_result.get("profile", {}).get("compute_s", 0.0)
         )
-
-        generated_ids: List[int] = [first_token]
-        current_token = first_token
-        max_tokens = int(max_new_tokens or self.model_config.max_new_tokens)
 
         try:
             for step in range(1, max_tokens):
@@ -188,6 +196,9 @@ class GlobalScheduler:
                 if next_token == 2:
                     break
         finally:
+            attention_debug_before_free = None
+            if return_metrics:
+                attention_debug_before_free = await attention.get_info.remote()
             rpc_started = time.perf_counter()
             await attention.free_request.remote(request_id)
             stage_timing["scheduler"]["free_request_rpc_s"] += time.perf_counter() - rpc_started
@@ -223,6 +234,7 @@ class GlobalScheduler:
                 0.0,
                 float(latency - scheduler_rpc_total),
             )
+            metrics["attention_backend_before_free"] = attention_debug_before_free
             metrics["attention_backend"] = await attention.get_info.remote()
             return generated_text, metrics
 

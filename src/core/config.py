@@ -27,6 +27,10 @@ class ClusterConfig(BaseModel):
     pim_qk_mixed_heads: int = 2
     pim_qk_mixed_window: int = 128
     pim_length: int = 128
+    pim_max_resident_groups_per_layer: int = 0
+    pim_head_grouping_policy: str = "balanced"
+    pim_dpu_placement_policy: str = "rotated"
+    pim_resident_kv_dtype: str = "fp32"
 
 class ModelConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")

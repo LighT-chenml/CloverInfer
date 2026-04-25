@@ -23,6 +23,18 @@ class HeadGroupState:
     k_slot: str
     v_slot: str
 
+    @property
+    def group_heads(self) -> int:
+        return int(self.head_end - self.head_start)
+
+    @property
+    def live_elems(self) -> int:
+        return int(self.seq_len) * self.group_heads * int(self.head_dim)
+
+    @property
+    def capacity_elems(self) -> int:
+        return int(self.capacity) * self.group_heads * int(self.head_dim)
+
 
 @dataclass
 class LayerState:
@@ -135,6 +147,10 @@ class PimNaiveAttentionBackend:
         num_dpus: int = 4,
         length: int = 128,
         resident_store_backend: str = "host",
+        max_resident_groups_per_layer: int = 0,
+        head_grouping_policy: str = "balanced",
+        dpu_placement_policy: str = "rotated",
+        resident_kv_dtype: str = "fp32",
         qk_check_interval: int = 1,
         qk_check_limit: int = 1,
         qk_mixed_enabled: bool = True,
@@ -145,8 +161,18 @@ class PimNaiveAttentionBackend:
         self.num_dpus = num_dpus
         self.length = length
         self.resident_store_backend = resident_store_backend
+        self.max_resident_groups_per_layer = max(0, int(max_resident_groups_per_layer))
+        self.head_grouping_policy = str(head_grouping_policy)
+        self.dpu_placement_policy = str(dpu_placement_policy)
+        self.resident_kv_dtype = str(resident_kv_dtype)
         self.qk_check_interval = qk_check_interval
         self.qk_check_limit = qk_check_limit
+        if self.head_grouping_policy not in {"legacy", "balanced"}:
+            raise ValueError(f"Unsupported head_grouping_policy: {self.head_grouping_policy}")
+        if self.dpu_placement_policy not in {"identity", "rotated"}:
+            raise ValueError(f"Unsupported dpu_placement_policy: {self.dpu_placement_policy}")
+        if self.resident_kv_dtype not in {"fp32", "fp16"}:
+            raise ValueError(f"Unsupported resident_kv_dtype: {self.resident_kv_dtype}")
         self.cpu_backend = CpuAttentionBackend()
         self.smoke_test_ok = False
         self.smoke_test_output = ""
@@ -168,7 +194,7 @@ class PimNaiveAttentionBackend:
         self.resident_metadata_enabled = True
         self.resident_compute_enabled = True
         if resident_store_backend == "upmem_kvslot":
-            self.resident_store = UpmemKVSlotStore(self.repo_root, self.num_dpus)
+            self.resident_store = UpmemKVSlotStore(self.repo_root, self.num_dpus, kv_dtype=self.resident_kv_dtype)
         elif resident_store_backend == "host":
             self.resident_store = HostResidentKVStore()
         else:
@@ -180,38 +206,116 @@ class PimNaiveAttentionBackend:
         self.resident_shadow_max_abs_diff = 0.0
         self._run_dot_smoke_test()
 
+    def _shares_persistent_dpu_owner(self) -> bool:
+        return isinstance(self.resident_store, UpmemKVSlotStore)
+
+    def _group_footprint_summary(self, group: HeadGroupState) -> Dict[str, object]:
+        return {
+            "dpu_id": int(group.dpu_id),
+            "heads": [int(group.head_start), int(group.head_end)],
+            "group_heads": int(group.group_heads),
+            "seq_len": int(group.seq_len),
+            "capacity": int(group.capacity),
+            "head_dim": int(group.head_dim),
+            "live_elems": int(group.live_elems),
+            "capacity_elems": int(group.capacity_elems),
+            "resident_slot": self.resident_store.slot_debug(group.k_slot, group.v_slot),
+        }
+
+    def _layer_footprint_summary(self, layer_state: LayerState) -> Dict[str, object]:
+        live_elems = sum(group.live_elems for group in layer_state.head_groups)
+        capacity_elems = sum(group.capacity_elems for group in layer_state.head_groups)
+        return {
+            "layer_idx": int(layer_state.layer_idx),
+            "num_heads": int(layer_state.num_heads),
+            "head_dim": int(layer_state.head_dim),
+            "group_count": len(layer_state.head_groups),
+            "live_elems": int(live_elems),
+            "capacity_elems": int(capacity_elems),
+            "groups": [self._group_footprint_summary(group) for group in layer_state.head_groups],
+        }
+
+    def _request_footprint_summary(self, request_state: RequestState) -> Dict[str, object]:
+        layer_summaries = [self._layer_footprint_summary(layer_state) for layer_state in request_state.layer_states]
+        live_elems = sum(int(layer["live_elems"]) for layer in layer_summaries)
+        capacity_elems = sum(int(layer["capacity_elems"]) for layer in layer_summaries)
+        per_dpu_live_elems = [0 for _ in range(self.num_dpus)]
+        per_dpu_capacity_elems = [0 for _ in range(self.num_dpus)]
+        for layer_state in request_state.layer_states:
+            for group in layer_state.head_groups:
+                physical_dpu = int(group.dpu_id) % max(self.num_dpus, 1)
+                per_dpu_live_elems[physical_dpu] += int(group.live_elems)
+                per_dpu_capacity_elems[physical_dpu] += int(group.capacity_elems)
+        return {
+            "request_id": request_state.request_id,
+            "context_len": int(request_state.context_len),
+            "num_layers": int(request_state.num_layers),
+            "live_elems": int(live_elems),
+            "capacity_elems": int(capacity_elems),
+            "per_dpu_live_elems": per_dpu_live_elems,
+            "per_dpu_capacity_elems": per_dpu_capacity_elems,
+            "layers": layer_summaries,
+        }
+
     def _build_head_groups(
         self,
         request_id: str,
         layer_idx: int,
         layer_key: torch.Tensor,
         layer_value: torch.Tensor,
+        decode_reserve_tokens: int = 0,
     ) -> List[HeadGroupState]:
         seq_len, num_heads, head_dim = (int(dim) for dim in layer_key.shape)
         if num_heads <= 0:
             raise ValueError(f"layer {layer_idx} in request {request_id} has no attention heads")
 
         num_groups = max(1, min(self.num_dpus, num_heads))
-        heads_per_group = math.ceil(num_heads / num_groups)
-        capacity = max(self.length, seq_len)
+        capacity = max(self.length, seq_len + max(0, int(decode_reserve_tokens)))
         head_groups = []
-        for group_idx in range(num_groups):
-            head_start = group_idx * heads_per_group
-            head_end = min(num_heads, head_start + heads_per_group)
-            if head_start >= head_end:
-                break
+        request_hash = sum(ord(ch) for ch in request_id)
+        dpu_rotation = (request_hash + int(layer_idx)) % max(self.num_dpus, 1)
+        group_ranges: List[tuple[int, int]] = []
+        if self.head_grouping_policy == "legacy":
+            heads_per_group = math.ceil(num_heads / num_groups)
+            for group_idx in range(num_groups):
+                head_start = group_idx * heads_per_group
+                head_end = min(num_heads, head_start + heads_per_group)
+                if head_start >= head_end:
+                    break
+                group_ranges.append((head_start, head_end))
+        else:
+            base_heads_per_group = num_heads // num_groups
+            extra_head_groups = num_heads % num_groups
+            head_start = 0
+            for _ in range(num_groups):
+                group_heads = base_heads_per_group + (1 if len(group_ranges) < extra_head_groups else 0)
+                head_end = min(num_heads, head_start + group_heads)
+                if head_start >= head_end:
+                    break
+                group_ranges.append((head_start, head_end))
+                head_start = head_end
+
+        for group_idx, (head_start, head_end) in enumerate(group_ranges):
+            if self.dpu_placement_policy == "rotated":
+                physical_dpu = (group_idx + dpu_rotation) % max(self.num_dpus, 1)
+            else:
+                physical_dpu = group_idx % max(self.num_dpus, 1)
             k_slot = f"{request_id}:layer{layer_idx}:group{group_idx}:k"
             v_slot = f"{request_id}:layer{layer_idx}:group{group_idx}:v"
+            initial_k_group = layer_key[:, head_start:head_end, :].contiguous()
+            initial_v_group = layer_value[:, head_start:head_end, :].contiguous()
             self.resident_store.allocate_group(
                 k_slot,
                 v_slot,
-                layer_key[:, head_start:head_end, :].contiguous(),
-                layer_value[:, head_start:head_end, :].contiguous(),
+                initial_k_group,
+                initial_v_group,
                 capacity=capacity,
+                preferred_dpu=physical_dpu,
+                force_host_fallback=self.max_resident_groups_per_layer > 0 and group_idx >= self.max_resident_groups_per_layer,
             )
             head_groups.append(
                 HeadGroupState(
-                    dpu_id=group_idx,
+                    dpu_id=physical_dpu,
                     head_start=head_start,
                     head_end=head_end,
                     seq_len=seq_len,
@@ -223,7 +327,12 @@ class PimNaiveAttentionBackend:
             )
         return head_groups
 
-    def _build_request_state(self, request_id: str, initial_kv: List[Dict[str, torch.Tensor]]) -> RequestState:
+    def _build_request_state(
+        self,
+        request_id: str,
+        initial_kv: List[Dict[str, torch.Tensor]],
+        decode_reserve_tokens: int = 0,
+    ) -> RequestState:
         layer_states = []
         if not initial_kv:
             raise ValueError("initial_kv must contain at least one layer")
@@ -248,6 +357,7 @@ class PimNaiveAttentionBackend:
                         layer_idx,
                         layer_key,
                         layer["value"].detach().cpu().contiguous(),
+                        decode_reserve_tokens,
                     ),
                 )
             )
@@ -342,31 +452,9 @@ class PimNaiveAttentionBackend:
         self.resident_shadow_max_abs_diff = max(self.resident_shadow_max_abs_diff, key_diff, value_diff)
 
     def _summarize_request_state(self, request_state: RequestState) -> Dict[str, object]:
-        layer_summaries = []
-        for layer_state in request_state.layer_states[: min(2, len(request_state.layer_states))]:
-            layer_summaries.append(
-                {
-                    "layer_idx": layer_state.layer_idx,
-                    "num_heads": layer_state.num_heads,
-                    "head_dim": layer_state.head_dim,
-                    "groups": [
-                        {
-                            "dpu_id": group.dpu_id,
-                            "heads": [group.head_start, group.head_end],
-                            "seq_len": group.seq_len,
-                            "capacity": group.capacity,
-                            "resident_slot": self.resident_store.slot_debug(group.k_slot, group.v_slot),
-                        }
-                        for group in layer_state.head_groups
-                    ],
-                }
-            )
-        return {
-            "request_id": request_state.request_id,
-            "context_len": request_state.context_len,
-            "num_layers": request_state.num_layers,
-            "layers_preview": layer_summaries,
-        }
+        footprint = self._request_footprint_summary(request_state)
+        footprint["layers_preview"] = footprint["layers"][: min(2, len(footprint["layers"]))]
+        return footprint
 
     def _run_make_smoke(self, subdir: str, env_overrides: Dict[str, str]) -> str:
         smoke_dir = os.path.join(self.repo_root, "src", "pim", subdir)
@@ -386,6 +474,12 @@ class PimNaiveAttentionBackend:
         return output
 
     def _run_dot_smoke_test(self) -> None:
+        if self._shares_persistent_dpu_owner():
+            self.smoke_test_output = (
+                "skipped upmem_dot smoke test: resident kvslot helper owns the persistent DPU set"
+            )
+            self.smoke_test_ok = True
+            return
         self.smoke_test_output = self._run_make_smoke(
             "upmem_dot",
             {
@@ -489,6 +583,19 @@ class PimNaiveAttentionBackend:
         k_i32 = torch.clamp(torch.round(k[:, :num_keys, :head_dim] * scale), -2**31, 2**31 - 1).to(torch.int32)
         expected = torch.einsum("qkd,qd->qk", k_i32.to(torch.int64), q_i32.to(torch.int64))
 
+        # When resident KV already owns a persistent DPU set, route qk-mixed
+        # through the same helper to avoid double DPU allocation.
+        if isinstance(self.resident_store, UpmemKVSlotStore):
+            actual = self.resident_store.qk_scores_batch(q_i32, k_i32)
+            diff = torch.max(torch.abs(actual - expected)).item() if num_keys > 0 else 0
+            self.qk_shadow_max_abs_diff = max(self.qk_shadow_max_abs_diff, int(diff))
+            self.qk_shadow_last_scores = actual[0, : min(8, num_keys)].tolist()
+            if diff != 0:
+                raise RuntimeError(f"UPMEM qk score mismatch max_abs_diff={diff}")
+            self.qk_check_count += num_queries
+            self.qk_batch_calls += 1
+            return actual.float() / (scale * scale), scale
+
         header = struct.pack("<IIII", 0x514B494F, head_dim, num_keys, num_queries)
         payload = header + q_i32.numpy().tobytes(order="C") + k_i32.numpy().tobytes(order="C")
         expected_bytes = 16 + (num_queries * num_keys * 8)
@@ -556,9 +663,18 @@ class PimNaiveAttentionBackend:
             )
         self.smoke_test_ok = True
 
-    def init_request(self, request_id: str, initial_kv: List[Dict[str, torch.Tensor]]) -> int:
+    def init_request(
+        self,
+        request_id: str,
+        initial_kv: List[Dict[str, torch.Tensor]],
+        decode_reserve_tokens: int = 0,
+    ) -> int:
         seq_len = self.cpu_backend.init_request(request_id, initial_kv)
-        self.request_states[request_id] = self._build_request_state(request_id, initial_kv)
+        self.request_states[request_id] = self._build_request_state(
+            request_id,
+            initial_kv,
+            decode_reserve_tokens,
+        )
         return seq_len
 
     def decode_layer(
@@ -654,9 +770,25 @@ class PimNaiveAttentionBackend:
 
     def get_debug_info(self) -> Dict[str, object]:
         request_preview = None
+        request_footprints = []
         if self.request_states:
             preview_key = next(iter(self.request_states))
             request_preview = self._summarize_request_state(self.request_states[preview_key])
+            for request_state in self.request_states.values():
+                footprint = self._request_footprint_summary(request_state)
+                request_footprints.append(
+                    {
+                        "request_id": request_state.request_id,
+                        "context_len": int(request_state.context_len),
+                        "num_layers": int(request_state.num_layers),
+                        "live_elems": int(footprint["live_elems"]),
+                        "capacity_elems": int(footprint["capacity_elems"]),
+                        "per_dpu_live_elems": footprint["per_dpu_live_elems"],
+                        "per_dpu_capacity_elems": footprint["per_dpu_capacity_elems"],
+                    }
+                )
+        total_live_elems = sum(int(item["live_elems"]) for item in request_footprints)
+        total_capacity_elems = sum(int(item["capacity_elems"]) for item in request_footprints)
         return {
             "smoke_test_ok": self.smoke_test_ok,
             "num_dpus": self.num_dpus,
@@ -681,11 +813,18 @@ class PimNaiveAttentionBackend:
             "resident_metadata_enabled": self.resident_metadata_enabled,
             "resident_compute_enabled": self.resident_compute_enabled,
             "resident_store_backend": self.resident_store_backend,
+            "resident_kv_dtype": self.resident_kv_dtype,
+            "max_resident_groups_per_layer": self.max_resident_groups_per_layer,
+            "head_grouping_policy": self.head_grouping_policy,
+            "dpu_placement_policy": self.dpu_placement_policy,
             "resident_request_count": len(self.request_states),
             "resident_last_freed_request_id": self.last_freed_request_id,
             "resident_append_ops": self.resident_append_ops,
             "resident_materialize_ops": self.resident_materialize_ops,
             "resident_shadow_max_abs_diff": self.resident_shadow_max_abs_diff,
+            "resident_total_live_elems": total_live_elems,
+            "resident_total_capacity_elems": total_capacity_elems,
+            "resident_request_footprints": request_footprints,
             "resident_store_debug": self.resident_store.get_debug_info(),
             "resident_request_preview": request_preview,
         }

@@ -95,9 +95,13 @@ class AttentionNode:
             info["backend_debug"] = self.backend.get_debug_info()
         return info
 
-    def init_request(self, request_id: str, initial_kv):
+    def init_request(self, request_id: str, initial_kv, decode_reserve_tokens: int = 0):
         started_at = time.perf_counter()
-        context_len = self.backend.init_request(request_id, initial_kv)
+        context_len = self.backend.init_request(
+            request_id,
+            initial_kv,
+            decode_reserve_tokens=int(decode_reserve_tokens),
+        )
         finished_at = time.perf_counter()
         return {
             "context_len": int(context_len),

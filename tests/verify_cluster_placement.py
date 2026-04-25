@@ -114,6 +114,12 @@ def main():
                 assert store_debug["backend"] == "upmem_kvslot_store", store_debug
                 assert store_debug["dpu_allocations"] > 0, store_debug
                 assert store_debug["helper_restarts"] >= 1, store_debug
+                allocator_stats = store_debug["allocator_stats"]
+                assert len(allocator_stats) == args.pim_num_dpus, allocator_stats
+                for stats in allocator_stats:
+                    assert stats["pool_capacity_elems"] > 0, stats
+                    assert 0 <= stats["usage_ratio"] <= 1.0, stats
+                    assert stats["total_free_elems"] + stats["used_elems_estimate"] == stats["pool_capacity_elems"], stats
 
     print("Placement verification passed.")
 
