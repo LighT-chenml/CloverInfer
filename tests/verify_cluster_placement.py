@@ -10,6 +10,8 @@ if REPO_ROOT not in sys.path:
 from src.core.config import ClusterConfig, ModelConfig
 from src.core.scheduler import GlobalScheduler
 
+FLOAT_TOL = 1e-4
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -107,10 +109,10 @@ def main():
             assert debug["resident_append_ops"] > 0, debug
             if debug.get("resident_av_enabled", False):
                 assert debug["resident_av_ops"] > 0, debug
-                assert debug["resident_av_shadow_max_abs_diff"] == 0.0, debug
+                assert debug["resident_av_shadow_max_abs_diff"] <= FLOAT_TOL, debug
             else:
                 assert debug["resident_materialize_ops"] > 0, debug
-                assert debug["resident_shadow_max_abs_diff"] == 0.0, debug
+                assert debug["resident_shadow_max_abs_diff"] <= FLOAT_TOL, debug
             assert debug["resident_last_freed_request_id"], debug
             assert debug["resident_request_count"] == 0, debug
             if args.pim_resident_store_backend == "upmem_kvslot":

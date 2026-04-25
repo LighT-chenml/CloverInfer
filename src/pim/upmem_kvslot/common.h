@@ -16,10 +16,13 @@
 #define KVSLOT_CMD_GET_STATS 5U
 #define KVSLOT_CMD_QK_BATCH 6U
 #define KVSLOT_CMD_AV 7U
+#define KVSLOT_CMD_AV_BATCH 8U
+#define KVSLOT_CMD_QK_SLOT_BATCH 9U
 
 #define KVSLOT_KERNEL_NONE 0U
 #define KVSLOT_KERNEL_QK 1U
 #define KVSLOT_KERNEL_AV 2U
+#define KVSLOT_KERNEL_QK_SLOT 3U
 
 typedef struct {
     uint32_t magic;
@@ -58,6 +61,25 @@ typedef struct {
     uint32_t elem_offset;
     uint32_t reserved[3];
 } kvslot_runtime_slot_args_t;
+
+typedef struct {
+    uint32_t num_slots;
+    uint32_t reserved[3];
+} kvslot_av_batch_args_t;
+
+typedef struct {
+    uint32_t num_heads;
+    uint32_t window;
+    uint32_t head_dim;
+    uint32_t reserved;
+} kvslot_qk_slot_args_t;
+
+typedef struct {
+    uint32_t num_heads;
+    uint32_t window;
+    uint32_t head_dim;
+    uint32_t reserved;
+} kvslot_qk_slot_batch_item_args_t;
 
 #define KVSLOT_DTYPE_FP32 0U
 #define KVSLOT_DTYPE_FP16 1U

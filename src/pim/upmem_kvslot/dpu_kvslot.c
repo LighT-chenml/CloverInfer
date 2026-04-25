@@ -15,20 +15,26 @@
 __host kvslot_slot_args_t slot_args;
 __host kvslot_qk_dpu_args_t qk_args;
 __host kvslot_runtime_slot_args_t runtime_slot_args;
+__host kvslot_qk_slot_args_t qk_slot_args;
+__host uint32_t qk_slot_head_indices[KVSLOT_MAX_HEADS];
 __host kvslot_meta_t kvslot_meta;
 __host uint32_t kvslot_kernel_command;
 
 __mram_noinit int32_t k_cache[KVSLOT_MAX_CAPACITY * KVSLOT_MAX_HEADS * KVSLOT_MAX_HEAD_DIM];
 __mram_noinit int32_t v_cache[KVSLOT_MAX_CAPACITY * KVSLOT_MAX_HEADS * KVSLOT_MAX_HEAD_DIM];
-__mram_noinit int32_t qk_query[KVSLOT_MAX_HEAD_DIM];
+__mram_noinit int32_t qk_query[KVSLOT_MAX_HEADS * KVSLOT_MAX_HEAD_DIM];
 __mram_noinit int32_t qk_keys[KVSLOT_MAX_CAPACITY * KVSLOT_MAX_HEAD_DIM];
 __mram_noinit int64_t qk_scores[KVSLOT_MAX_CAPACITY];
+__mram_noinit uint32_t qk_slot_scores_bits[KVSLOT_MAX_HEADS * KVSLOT_MAX_CAPACITY];
 __mram_noinit uint32_t av_weights_bits[KVSLOT_MAX_HEADS * KVSLOT_MAX_CAPACITY];
 __mram_noinit uint32_t av_context_bits[KVSLOT_MAX_HEADS * KVSLOT_MAX_HEAD_DIM];
 
 BARRIER_INIT(kvslot_barrier, NR_TASKLETS);
 
 static int64_t partial_sums[NR_TASKLETS];
+static float partial_float_sums[NR_TASKLETS];
+static uint32_t qk_slot_score_local[KVSLOT_MAX_HEADS * KVSLOT_MAX_CAPACITY];
+static float qk_slot_query_row[KVSLOT_MAX_HEAD_DIM];
 
 static float u32_bits_to_float(uint32_t bits)
 {
@@ -110,6 +116,29 @@ static float read_v_value(const kvslot_runtime_slot_args_t *slot, uint32_t logic
     uint32_t pair_base = word_idx & ~1u;
     uint32_t bits = 0;
     mram_read(&v_cache[pair_base], &packed, sizeof(packed));
+    bits = (word_idx & 1u) == 0 ? (uint32_t)(packed & 0xffffffffu) : (uint32_t)(packed >> 32);
+    return u32_bits_to_float(bits);
+}
+
+static float read_k_value(const kvslot_runtime_slot_args_t *slot, uint32_t logical_idx)
+{
+    if (slot->dtype_code == KVSLOT_DTYPE_FP16) {
+        uint64_t packed64 = 0;
+        uint32_t packed = 0;
+        uint32_t word_idx = slot->elem_offset + (logical_idx / 2u);
+        uint32_t pair_base = word_idx & ~1u;
+        uint16_t fp16_bits;
+        mram_read(&k_cache[pair_base], &packed64, sizeof(packed64));
+        packed = (word_idx & 1u) == 0 ? (uint32_t)(packed64 & 0xffffffffu) : (uint32_t)(packed64 >> 32);
+        fp16_bits = (logical_idx & 1u) == 0 ? (uint16_t)(packed & 0xffffu) : (uint16_t)(packed >> 16);
+        return fp16_bits_to_float(fp16_bits);
+    }
+
+    uint64_t packed = 0;
+    uint32_t word_idx = slot->elem_offset + logical_idx;
+    uint32_t pair_base = word_idx & ~1u;
+    uint32_t bits = 0;
+    mram_read(&k_cache[pair_base], &packed, sizeof(packed));
     bits = (word_idx & 1u) == 0 ? (uint32_t)(packed & 0xffffffffu) : (uint32_t)(packed >> 32);
     return u32_bits_to_float(bits);
 }
@@ -215,6 +244,90 @@ static void run_av_kernel(void)
     }
 }
 
+static void run_qk_slot_kernel(void)
+{
+    uint32_t tasklet_id = me();
+    uint32_t seq_len = runtime_slot_args.seq_len;
+    uint32_t group_heads = runtime_slot_args.group_heads;
+    uint32_t slot_head_dim = runtime_slot_args.head_dim;
+    uint32_t num_heads = qk_slot_args.num_heads;
+    uint32_t window = qk_slot_args.window;
+    uint32_t head_dim = qk_slot_args.head_dim;
+
+    if (seq_len > KVSLOT_MAX_CAPACITY) {
+        seq_len = KVSLOT_MAX_CAPACITY;
+    }
+    if (group_heads > KVSLOT_MAX_HEADS) {
+        group_heads = KVSLOT_MAX_HEADS;
+    }
+    if (slot_head_dim > KVSLOT_MAX_HEAD_DIM) {
+        slot_head_dim = KVSLOT_MAX_HEAD_DIM;
+    }
+    if (head_dim > slot_head_dim) {
+        head_dim = slot_head_dim;
+    }
+    if (head_dim > KVSLOT_MAX_HEAD_DIM) {
+        head_dim = KVSLOT_MAX_HEAD_DIM;
+    }
+    if (window > seq_len) {
+        window = seq_len;
+    }
+    if (num_heads > group_heads) {
+        num_heads = group_heads;
+    }
+    if (num_heads > KVSLOT_MAX_HEADS) {
+        num_heads = KVSLOT_MAX_HEADS;
+    }
+
+    for (uint32_t head_row = 0; head_row < num_heads; ++head_row) {
+        uint32_t local_head_idx = qk_slot_head_indices[head_row];
+        if (local_head_idx >= group_heads) {
+            continue;
+        }
+        {
+            uint32_t total_query_pairs = (head_dim + 1u) / 2u;
+            uint32_t query_row_base = head_row * head_dim;
+            for (uint32_t pair_idx = tasklet_id; pair_idx < total_query_pairs; pair_idx += NR_TASKLETS) {
+                uint32_t dim_idx0 = pair_idx * 2u;
+                uint32_t dim_idx1 = dim_idx0 + 1u;
+                uint64_t packed_q = 0;
+                mram_read(&qk_query[query_row_base + dim_idx0], &packed_q, sizeof(packed_q));
+                qk_slot_query_row[dim_idx0] = u32_bits_to_float((uint32_t)(packed_q & 0xffffffffu));
+                if (dim_idx1 < head_dim) {
+                    qk_slot_query_row[dim_idx1] = u32_bits_to_float((uint32_t)(packed_q >> 32));
+                }
+            }
+        }
+        barrier_wait(&kvslot_barrier);
+        for (uint32_t token_offset = tasklet_id; token_offset < window; token_offset += NR_TASKLETS) {
+            uint32_t token_idx = seq_len - window + token_offset;
+            float local_sum = 0.0f;
+            for (uint32_t dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
+                uint32_t logical_idx = ((token_idx * group_heads) + local_head_idx) * slot_head_dim + dim_idx;
+                float key_value = read_k_value(&runtime_slot_args, logical_idx);
+                local_sum += qk_slot_query_row[dim_idx] * key_value;
+            }
+            qk_slot_score_local[(size_t)head_row * window + token_offset] = float_to_u32_bits(local_sum);
+        }
+        barrier_wait(&kvslot_barrier);
+    }
+
+    if (tasklet_id == 0) {
+        for (uint32_t head_row = 0; head_row < num_heads; ++head_row) {
+            uint32_t total_pairs = (window + 1u) / 2u;
+            for (uint32_t pair_idx = 0; pair_idx < total_pairs; ++pair_idx) {
+                uint32_t out_idx0 = pair_idx * 2u;
+                uint32_t out_idx1 = out_idx0 + 1u;
+                uint32_t low_bits = qk_slot_score_local[(size_t)head_row * window + out_idx0];
+                uint32_t high_bits = out_idx1 < window ? qk_slot_score_local[(size_t)head_row * window + out_idx1] : 0u;
+                uint64_t packed = ((uint64_t)high_bits << 32) | (uint64_t)low_bits;
+                mram_write(&packed, &qk_slot_scores_bits[(size_t)head_row * window + out_idx0], sizeof(packed));
+            }
+        }
+    }
+    barrier_wait(&kvslot_barrier);
+}
+
 int main(void)
 {
     uint32_t tasklet_id = me();
@@ -228,6 +341,8 @@ int main(void)
         run_qk_kernel();
     } else if (kvslot_kernel_command == KVSLOT_KERNEL_AV) {
         run_av_kernel();
+    } else if (kvslot_kernel_command == KVSLOT_KERNEL_QK_SLOT) {
+        run_qk_slot_kernel();
     }
     barrier_wait(&kvslot_barrier);
     if (tasklet_id == 0) {

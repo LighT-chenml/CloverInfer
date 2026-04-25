@@ -65,7 +65,16 @@ class ResidentKVStore:
     def qk_scores_batch(self, queries: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
+    def qk_slot_scores_batch(
+        self,
+        slot_queries: list[tuple[str, str, list[int], int, torch.Tensor]],
+    ) -> list[torch.Tensor]:
+        raise NotImplementedError
+
     def weighted_value_sum(self, k_slot: str, v_slot: str, weights: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
+    def weighted_value_sum_batch(self, slot_weights: list[tuple[str, str, torch.Tensor]]) -> list[torch.Tensor]:
         raise NotImplementedError
 
 
@@ -78,6 +87,8 @@ class _KVSlotHelperClient:
     CMD_GET_STATS = 5
     CMD_QK_BATCH = 6
     CMD_AV = 7
+    CMD_AV_BATCH = 8
+    CMD_QK_SLOT_BATCH = 9
     MAX_SLOTS_PER_DPU = 64
 
     def __init__(self, binary_path: str, num_dpus: int, cwd: str, kv_dtype: str = "fp32"):
@@ -267,6 +278,66 @@ class _KVSlotHelperClient:
         ).view(num_queries, num_keys)
         return scores
 
+    def qk_slot_scores_batch(self, slot_queries: list[tuple[int, list[int], int, torch.Tensor]]) -> list[torch.Tensor]:
+        if not slot_queries:
+            return []
+
+        header = struct.pack("<IIII", self.MAGIC, self.CMD_QK_SLOT_BATCH, 0, 0)
+        args = struct.pack("<IIII", int(len(slot_queries)), 0, 0, 0)
+        payload_parts = [header, args]
+        expected_meta = []
+
+        for slot_id, local_head_indices, window, queries in slot_queries:
+            q = queries.detach().cpu().to(torch.float32).contiguous()
+            if q.dim() != 2:
+                raise ValueError(f"slot queries must be 2D, got shape {tuple(q.shape)}")
+            num_heads = int(q.shape[0])
+            head_dim = int(q.shape[1])
+            if num_heads != len(local_head_indices):
+                raise ValueError(
+                    f"slot query head count mismatch: queries={num_heads} local_head_indices={len(local_head_indices)}"
+                )
+            payload_parts.append(struct.pack("<I", int(slot_id)))
+            payload_parts.append(
+                struct.pack(
+                    "<IIII",
+                    num_heads,
+                    int(window),
+                    head_dim,
+                    0,
+                )
+            )
+            payload_parts.append(struct.pack(f"<{num_heads}I", *[int(idx) for idx in local_head_indices]))
+            payload_parts.append(q.numpy().tobytes(order="C"))
+            expected_meta.append((num_heads, int(window)))
+
+        self._write(b"".join(payload_parts))
+
+        out_args = struct.unpack("<IIII", self._read_exact(16))
+        out_num_items = int(out_args[0])
+        if out_num_items != len(slot_queries):
+            raise RuntimeError(
+                f"kvslot helper returned invalid qk slot batch header: expected={len(slot_queries)} actual={out_num_items}"
+            )
+
+        scores_per_item: list[torch.Tensor] = []
+        for idx, (expected_heads, expected_window) in enumerate(expected_meta):
+            out = struct.unpack("<IIII", self._read_exact(16))
+            actual_heads = int(out[0])
+            actual_window = int(out[1])
+            if actual_heads != expected_heads or actual_window != expected_window:
+                raise RuntimeError(
+                    "kvslot helper returned invalid qk slot batch item header: "
+                    f"index={idx} expected=({expected_heads}, {expected_window}) actual=({actual_heads}, {actual_window})"
+                )
+            raw_scores = self._read_exact(actual_heads * actual_window * 4)
+            scores = torch.tensor(
+                struct.unpack(f"<{actual_heads * actual_window}f", raw_scores),
+                dtype=torch.float32,
+            ).view(actual_heads, actual_window)
+            scores_per_item.append(scores)
+        return scores_per_item
+
     def weighted_value_sum(self, slot_id: int, weights: torch.Tensor) -> torch.Tensor:
         w = weights.detach().cpu().to(torch.float32).contiguous()
         if w.dim() != 2:
@@ -289,6 +360,49 @@ class _KVSlotHelperClient:
             dtype=torch.float32,
         ).view(group_heads, head_dim)
         return context
+
+    def weighted_value_sum_batch(self, slot_weights: list[tuple[int, torch.Tensor]]) -> list[torch.Tensor]:
+        if not slot_weights:
+            return []
+
+        header = struct.pack("<IIII", self.MAGIC, self.CMD_AV_BATCH, 0, 0)
+        args = struct.pack("<IIII", int(len(slot_weights)), 0, 0, 0)
+        payload_parts = [header, args]
+        expected_meta = []
+
+        for slot_id, weights in slot_weights:
+            w = weights.detach().cpu().to(torch.float32).contiguous()
+            if w.dim() != 2:
+                raise ValueError(f"weights must be 2D, got shape {tuple(w.shape)}")
+            payload_parts.append(struct.pack("<IIII", self.MAGIC, self.CMD_AV, int(slot_id), 0))
+            payload_parts.append(w.numpy().tobytes(order="C"))
+            expected_meta.append((int(slot_id), int(w.shape[0]), int(w.shape[1])))
+
+        self._write(b"".join(payload_parts))
+
+        out_args = struct.unpack("<IIII", self._read_exact(16))
+        out_num_slots = int(out_args[0])
+        if out_num_slots != len(slot_weights):
+            raise RuntimeError(
+                f"kvslot helper returned invalid av batch header: expected={len(slot_weights)} actual={out_num_slots}"
+            )
+
+        contexts: list[torch.Tensor] = []
+        for idx, (_, expected_heads, expected_seq_len) in enumerate(expected_meta):
+            out = struct.unpack("<IIIII", self._read_exact(20))
+            _, seq_len, group_heads, head_dim, _ = (int(item) for item in out)
+            if group_heads != expected_heads or seq_len != expected_seq_len:
+                raise RuntimeError(
+                    "kvslot helper returned invalid av batch item header: "
+                    f"index={idx} weights=({expected_heads}, {expected_seq_len}) header=({seq_len}, {group_heads}, {head_dim})"
+                )
+            raw_context = self._read_exact(group_heads * head_dim * 4)
+            context = torch.tensor(
+                struct.unpack(f"<{group_heads * head_dim}f", raw_context),
+                dtype=torch.float32,
+            ).view(group_heads, head_dim)
+            contexts.append(context)
+        return contexts
 
 
 class HostResidentKVStore(ResidentKVStore):
@@ -451,6 +565,36 @@ class HostResidentKVStore(ResidentKVStore):
         k = keys.detach().cpu().to(torch.int32).contiguous()
         return torch.einsum("qkd,qd->qk", k.to(torch.int64), q.to(torch.int64))
 
+    def qk_slot_scores_batch(
+        self,
+        slot_queries: list[tuple[str, str, list[int], int, torch.Tensor]],
+    ) -> list[torch.Tensor]:
+        outputs: list[torch.Tensor] = []
+        for k_slot, v_slot, local_head_indices, window, queries in slot_queries:
+            key = self._slot_key(k_slot, v_slot)
+            if key not in self.groups:
+                raise KeyError(f"Unknown KV slot: {key}")
+            slot = self.groups[key]
+            actual_window = min(int(window), int(slot.seq_len))
+            q = queries.detach().cpu().to(torch.float32).contiguous()
+            if q.dim() != 2:
+                raise ValueError(f"slot queries must be 2D, got shape {tuple(q.shape)}")
+            head_dim = min(int(q.shape[-1]), int(slot.head_dim))
+            if actual_window <= 0:
+                outputs.append(torch.empty((len(local_head_indices), 0), dtype=torch.float32))
+                continue
+            score_rows = []
+            for row_idx, local_head_idx in enumerate(local_head_indices):
+                if local_head_idx < 0 or local_head_idx >= slot.group_heads:
+                    raise ValueError(
+                        f"local_head_idx out of range for slot {key}: got={local_head_idx} group_heads={slot.group_heads}"
+                    )
+                query_vec = q[row_idx, :head_dim]
+                keys = slot.k_cache[slot.seq_len - actual_window : slot.seq_len, local_head_idx, :head_dim].float().contiguous()
+                score_rows.append(torch.einsum("ld,d->l", keys, query_vec).contiguous())
+            outputs.append(torch.stack(score_rows, dim=0))
+        return outputs
+
     def weighted_value_sum(self, k_slot: str, v_slot: str, weights: torch.Tensor) -> torch.Tensor:
         key = self._slot_key(k_slot, v_slot)
         if key not in self.groups:
@@ -464,6 +608,9 @@ class HostResidentKVStore(ResidentKVStore):
             )
         values = slot.v_cache[: slot.seq_len].float()
         return torch.einsum("hl,lhd->hd", w, values).contiguous()
+
+    def weighted_value_sum_batch(self, slot_weights: list[tuple[str, str, torch.Tensor]]) -> list[torch.Tensor]:
+        return [self.weighted_value_sum(k_slot, v_slot, weights) for k_slot, v_slot, weights in slot_weights]
 
 
 class UpmemKVSlotStore(ResidentKVStore):
@@ -726,9 +873,63 @@ class UpmemKVSlotStore(ResidentKVStore):
     def qk_scores_batch(self, queries: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
         return self.helper.qk_scores_batch(queries, keys)
 
+    def qk_slot_scores_batch(
+        self,
+        slot_queries: list[tuple[str, str, list[int], int, torch.Tensor]],
+    ) -> list[torch.Tensor]:
+        if not slot_queries:
+            return []
+
+        outputs: list[torch.Tensor | None] = [None for _ in slot_queries]
+        dpu_items: list[tuple[int, list[int], int, torch.Tensor]] = []
+        dpu_indices: list[int] = []
+
+        for idx, (k_slot, v_slot, local_head_indices, window, queries) in enumerate(slot_queries):
+            key = self._slot_key(k_slot, v_slot)
+            slot_info = self.slot_mapping[key]
+            if slot_info["backend"] == "dpu":
+                actual_window = min(int(window), int(slot_info["seq_len"]))
+                dpu_items.append((int(slot_info["slot_id"]), [int(v) for v in local_head_indices], actual_window, queries))
+                dpu_indices.append(idx)
+            else:
+                outputs[idx] = self.host_fallback.qk_slot_scores_batch(
+                    [(k_slot, v_slot, [int(v) for v in local_head_indices], window, queries)]
+                )[0]
+
+        if dpu_items:
+            dpu_outputs = self.helper.qk_slot_scores_batch(dpu_items)
+            for idx, scores in zip(dpu_indices, dpu_outputs):
+                outputs[idx] = scores
+
+        return [output for output in outputs if output is not None]
+
     def weighted_value_sum(self, k_slot: str, v_slot: str, weights: torch.Tensor) -> torch.Tensor:
         key = self._slot_key(k_slot, v_slot)
         slot_info = self.slot_mapping[key]
         if slot_info["backend"] == "dpu":
             return self.helper.weighted_value_sum(int(slot_info["slot_id"]), weights)
         return self.host_fallback.weighted_value_sum(k_slot, v_slot, weights)
+
+    def weighted_value_sum_batch(self, slot_weights: list[tuple[str, str, torch.Tensor]]) -> list[torch.Tensor]:
+        if not slot_weights:
+            return []
+
+        contexts: list[torch.Tensor | None] = [None for _ in slot_weights]
+        dpu_batch: list[tuple[int, torch.Tensor]] = []
+        dpu_indices: list[int] = []
+
+        for idx, (k_slot, v_slot, weights) in enumerate(slot_weights):
+            key = self._slot_key(k_slot, v_slot)
+            slot_info = self.slot_mapping[key]
+            if slot_info["backend"] == "dpu":
+                dpu_batch.append((int(slot_info["slot_id"]), weights))
+                dpu_indices.append(idx)
+            else:
+                contexts[idx] = self.host_fallback.weighted_value_sum(k_slot, v_slot, weights)
+
+        if dpu_batch:
+            dpu_contexts = self.helper.weighted_value_sum_batch(dpu_batch)
+            for idx, context in zip(dpu_indices, dpu_contexts):
+                contexts[idx] = context
+
+        return [context for context in contexts if context is not None]

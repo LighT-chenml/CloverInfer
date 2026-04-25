@@ -269,3 +269,283 @@ The next actions should separate system issues from algorithm issues.
   - reduce per-call host/DPU copy overhead
   - batch more work into one launch
   - reduce or eliminate host-side key materialization on the mixed-QK path
+
+### Early end-to-end result after AV integration
+
+The first small end-to-end comparison now says:
+
+- the resident-AV path is functionally active
+  - host-side `resident_materialize_ops` dropped to `0`
+  - resident `AV` calls replaced them in decode
+- but the naive `upmem_kvslot + resident AV` path is still much slower than
+  the host-store path on small `OPT-125M` traces
+
+Current interpretation:
+
+- the next bottleneck is no longer “can we route AV through DPU?”
+- the next bottleneck is “how do we make DPU-side AV amortize copy and launch
+  costs enough to win?”
+
+So the optimization order should now bias toward:
+
+1. reducing AV input/output traffic per decode step
+2. fusing or batching more work per launch
+3. reducing the residual host-side work around mixed-QK
+
+### AV batching checkpoint
+
+We have now tried the first `AV` batching step:
+
+- one Python/helper `AV_BATCH` call per layer
+- but helper-internal execution is still one `AV` launch per item
+
+Result:
+
+- end-to-end latency on the small `OPT-125M` trace was essentially unchanged
+- this is an expected but now confirmed negative result
+
+Immediate implication:
+
+- do not spend more time on protocol-only batching
+- move the optimization focus into `host_kvslot` itself
+
+Updated near-term order:
+
+1. batch `AV` work inside the helper by DPU and launch asynchronously when
+   possible
+2. after that, revisit the mixed `QK` path and reduce resident-key
+   materialization / host-side assembly
+3. then decide whether a deeper DPU-kernel refactor is needed for multi-slot
+   `AV` or resident-key-native `QK`
+
+### AV helper-side async checkpoint
+
+We also completed the next `AV` batching step:
+
+- inside `host_kvslot`, one batch is now partitioned into rounds
+- each round launches at most one `AV` item per DPU asynchronously
+- responses are written back in original order after all rounds finish
+
+Result:
+
+- correctness remained stable
+- small-trace latency still did not improve
+- this is another useful negative result
+
+Immediate implication:
+
+- stop spending time on finer-grained `AV` host/helper scheduling for now
+- the remaining bottleneck is likely more structural than orchestration-only
+
+Updated near-term order:
+
+1. reduce mixed-`QK` host-side resident-key assembly / materialization
+2. then re-measure whether `AV` becomes relatively more visible
+3. only if `AV` is still dominant, consider a deeper multi-slot kernel design
+   rather than more helper-side scheduling tweaks
+
+### Resident-slot mixed-QK checkpoint
+
+We have now completed the first resident-slot mixed-`QK` baseline:
+
+- mixed-`QK` now reads resident `K` directly from `upmem_kvslot`
+- it no longer repacks a CPU-materialized key window for the helper
+- minimal correctness check passed with `qk_mixed_last_max_abs_diff = 0.0`
+
+Small-trace result:
+
+- end-to-end latency became worse, not better
+
+Immediate implication:
+
+- the direction is still correct architecturally
+- but the current implementation is too naive to win yet
+
+Updated near-term order:
+
+1. batch or fuse resident-slot mixed-`QK` across heads / slots to reduce
+   per-head kernel overhead
+2. after that, re-measure whether mixed-`QK` or resident-`AV` is the larger
+   remaining bottleneck
+3. only then decide whether the next deeper refactor should target:
+   - multi-head resident-slot `QK`
+   - or multi-slot `AV`
+
+### Grouped resident-slot mixed-QK checkpoint
+
+We have now completed the next step on that path:
+
+- mixed heads are grouped by resident slot before sending work to
+  `upmem_kvslot`
+- one slot item can now carry multiple local heads / queries
+- this reduces some per-head protocol and helper setup overhead
+
+Small-trace result:
+
+- grouped resident-slot mixed-`QK` is slightly better than the first
+  ungrouped resident-slot baseline
+- but it is still slower than the earlier resident-AV baseline without this
+  resident-slot mixed-`QK` path
+
+Immediate implication:
+
+- grouping by slot helps, so this line is worth continuing
+- but the remaining bottleneck is now clearly inside helper/kernel execution
+  rather than only in Python-side packing
+
+Updated near-term order:
+
+1. implement true multi-head resident-slot `QK` inside one helper/kernel item
+   instead of still launching one kernel per head
+2. after that, consider overlapping multiple slot groups / DPUs in the helper
+3. only then re-evaluate whether the next deeper target should return to
+   resident-`AV`
+
+### True multi-head resident-slot QK checkpoint
+
+We have now completed that next step:
+
+- one grouped slot item executes one real multi-head resident-slot `QK` kernel
+- the grouped path no longer falls back to one kernel launch per head
+- minimal three-machine correctness still passed with exact mixed-`QK`
+  agreement
+
+Small-trace result:
+
+- this version is materially faster than both:
+  - the earlier grouped resident-slot mixed-`QK` baseline
+  - the original resident-AV-only baseline on the same workload
+
+Immediate implication:
+
+- the mainline should stay on the mixed-`QK` optimization path for now
+- we now have direct evidence that fixing execution granularity inside
+  `host_kvslot` / DPU kernels can beat the earlier resident-AV baseline
+- protocol-only batching should remain de-prioritized relative to
+  helper/kernel-structure changes
+
+Updated near-term order:
+
+1. overlap multiple grouped slot items across DPUs inside `host_kvslot`
+   without undoing the new multi-head kernel granularity
+2. re-measure whether mixed-`QK` is still the dominant remaining bottleneck or
+   whether resident-`AV` becomes the next limiter
+3. only after that, choose between:
+   - deeper resident-`AV` kernel fusion
+   - or further mixed-`QK` tiling / WRAM-staging improvements
+
+### Helper-side cross-DPU overlap checkpoint
+
+We have now tried the next obvious helper-side step on top of the true
+multi-head resident-slot `QK` kernel:
+
+- preload all grouped slot items for one `QK_SLOT_BATCH`
+- launch at most one grouped item per physical DPU asynchronously in each
+  round
+- read results back and return them in original order
+
+Small-trace result:
+
+- end-to-end latency stayed essentially unchanged relative to the immediately
+  previous multi-head-kernel baseline
+
+Immediate implication:
+
+- after fixing the per-head kernel granularity problem, the next bottleneck is
+  likely no longer plain host/helper slot scheduling
+- do not spend more time on finer-grained cross-slot helper overlap for now
+
+Updated near-term order:
+
+1. optimize the multi-head slot kernel itself:
+   - reduce repeated MRAM reads for query rows
+   - stage query/head metadata into WRAM once per grouped item
+   - revisit tasklet work partitioning across `(head, token)` tiles
+2. then re-measure whether mixed-`QK` still dominates relative to resident-`AV`
+3. only after that, decide whether to:
+   - continue kernel-level mixed-`QK` optimization
+   - or switch the mainline back to deeper resident-`AV` fusion
+
+### Per-row query WRAM staging checkpoint
+
+We have now completed the first kernel-internal staging step:
+
+- one grouped slot-`QK` head row stages its query row into WRAM once
+- the token loop then reuses that WRAM row while reading only resident `K`
+- correctness remained exact in the current mixed-`QK` check path
+
+Small-trace result:
+
+- this improved both latency and TPOT materially over the previous true
+  multi-head slot-kernel baseline
+
+Immediate implication:
+
+- the current mainline should continue inside the slot-`QK` kernel rather than
+  going back to helper scheduling
+- repeated MRAM traffic on the query side was a real bottleneck, not just a
+  micro-optimization target
+
+Updated near-term order:
+
+1. continue kernel-level mixed-`QK` optimization:
+   - revisit tasklet work partitioning across `(head, token)` tiles
+   - reduce repeated `K` unpack / scalar-read overhead
+   - explore small tiled staging for `K` where WRAM permits
+2. then re-measure whether resident-`AV` becomes the next dominant limiter
+3. only after that, choose whether the next engineering focus should be:
+   - deeper mixed-`QK` kernel refactoring
+   - or resident-`AV` kernel fusion / bandwidth reduction
+
+### Correctness reset after grouped multi-head readback bug
+
+We later found that the earlier fastest grouped multi-head numbers were not a
+safe basis for further optimization.
+
+Root cause:
+
+- grouped multi-head DPU `QK` wrote score rows with one layout
+- helper-side readback interpreted the same MRAM region with a different
+  compact layout
+- real decode could therefore produce corrupted later-head score rows,
+  including `NaN`
+
+Practical consequence:
+
+- all optimization decisions after this point should use only post-fix
+  measurements
+- the first corrected row-stage reruns were around `1.91 s` to `1.94 s`, not
+  `~1.20 s`
+
+### Token-parallel compact-score checkpoint
+
+We then replaced the slower correct row-stage kernel with a token-parallel
+compact-score variant.
+
+What changed:
+
+- each tasklet owns different token positions within the decode window
+- each tasklet computes the full dot product for those tokens
+- grouped scores remain in the compact layout that matches helper readback
+- per-token barrier/reduction overhead is removed
+
+Checkpoint result:
+
+- exact mixed-`QK` verification remained intact
+- small-trace performance improved to about:
+  - `avg_latency = 1.8203 s`
+  - `avg_tpot = 1.6384 s`
+
+Immediate implication:
+
+- tasklet work partitioning is now a stronger lever than additional helper
+  overlap
+- the next kernel work should focus on `K`-side read efficiency rather than
+  reworking the response protocol again
+
+Updated near-term order:
+
+1. reduce `read_k_value()` overhead inside the grouped mixed-`QK` kernel
+2. explore small tiled / packed `K` reads that preserve the compact score
+   layout
+3. re-measure whether resident `AV` or mixed-`QK` is now the dominant limiter
