@@ -204,6 +204,9 @@ class PimNaiveAttentionBackend:
         self.resident_append_ops = 0
         self.resident_materialize_ops = 0
         self.resident_shadow_max_abs_diff = 0.0
+        self.resident_av_enabled = isinstance(self.resident_store, UpmemKVSlotStore)
+        self.resident_av_ops = 0
+        self.resident_av_shadow_max_abs_diff = 0.0
         self._run_dot_smoke_test()
 
     def _shares_persistent_dpu_owner(self) -> bool:
@@ -717,7 +720,9 @@ class PimNaiveAttentionBackend:
             [self.cpu_backend.v_cache[request_id][layer_idx], v_new.unsqueeze(0)], dim=0
         )
 
-        if self.resident_compute_enabled:
+        use_resident_av = self.resident_compute_enabled and self.resident_av_enabled
+
+        if self.resident_compute_enabled and not use_resident_av:
             keys, values = self._materialize_layer_kv(request_state, layer_idx)
             self._update_resident_shadow_diff(request_id, layer_idx, keys, values)
         else:
@@ -749,7 +754,21 @@ class PimNaiveAttentionBackend:
                 raise
 
         weights = torch.softmax(scores, dim=-1)
-        context = torch.einsum("hl,lhd->hd", weights, values.float()).to(query.dtype)
+        if use_resident_av:
+            layer_state = request_state.layer_states[layer_idx]
+            group_contexts = []
+            for group in layer_state.head_groups:
+                group_weights = weights[group.head_start:group.head_end, :].contiguous()
+                group_contexts.append(
+                    self.resident_store.weighted_value_sum(group.k_slot, group.v_slot, group_weights)
+                )
+            context = torch.cat(group_contexts, dim=0).to(query.dtype)
+            cpu_context = torch.einsum("hl,lhd->hd", weights, values.float()).to(query.dtype)
+            av_diff = float(torch.max(torch.abs(context.float() - cpu_context.float())).item())
+            self.resident_av_shadow_max_abs_diff = max(self.resident_av_shadow_max_abs_diff, av_diff)
+            self.resident_av_ops += 1
+        else:
+            context = torch.einsum("hl,lhd->hd", weights, values.float()).to(query.dtype)
 
         if layer_idx == len(self.cpu_backend.k_cache[request_id]) - 1:
             self.cpu_backend.context_lens[request_id] += 1
@@ -814,6 +833,7 @@ class PimNaiveAttentionBackend:
             "resident_compute_enabled": self.resident_compute_enabled,
             "resident_store_backend": self.resident_store_backend,
             "resident_kv_dtype": self.resident_kv_dtype,
+            "resident_av_enabled": self.resident_av_enabled,
             "max_resident_groups_per_layer": self.max_resident_groups_per_layer,
             "head_grouping_policy": self.head_grouping_policy,
             "dpu_placement_policy": self.dpu_placement_policy,
@@ -822,6 +842,8 @@ class PimNaiveAttentionBackend:
             "resident_append_ops": self.resident_append_ops,
             "resident_materialize_ops": self.resident_materialize_ops,
             "resident_shadow_max_abs_diff": self.resident_shadow_max_abs_diff,
+            "resident_av_ops": self.resident_av_ops,
+            "resident_av_shadow_max_abs_diff": self.resident_av_shadow_max_abs_diff,
             "resident_total_live_elems": total_live_elems,
             "resident_total_capacity_elems": total_capacity_elems,
             "resident_request_footprints": request_footprints,

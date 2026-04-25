@@ -105,8 +105,12 @@ def main():
         if args.attention_backend == "pim_naive":
             debug = metrics["attention_backend"]["backend_debug"]
             assert debug["resident_append_ops"] > 0, debug
-            assert debug["resident_materialize_ops"] > 0, debug
-            assert debug["resident_shadow_max_abs_diff"] == 0.0, debug
+            if debug.get("resident_av_enabled", False):
+                assert debug["resident_av_ops"] > 0, debug
+                assert debug["resident_av_shadow_max_abs_diff"] == 0.0, debug
+            else:
+                assert debug["resident_materialize_ops"] > 0, debug
+                assert debug["resident_shadow_max_abs_diff"] == 0.0, debug
             assert debug["resident_last_freed_request_id"], debug
             assert debug["resident_request_count"] == 0, debug
             if args.pim_resident_store_backend == "upmem_kvslot":
@@ -115,11 +119,14 @@ def main():
                 assert store_debug["dpu_allocations"] > 0, store_debug
                 assert store_debug["helper_restarts"] >= 1, store_debug
                 allocator_stats = store_debug["allocator_stats"]
-                assert len(allocator_stats) == args.pim_num_dpus, allocator_stats
-                for stats in allocator_stats:
-                    assert stats["pool_capacity_elems"] > 0, stats
-                    assert 0 <= stats["usage_ratio"] <= 1.0, stats
-                    assert stats["total_free_elems"] + stats["used_elems_estimate"] == stats["pool_capacity_elems"], stats
+                if allocator_stats:
+                    assert len(allocator_stats) == args.pim_num_dpus, allocator_stats
+                    for stats in allocator_stats:
+                        assert stats["pool_capacity_elems"] > 0, stats
+                        assert 0 <= stats["usage_ratio"] <= 1.0, stats
+                        assert stats["total_free_elems"] + stats["used_elems_estimate"] == stats["pool_capacity_elems"], stats
+                else:
+                    assert store_debug["dpu_live_slots"] == 0, store_debug
 
     print("Placement verification passed.")
 

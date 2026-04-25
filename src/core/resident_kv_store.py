@@ -65,6 +65,9 @@ class ResidentKVStore:
     def qk_scores_batch(self, queries: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
+    def weighted_value_sum(self, k_slot: str, v_slot: str, weights: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError
+
 
 class _KVSlotHelperClient:
     MAGIC = 0x4B56534C
@@ -74,6 +77,7 @@ class _KVSlotHelperClient:
     CMD_FREE = 4
     CMD_GET_STATS = 5
     CMD_QK_BATCH = 6
+    CMD_AV = 7
     MAX_SLOTS_PER_DPU = 64
 
     def __init__(self, binary_path: str, num_dpus: int, cwd: str, kv_dtype: str = "fp32"):
@@ -109,6 +113,23 @@ class _KVSlotHelperClient:
         )
         self.restarts += 1
         return self.proc
+
+    def close(self) -> None:
+        proc = self.proc
+        self.proc = None
+        self.persistent_state_active = False
+        if proc is None:
+            return
+        if proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=2.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     def _dtype_code(self) -> int:
         return 1 if self.kv_dtype == "fp16" else 0
@@ -245,6 +266,29 @@ class _KVSlotHelperClient:
             dtype=torch.int64,
         ).view(num_queries, num_keys)
         return scores
+
+    def weighted_value_sum(self, slot_id: int, weights: torch.Tensor) -> torch.Tensor:
+        w = weights.detach().cpu().to(torch.float32).contiguous()
+        if w.dim() != 2:
+            raise ValueError(f"weights must be 2D, got shape {tuple(w.shape)}")
+
+        header = struct.pack("<IIII", self.MAGIC, self.CMD_AV, slot_id, 0)
+        payload = header + w.numpy().tobytes(order="C")
+        self._write(payload)
+
+        out = struct.unpack("<IIIII", self._read_exact(20))
+        _, seq_len, group_heads, head_dim, _ = (int(item) for item in out)
+        if int(w.shape[0]) != group_heads or int(w.shape[1]) != seq_len:
+            raise RuntimeError(
+                "kvslot helper returned invalid av header: "
+                f"weights={tuple(w.shape)} header=({seq_len}, {group_heads}, {head_dim})"
+            )
+        raw_context = self._read_exact(group_heads * head_dim * 4)
+        context = torch.tensor(
+            struct.unpack(f"<{group_heads * head_dim}f", raw_context),
+            dtype=torch.float32,
+        ).view(group_heads, head_dim)
+        return context
 
 
 class HostResidentKVStore(ResidentKVStore):
@@ -406,6 +450,20 @@ class HostResidentKVStore(ResidentKVStore):
         q = queries.detach().cpu().to(torch.int32).contiguous()
         k = keys.detach().cpu().to(torch.int32).contiguous()
         return torch.einsum("qkd,qd->qk", k.to(torch.int64), q.to(torch.int64))
+
+    def weighted_value_sum(self, k_slot: str, v_slot: str, weights: torch.Tensor) -> torch.Tensor:
+        key = self._slot_key(k_slot, v_slot)
+        if key not in self.groups:
+            raise KeyError(f"Unknown KV slot: {key}")
+        slot = self.groups[key]
+        w = weights.detach().cpu().to(torch.float32).contiguous()
+        if tuple(w.shape) != (slot.group_heads, slot.seq_len):
+            raise ValueError(
+                f"weight shape mismatch for slot {key}: got={tuple(w.shape)} "
+                f"expected=({slot.group_heads}, {slot.seq_len})"
+            )
+        values = slot.v_cache[: slot.seq_len].float()
+        return torch.einsum("hl,lhd->hd", w, values).contiguous()
 
 
 class UpmemKVSlotStore(ResidentKVStore):
@@ -615,6 +673,10 @@ class UpmemKVSlotStore(ResidentKVStore):
             elem_count = int(slot_info.get("elem_count", 0))
             self.dpu_live_elems_by_dpu[physical_dpu] = max(0, self.dpu_live_elems_by_dpu[physical_dpu] - elem_count)
             self.helper.persistent_state_active = self.dpu_live_slots > 0
+            if self.dpu_live_slots == 0:
+                # Release the allocated DPU set once the resident store becomes
+                # empty, so later experiments do not inherit a stale helper.
+                self.helper.close()
         else:
             self.host_fallback.free_group(k_slot, v_slot)
         if slot_id is not None:
@@ -663,3 +725,10 @@ class UpmemKVSlotStore(ResidentKVStore):
 
     def qk_scores_batch(self, queries: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
         return self.helper.qk_scores_batch(queries, keys)
+
+    def weighted_value_sum(self, k_slot: str, v_slot: str, weights: torch.Tensor) -> torch.Tensor:
+        key = self._slot_key(k_slot, v_slot)
+        slot_info = self.slot_mapping[key]
+        if slot_info["backend"] == "dpu":
+            return self.helper.weighted_value_sum(int(slot_info["slot_id"]), weights)
+        return self.host_fallback.weighted_value_sum(k_slot, v_slot, weights)

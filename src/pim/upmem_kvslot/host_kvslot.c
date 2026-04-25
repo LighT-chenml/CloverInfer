@@ -11,6 +11,8 @@
 #define DPU_BINARY "./build/dpu_kvslot"
 #endif
 
+#define KVSLOT_QK_MAX_ACTIVE_DPUS 16U
+
 typedef struct {
     uint32_t capacity;
     uint32_t seq_len;
@@ -619,7 +621,6 @@ static int handle_get_stats(kvslot_runner_t *runner)
 
 static int handle_qk_batch(kvslot_runner_t *runner)
 {
-    (void)runner;
     kvslot_qk_args_t args;
     if (read_exact(stdin, &args, sizeof(args)) != 0) {
         fprintf(stderr, "Failed to read qk batch args\n");
@@ -641,52 +642,259 @@ static int handle_qk_batch(kvslot_runner_t *runner)
     size_t query_elems = (size_t)args.num_queries * args.head_dim;
     size_t key_elems = (size_t)args.num_queries * args.num_keys * args.head_dim;
     size_t score_elems = (size_t)args.num_queries * args.num_keys;
-    int32_t *queries = calloc(query_elems, sizeof(*queries));
-    int32_t *keys = calloc(key_elems, sizeof(*keys));
-    int64_t *scores = calloc(score_elems, sizeof(*scores));
-    if (queries == NULL || keys == NULL || scores == NULL) {
+    int32_t *queries_in = calloc(query_elems, sizeof(*queries_in));
+    int32_t *keys_in = calloc(key_elems, sizeof(*keys_in));
+    int64_t *scores_out = calloc(score_elems, sizeof(*scores_out));
+    if (queries_in == NULL || keys_in == NULL || scores_out == NULL) {
         fprintf(stderr, "Failed to allocate qk batch buffers\n");
-        free(queries);
-        free(keys);
-        free(scores);
+        free(queries_in);
+        free(keys_in);
+        free(scores_out);
         return 1;
     }
 
-    if (read_exact(stdin, queries, query_elems * sizeof(*queries)) != 0
-        || read_exact(stdin, keys, key_elems * sizeof(*keys)) != 0) {
+    if (read_exact(stdin, queries_in, query_elems * sizeof(*queries_in)) != 0
+        || read_exact(stdin, keys_in, key_elems * sizeof(*keys_in)) != 0) {
         fprintf(stderr, "Failed to read qk batch payload\n");
-        free(queries);
-        free(keys);
-        free(scores);
+        free(queries_in);
+        free(keys_in);
+        free(scores_out);
         return 1;
     }
 
-    for (uint32_t query_idx = 0; query_idx < args.num_queries; ++query_idx) {
-        const int32_t *query = &queries[(size_t)query_idx * args.head_dim];
-        const int32_t *query_keys = &keys[(size_t)query_idx * args.num_keys * args.head_dim];
-        for (uint32_t key_idx = 0; key_idx < args.num_keys; ++key_idx) {
-            int64_t dot = 0;
-            const int32_t *key = &query_keys[(size_t)key_idx * args.head_dim];
-            for (uint32_t dim = 0; dim < args.head_dim; ++dim) {
-                dot += (int64_t)query[dim] * (int64_t)key[dim];
+    uint32_t active_dpus = runner->nr_dpus;
+    if (active_dpus > args.num_keys) {
+        active_dpus = args.num_keys;
+    }
+    if (active_dpus > KVSLOT_QK_MAX_ACTIVE_DPUS) {
+        active_dpus = KVSLOT_QK_MAX_ACTIVE_DPUS;
+    }
+    uint32_t keys_per_dpu = (args.num_keys + active_dpus - 1) / active_dpus;
+    if (keys_per_dpu > KVSLOT_MAX_CAPACITY) {
+        fprintf(stderr, "Too many keys per DPU after partitioning: %u\n", keys_per_dpu);
+        free(queries_in);
+        free(keys_in);
+        free(scores_out);
+        return 1;
+    }
+
+    int32_t *queries_partitioned = calloc((size_t)active_dpus * args.head_dim, sizeof(*queries_partitioned));
+    int32_t *keys_partitioned = calloc((size_t)active_dpus * keys_per_dpu * args.head_dim, sizeof(*keys_partitioned));
+    int64_t *scores_partitioned = calloc((size_t)active_dpus * keys_per_dpu, sizeof(*scores_partitioned));
+    kvslot_meta_t *metas = calloc(active_dpus, sizeof(*metas));
+    if (queries_partitioned == NULL || keys_partitioned == NULL || scores_partitioned == NULL || metas == NULL) {
+        fprintf(stderr, "Failed to allocate qk DPU-partitioned buffers\n");
+        free(queries_in);
+        free(keys_in);
+        free(scores_out);
+        free(queries_partitioned);
+        free(keys_partitioned);
+        free(scores_partitioned);
+        free(metas);
+        return 1;
+    }
+
+    int rc = 0;
+    struct dpu_set_t active_dpu_sets[KVSLOT_QK_MAX_ACTIVE_DPUS];
+    memset(active_dpu_sets, 0, sizeof(active_dpu_sets));
+    {
+        struct dpu_set_t dpu;
+        uint32_t each_dpu;
+        uint32_t selected = 0;
+        DPU_FOREACH(runner->dpu_set, dpu, each_dpu)
+        {
+            if (selected >= active_dpus) {
+                break;
             }
-            scores[(size_t)query_idx * args.num_keys + key_idx] = dot;
+            active_dpu_sets[selected++] = dpu;
+        }
+        if (selected != active_dpus) {
+            fprintf(stderr, "Failed to collect enough active DPUs for qk batch\n");
+            free(queries_in);
+            free(keys_in);
+            free(scores_out);
+            free(queries_partitioned);
+            free(keys_partitioned);
+            free(scores_partitioned);
+            free(metas);
+            return 1;
         }
     }
 
-    if (write_exact(stdout, &args, sizeof(args)) != 0
-        || write_exact(stdout, scores, score_elems * sizeof(*scores)) != 0
-        || flush_exact(stdout) != 0) {
+    for (uint32_t query_idx = 0; query_idx < args.num_queries && rc == 0; ++query_idx) {
+        memset(queries_partitioned, 0, (size_t)active_dpus * args.head_dim * sizeof(*queries_partitioned));
+        memset(keys_partitioned, 0, (size_t)active_dpus * keys_per_dpu * args.head_dim * sizeof(*keys_partitioned));
+        memset(scores_partitioned, 0, (size_t)active_dpus * keys_per_dpu * sizeof(*scores_partitioned));
+        memset(metas, 0, (size_t)active_dpus * sizeof(*metas));
+
+        const int32_t *query = &queries_in[(size_t)query_idx * args.head_dim];
+        const int32_t *query_keys = &keys_in[(size_t)query_idx * args.num_keys * args.head_dim];
+
+        for (uint32_t dpu_idx = 0; dpu_idx < active_dpus; ++dpu_idx) {
+            memcpy(&queries_partitioned[(size_t)dpu_idx * args.head_dim], query, args.head_dim * sizeof(int32_t));
+            for (uint32_t local_key = 0; local_key < keys_per_dpu; ++local_key) {
+                uint32_t global_key = dpu_idx * keys_per_dpu + local_key;
+                if (global_key < args.num_keys) {
+                    memcpy(
+                        &keys_partitioned[((size_t)dpu_idx * keys_per_dpu + local_key) * args.head_dim],
+                        &query_keys[(size_t)global_key * args.head_dim],
+                        args.head_dim * sizeof(int32_t));
+                }
+            }
+        }
+
+        kvslot_qk_dpu_args_t dpu_args = {
+            .head_dim = args.head_dim,
+            .num_keys = keys_per_dpu,
+            .key_stride = args.head_dim,
+            .reserved = 0,
+        };
+        uint32_t kernel_command = KVSLOT_KERNEL_QK;
+        for (uint32_t dpu_idx = 0; dpu_idx < active_dpus; ++dpu_idx) {
+            struct dpu_set_t target = active_dpu_sets[dpu_idx];
+            DPU_ASSERT(dpu_copy_to(target, "kvslot_kernel_command", 0, &kernel_command, sizeof(kernel_command)));
+            DPU_ASSERT(dpu_copy_to(target, "qk_args", 0, &dpu_args, sizeof(dpu_args)));
+            DPU_ASSERT(dpu_copy_to(
+                target,
+                "qk_query",
+                0,
+                &queries_partitioned[(size_t)dpu_idx * args.head_dim],
+                (size_t)args.head_dim * sizeof(int32_t)));
+            DPU_ASSERT(dpu_copy_to(
+                target,
+                "qk_keys",
+                0,
+                &keys_partitioned[(size_t)dpu_idx * keys_per_dpu * args.head_dim],
+                (size_t)keys_per_dpu * args.head_dim * sizeof(int32_t)));
+            DPU_ASSERT(dpu_launch(target, DPU_ASYNCHRONOUS));
+        }
+        for (uint32_t dpu_idx = 0; dpu_idx < active_dpus; ++dpu_idx) {
+            struct dpu_set_t target = active_dpu_sets[dpu_idx];
+            DPU_ASSERT(dpu_sync(target));
+            DPU_ASSERT(dpu_copy_from(
+                target,
+                "qk_scores",
+                0,
+                &scores_partitioned[(size_t)dpu_idx * keys_per_dpu],
+                (size_t)keys_per_dpu * sizeof(int64_t)));
+            DPU_ASSERT(dpu_copy_from(target, "kvslot_meta", 0, &metas[dpu_idx], sizeof(kvslot_meta_t)));
+        }
+
+        for (uint32_t dpu_idx = 0; dpu_idx < active_dpus; ++dpu_idx) {
+            for (uint32_t local_key = 0; local_key < keys_per_dpu; ++local_key) {
+                uint32_t global_key = dpu_idx * keys_per_dpu + local_key;
+                if (global_key < args.num_keys) {
+                    scores_out[(size_t)query_idx * args.num_keys + global_key] =
+                        scores_partitioned[(size_t)dpu_idx * keys_per_dpu + local_key];
+                }
+            }
+        }
+    }
+
+    if (rc == 0 && (write_exact(stdout, &args, sizeof(args)) != 0
+        || write_exact(stdout, scores_out, score_elems * sizeof(*scores_out)) != 0
+        || flush_exact(stdout) != 0)) {
         fprintf(stderr, "Failed to write qk batch response\n");
-        free(queries);
-        free(keys);
-        free(scores);
+        rc = 1;
+    }
+
+    free(queries_in);
+    free(keys_in);
+    free(scores_out);
+    free(queries_partitioned);
+    free(keys_partitioned);
+    free(scores_partitioned);
+    free(metas);
+    return rc;
+}
+
+static int handle_av(kvslot_runner_t *runner, uint32_t slot_id)
+{
+    struct dpu_set_t target_dpu;
+    host_slot_t *slot = NULL;
+    kvslot_slot_args_t out;
+    kvslot_runtime_slot_args_t runtime_args;
+    uint32_t kernel_command = KVSLOT_KERNEL_AV;
+
+    if (slot_id >= runner->nr_dpus * KVSLOT_MAX_SLOTS_PER_DPU) {
+        fprintf(stderr, "Invalid slot id %u for av\n", slot_id);
+        return 1;
+    }
+    if (runner_get_dpu_and_slot(runner, slot_id, &target_dpu, &slot) != 0) {
+        fprintf(stderr, "Failed to locate DPU for slot %u\n", slot_id);
+        return 1;
+    }
+    if (slot->capacity == 0) {
+        fprintf(stderr, "AV on uninitialized slot %u\n", slot_id);
         return 1;
     }
 
-    free(queries);
-    free(keys);
-    free(scores);
+    size_t weight_elems = (size_t)slot->seq_len * slot->group_heads;
+    size_t context_elems = (size_t)slot->group_heads * slot->head_dim;
+    size_t weight_bytes = weight_elems * sizeof(float);
+    size_t context_bytes = context_elems * sizeof(float);
+    size_t padded_weight_bytes = ((weight_bytes + 7u) / 8u) * 8u;
+    size_t padded_context_bytes = ((context_bytes + 7u) / 8u) * 8u;
+    float *weights = NULL;
+    float *context = NULL;
+
+    if (weight_elems > 0) {
+        weights = calloc(1, padded_weight_bytes);
+        if (weights == NULL) {
+            fprintf(stderr, "Failed to allocate av weights buffer\n");
+            return 1;
+        }
+        if (read_exact(stdin, weights, weight_bytes) != 0) {
+            fprintf(stderr, "Failed to read av weights payload\n");
+            free(weights);
+            return 1;
+        }
+    }
+
+    if (context_elems > 0) {
+        context = calloc(1, padded_context_bytes);
+        if (context == NULL) {
+            fprintf(stderr, "Failed to allocate av context buffer\n");
+            free(weights);
+            return 1;
+        }
+    }
+
+    runtime_args.seq_len = slot->seq_len;
+    runtime_args.group_heads = slot->group_heads;
+    runtime_args.head_dim = slot->head_dim;
+    runtime_args.dtype_code = slot->dtype_code;
+    runtime_args.elem_offset = slot->elem_offset;
+    runtime_args.reserved[0] = 0;
+    runtime_args.reserved[1] = 0;
+    runtime_args.reserved[2] = 0;
+
+    DPU_ASSERT(dpu_copy_to(target_dpu, "kvslot_kernel_command", 0, &kernel_command, sizeof(kernel_command)));
+    DPU_ASSERT(dpu_copy_to(target_dpu, "runtime_slot_args", 0, &runtime_args, sizeof(runtime_args)));
+    if (weight_bytes > 0) {
+        DPU_ASSERT(dpu_copy_to(target_dpu, "av_weights_bits", 0, weights, padded_weight_bytes));
+    }
+    DPU_ASSERT(dpu_launch(target_dpu, DPU_SYNCHRONOUS));
+    if (context_bytes > 0) {
+        DPU_ASSERT(dpu_copy_from(target_dpu, "av_context_bits", 0, context, padded_context_bytes));
+    }
+
+    out.capacity = slot->capacity;
+    out.seq_len = slot->seq_len;
+    out.group_heads = slot->group_heads;
+    out.head_dim = slot->head_dim;
+    out.dtype_code = slot->dtype_code;
+    if (write_exact(stdout, &out, sizeof(out)) != 0
+        || (context_bytes > 0 && write_exact(stdout, context, context_bytes) != 0)
+        || flush_exact(stdout) != 0) {
+        fprintf(stderr, "Failed to write av response\n");
+        free(weights);
+        free(context);
+        return 1;
+    }
+
+    free(weights);
+    free(context);
     return 0;
 }
 
@@ -726,6 +934,8 @@ static int run_stdio_mode(uint32_t requested_dpus)
             rc = handle_get_stats(&runner);
         } else if (header.command == KVSLOT_CMD_QK_BATCH) {
             rc = handle_qk_batch(&runner);
+        } else if (header.command == KVSLOT_CMD_AV) {
+            rc = handle_av(&runner, header.slot_id);
         } else {
             fprintf(stderr, "Unknown kvslot command %u\n", header.command);
             rc = 1;

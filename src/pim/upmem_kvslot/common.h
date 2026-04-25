@@ -15,6 +15,11 @@
 #define KVSLOT_CMD_FREE 4U
 #define KVSLOT_CMD_GET_STATS 5U
 #define KVSLOT_CMD_QK_BATCH 6U
+#define KVSLOT_CMD_AV 7U
+
+#define KVSLOT_KERNEL_NONE 0U
+#define KVSLOT_KERNEL_QK 1U
+#define KVSLOT_KERNEL_AV 2U
 
 typedef struct {
     uint32_t magic;
@@ -37,6 +42,22 @@ typedef struct {
     uint32_t num_queries;
     uint32_t reserved;
 } kvslot_qk_args_t;
+
+typedef struct {
+    uint32_t head_dim;
+    uint32_t num_keys;
+    uint32_t key_stride;
+    uint32_t reserved;
+} kvslot_qk_dpu_args_t;
+
+typedef struct {
+    uint32_t seq_len;
+    uint32_t group_heads;
+    uint32_t head_dim;
+    uint32_t dtype_code;
+    uint32_t elem_offset;
+    uint32_t reserved[3];
+} kvslot_runtime_slot_args_t;
 
 #define KVSLOT_DTYPE_FP32 0U
 #define KVSLOT_DTYPE_FP16 1U

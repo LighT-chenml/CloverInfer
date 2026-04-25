@@ -229,7 +229,10 @@ The shared-owner refactor has now reached a useful checkpoint:
 
 - resident KV and QK-mixed traffic share the same `upmem_kvslot` helper
 - startup no longer runs a separate `upmem_dot` allocation smoke in this mode
-- the current real-model trace is stable at `446 DPU`
+- the current real-model trace is stable at both `512 DPU` and `1020 DPU`
+- QK has now moved from CPU-inside-helper to a real DPU launch path
+- AV has now moved to a first real DPU-side resident-`V` path with standalone
+  correctness checks passing at `fp32` and `fp16`
 
 The next actions should separate system issues from algorithm issues.
 
@@ -239,7 +242,8 @@ The next actions should separate system issues from algorithm issues.
   allocate a requested DPU count
 - especially look for leftover `host_qk --stdio` or `host_kvslot --stdio`
   processes from previous experiments
-- after cleaning stale helpers, retry `512 DPU` and then `1020 DPU`
+- note that the resident-KV path now also auto-closes its own `host_kvslot`
+  helper when the last live DPU slot is freed
 
 ### Immediate backend follow-up
 
@@ -247,8 +251,21 @@ The next actions should separate system issues from algorithm issues.
 - do not reintroduce dual-owner `host_qk` allocation for large-DPU runs
 - add clearer diagnostics when helper startup fails because a previous helper is
   still occupying DPUs
+- treat the current DPU-QK path as the new functional baseline, even though it
+  is not yet performance-optimized
 
-### After the allocatable-budget issue is clarified
+### Immediate optimization takeaway
 
-- move QK from CPU-inside-kvslot-helper to true DPU-side compute
-- then start moving AV onto the same shared-owner path
+- the attempted `QK active16` launch cap did not help at either `512 DPU` or
+  `1020 DPU`
+- treat it as a negative result and do not keep iterating on that specific
+  idea first
+
+### Next compute step
+
+- validate the new resident-AV path in end-to-end cluster runs
+- then optimize the combined DPU-side `QK + AV` path
+- priority candidates:
+  - reduce per-call host/DPU copy overhead
+  - batch more work into one launch
+  - reduce or eliminate host-side key materialization on the mixed-QK path

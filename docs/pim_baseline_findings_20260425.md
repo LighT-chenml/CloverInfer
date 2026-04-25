@@ -275,6 +275,139 @@ Interpretation:
 - this confirms the remaining blocker was runtime leakage, not the shared-owner
   refactor itself
 
+### 9. 1020 DPU + fp16 + balanced/rotated + shared-owner
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_qwen1.8b_humaneval4_conc2_tok8_dpu1020_fp16_balanced_rotated_shared.jsonl`
+
+Observed:
+
+- `avg_latency = 26.4178 s`
+- `max_latency = 28.0796 s`
+- `max_usage_ratio = 0.25`
+- `max_fallback_allocations = 0`
+- `max_dpu_allocate_failures = 0`
+
+Interpretation:
+
+- the shared-owner Scheme 2 path also runs correctly at the full `1020 DPU`
+  scale on `.7`
+- once stale helper leakage is removed, large-DPU scale-up no longer introduces
+  a new functional failure on this workload
+
+### Runtime leak fix
+
+We also fixed the main software cause of the stale-helper issue:
+
+- when the last DPU-backed resident slot is freed, `UpmemKVSlotStore` now
+  closes its persistent `host_kvslot` helper automatically
+
+This means later experiments should not inherit an orphaned helper that keeps a
+large DPU set pinned after the request lifecycle has already ended.
+
+### DPU-side QK milestone
+
+We then replaced the temporary CPU-side `QK_BATCH` implementation inside
+`host_kvslot` with a real DPU launch path:
+
+- host partitions each query's key window across the allocated DPU set
+- the kvslot DPU program computes dot products on DPU
+- host collects per-DPU score shards and reassembles the final score matrix
+
+Standalone correctness check:
+
+- local `UpmemKVSlotStore.qk_scores_batch(...)` matched the host reference with
+  `max_abs_diff = 0`
+
+### 10. 512 DPU + fp16 + balanced/rotated + shared-owner + DPU-QK
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_qwen1.8b_humaneval4_conc2_tok8_dpu512_fp16_balanced_rotated_shared_dpuqk.jsonl`
+
+Observed:
+
+- `avg_latency = 27.7712 s`
+- `max_latency = 29.4477 s`
+- `max_usage_ratio = 0.2422`
+- `max_fallback_allocations = 0`
+
+Interpretation:
+
+- the first real DPU-side QK implementation preserves end-to-end correctness
+  and stability on the real-model shared-owner path
+- latency is slightly worse than the temporary CPU-inside-helper version, which
+  is expected for a first functional DPU-QK path without optimization
+
+### 11. 1020 DPU + fp16 + balanced/rotated + shared-owner + DPU-QK
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_qwen1.8b_humaneval4_conc2_tok8_dpu1020_fp16_balanced_rotated_shared_dpuqk.jsonl`
+
+Observed:
+
+- `avg_latency = 29.3233 s`
+- `max_latency = 31.2214 s`
+- `max_usage_ratio = 0.125`
+- `max_fallback_allocations = 0`
+
+Interpretation:
+
+- the real DPU-side QK path also remains stable at `1020 DPU`
+- this confirms the new QK implementation scales functionally to the full
+  machine-wide DPU count
+
+### DPU-QK active-set follow-up
+
+We also tried a host-side launch optimization that capped each QK batch to at
+most `16` active DPUs instead of launching the whole persistent set.
+
+Artifacts:
+
+- `artifacts/pim_allocator_trace_qwen1.8b_humaneval4_conc2_tok8_dpu512_fp16_balanced_rotated_shared_dpuqk_active16.jsonl`
+- `artifacts/pim_allocator_trace_qwen1.8b_humaneval4_conc2_tok8_dpu1020_fp16_balanced_rotated_shared_dpuqk_active16.jsonl`
+
+Observed:
+
+- `512 DPU`: `avg_latency = 27.8377 s`
+- `1020 DPU`: `avg_latency = 29.3965 s`
+
+Interpretation:
+
+- this did not improve over the earlier DPU-QK baselines
+- the main DPU-QK overhead is not simply caused by launching too many DPUs per
+  batch
+- this should be recorded as a negative optimization result, not a mainline
+  direction
+
+### DPU-side AV milestone
+
+The shared-owner `upmem_kvslot` path now also has a first real DPU-side `AV`
+implementation over resident `V`.
+
+What changed:
+
+- a new `KVSLOT_CMD_AV` protocol path was added to `host_kvslot`
+- the kvslot DPU program now supports weighted value aggregation on resident
+  `V`
+- the attention backend now calls resident `AV` directly on the
+  `upmem_kvslot` path instead of materializing `V` back to host
+
+Standalone correctness check on `.7`:
+
+- `fp32`: `max_abs_diff = 0.0`
+- `fp16`: `max_abs_diff = 0.0`
+
+Interpretation:
+
+- resident `AV` is now functionally correct for both currently supported KV
+  formats
+- the implementation is still a naive kernel aimed at correctness first
+- architecturally, the system has now crossed the key milestone where both
+  `QK` and `AV` have real DPU-side execution paths
+
 ## Updated Practical Takeaway
 
 There are now two separate conclusions:
@@ -284,3 +417,12 @@ There are now two separate conclusions:
 
 2. Large-DPU failures after the refactor should first be checked for stale
    helper processes before being interpreted as architectural limits.
+
+3. With the stale-helper leak fixed, the current real-model shared-owner path
+   is now verified at both:
+   - `512 DPU`
+   - `1020 DPU`
+
+4. QK is no longer just "logically shared-owner"; it now executes on DPU in
+   the kvslot path, giving us a true PIM-side attention-compute baseline to
+   optimize next.
