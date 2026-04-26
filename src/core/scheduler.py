@@ -61,47 +61,216 @@ class GlobalScheduler:
             "num_heads": int(model_config.num_heads),
             "vocab_size": 0,
         }
+        self.decode_step_sync_window_s = max(0.0, float(cluster_config.decode_step_sync_window_s))
+        self.decode_step_sync_max_size = max(1, int(cluster_config.decode_step_sync_max_size))
+        self.decode_step_sync_flushes = 0
+        self.decode_step_sync_total_items = 0
+        self.decode_step_sync_max_observed = 0
+        self._decode_step_sync_batches: dict[int, list[asyncio.Future]] = {}
+        self._decode_step_sync_tasks: dict[int, asyncio.Task] = {}
+        self._inflight_request_count = 0
+        self.attention_layer_barrier_window_s = max(
+            0.0, float(cluster_config.attention_layer_barrier_window_s)
+        )
+        self.attention_layer_barrier_max_size = max(
+            1, int(cluster_config.attention_layer_barrier_max_size)
+        )
+        self.attention_layer_barrier_flushes = 0
+        self.attention_layer_barrier_total_items = 0
+        self.attention_layer_barrier_max_observed = 0
+        self._attention_layer_barrier_batches: dict[tuple[int, int], list[asyncio.Future]] = {}
+        self._attention_layer_barrier_tasks: dict[tuple[int, int], asyncio.Task] = {}
         self.attention_batch_window_s = max(0.0, float(cluster_config.attention_rpc_batch_window_s))
         self.attention_batch_max_size = max(1, int(cluster_config.attention_rpc_batch_max_size))
         self.attention_batch_flushes = 0
         self.attention_batch_total_items = 0
         self.attention_batch_max_observed = 0
-        self._attention_batch_queue: list[tuple[dict, asyncio.Future, object]] = []
-        self._attention_batch_task: asyncio.Task | None = None
+        self._attention_wavefront_batches: dict[tuple[int, int], list[tuple[dict, asyncio.Future, object]]] = {}
+        self._attention_wavefront_tasks: dict[tuple[int, int], asyncio.Task] = {}
+        self._attention_wavefront_expected_sizes: dict[tuple[int, int], int] = {}
+        self._active_decode_requests = 0
 
-    async def _flush_attention_batch(self):
+    def _attention_batch_target_size(self) -> int:
+        return max(1, min(self._active_decode_requests, self.attention_batch_max_size))
+
+    def _decode_step_sync_target_size(self) -> int:
+        return max(1, min(self._inflight_request_count, self.decode_step_sync_max_size))
+
+    def _attention_layer_barrier_target_size(self) -> int:
+        return max(1, min(self._active_decode_requests, self.attention_layer_barrier_max_size))
+
+    async def _flush_decode_step_sync(self, step: int):
+        try:
+            if self.decode_step_sync_window_s > 0:
+                await asyncio.sleep(self.decode_step_sync_window_s)
+            await self._execute_decode_step_sync(step)
+        except asyncio.CancelledError:
+            return
+
+    async def _execute_decode_step_sync(self, step: int):
+        batch = self._decode_step_sync_batches.pop(step, [])
+        self._decode_step_sync_tasks.pop(step, None)
+        if not batch:
+            return
+        self.decode_step_sync_flushes += 1
+        self.decode_step_sync_total_items += len(batch)
+        self.decode_step_sync_max_observed = max(self.decode_step_sync_max_observed, len(batch))
+        for future in batch:
+            if not future.done():
+                future.set_result(True)
+
+    async def _maybe_flush_decode_step_syncs(self):
+        target_size = self._decode_step_sync_target_size()
+        ready_steps = [
+            step
+            for step, batch in self._decode_step_sync_batches.items()
+            if len(batch) >= target_size
+        ]
+        for step in ready_steps:
+            task = self._decode_step_sync_tasks.pop(step, None)
+            if task is not None:
+                task.cancel()
+            await self._execute_decode_step_sync(step)
+
+    async def _synchronize_decode_step(self, step: int):
+        if self.decode_step_sync_window_s <= 0:
+            return
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        batch = self._decode_step_sync_batches.setdefault(int(step), [])
+        batch.append(future)
+        target_size = self._decode_step_sync_target_size()
+        if len(batch) >= target_size:
+            task = self._decode_step_sync_tasks.pop(int(step), None)
+            if task is not None:
+                task.cancel()
+            await self._execute_decode_step_sync(int(step))
+        elif int(step) not in self._decode_step_sync_tasks:
+            self._decode_step_sync_tasks[int(step)] = asyncio.create_task(
+                self._flush_decode_step_sync(int(step))
+            )
+        return await future
+
+    async def _flush_attention_layer_barrier_key(self, key: tuple[int, int]):
+        try:
+            if self.attention_layer_barrier_window_s > 0:
+                await asyncio.sleep(self.attention_layer_barrier_window_s)
+            await self._execute_attention_layer_barrier_key(key)
+        except asyncio.CancelledError:
+            return
+
+    async def _execute_attention_layer_barrier_key(self, key: tuple[int, int]):
+        batch = self._attention_layer_barrier_batches.pop(key, [])
+        self._attention_layer_barrier_tasks.pop(key, None)
+        if not batch:
+            return
+        group_size = len(batch)
+        self.attention_layer_barrier_flushes += 1
+        self.attention_layer_barrier_total_items += group_size
+        self.attention_layer_barrier_max_observed = max(
+            self.attention_layer_barrier_max_observed, group_size
+        )
+        for future in batch:
+            if not future.done():
+                future.set_result(group_size)
+
+    async def _maybe_flush_attention_layer_barriers(self):
+        target_size = self._attention_layer_barrier_target_size()
+        ready_keys = [
+            key
+            for key, batch in self._attention_layer_barrier_batches.items()
+            if len(batch) >= target_size
+        ]
+        for key in ready_keys:
+            task = self._attention_layer_barrier_tasks.pop(key, None)
+            if task is not None:
+                task.cancel()
+            await self._execute_attention_layer_barrier_key(key)
+
+    async def _synchronize_attention_layer(self, key: tuple[int, int]) -> int | None:
+        if self.attention_layer_barrier_window_s <= 0:
+            return None
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        batch = self._attention_layer_barrier_batches.setdefault(key, [])
+        batch.append(future)
+        target_size = self._attention_layer_barrier_target_size()
+        if len(batch) >= target_size:
+            task = self._attention_layer_barrier_tasks.pop(key, None)
+            if task is not None:
+                task.cancel()
+            await self._execute_attention_layer_barrier_key(key)
+        elif key not in self._attention_layer_barrier_tasks:
+            self._attention_layer_barrier_tasks[key] = asyncio.create_task(
+                self._flush_attention_layer_barrier_key(key)
+            )
+        return await future
+
+    async def _flush_attention_wavefront_key(self, key: tuple[int, int]):
         try:
             if self.attention_batch_window_s > 0:
                 await asyncio.sleep(self.attention_batch_window_s)
-            while self._attention_batch_queue:
-                batch = self._attention_batch_queue[: self.attention_batch_max_size]
-                del self._attention_batch_queue[: self.attention_batch_max_size]
-                payloads = [item[0] for item in batch]
-                futures = [item[1] for item in batch]
-                attention = batch[0][2]
-                self.attention_batch_flushes += 1
-                self.attention_batch_total_items += len(payloads)
-                self.attention_batch_max_observed = max(self.attention_batch_max_observed, len(payloads))
-                try:
-                    results = await attention.decode_layer_batch.remote(payloads)
-                    for future, result in zip(futures, results):
-                        if not future.done():
-                            future.set_result(result)
-                except Exception as exc:
-                    for future in futures:
-                        if not future.done():
-                            future.set_exception(exc)
-        finally:
-            self._attention_batch_task = None
-            if self._attention_batch_queue:
-                self._attention_batch_task = asyncio.create_task(self._flush_attention_batch())
+            await self._execute_attention_wavefront_key(key)
+        except asyncio.CancelledError:
+            return
 
-    async def _batched_attention_decode(self, attention, prepared):
+    async def _execute_attention_wavefront_key(self, key: tuple[int, int]):
+        batch = self._attention_wavefront_batches.pop(key, [])
+        self._attention_wavefront_tasks.pop(key, None)
+        self._attention_wavefront_expected_sizes.pop(key, None)
+        if not batch:
+            return
+        payloads = [item[0] for item in batch]
+        futures = [item[1] for item in batch]
+        attention = batch[0][2]
+        self.attention_batch_flushes += 1
+        self.attention_batch_total_items += len(payloads)
+        self.attention_batch_max_observed = max(self.attention_batch_max_observed, len(payloads))
+        try:
+            results = await attention.decode_layer_batch.remote(payloads)
+            for future, result in zip(futures, results):
+                if not future.done():
+                    future.set_result(result)
+        except Exception as exc:
+            for future in futures:
+                if not future.done():
+                    future.set_exception(exc)
+
+    async def _maybe_flush_attention_wavefronts(self):
+        ready_keys = []
+        default_target_size = self._attention_batch_target_size()
+        for key, batch in self._attention_wavefront_batches.items():
+            target_size = self._attention_wavefront_expected_sizes.get(key, default_target_size)
+            if len(batch) >= target_size:
+                ready_keys.append(key)
+        for key in ready_keys:
+            task = self._attention_wavefront_tasks.pop(key, None)
+            if task is not None:
+                task.cancel()
+            await self._execute_attention_wavefront_key(key)
+
+    async def _batched_attention_decode(self, attention, prepared, decode_step: int):
         loop = asyncio.get_running_loop()
         future = loop.create_future()
-        self._attention_batch_queue.append((prepared, future, attention))
-        if self._attention_batch_task is None:
-            self._attention_batch_task = asyncio.create_task(self._flush_attention_batch())
+        key = (int(decode_step), int(prepared["layer_idx"]))
+        barrier_group_size = await self._synchronize_attention_layer(key)
+        batch = self._attention_wavefront_batches.setdefault(key, [])
+        batch.append((prepared, future, attention))
+        if barrier_group_size is not None:
+            current_expected = self._attention_wavefront_expected_sizes.get(key, 1)
+            self._attention_wavefront_expected_sizes[key] = max(current_expected, int(barrier_group_size))
+        target_size = self._attention_wavefront_expected_sizes.get(
+            key, self._attention_batch_target_size()
+        )
+        if len(batch) >= target_size:
+            task = self._attention_wavefront_tasks.pop(key, None)
+            if task is not None:
+                task.cancel()
+            await self._execute_attention_wavefront_key(key)
+        elif key not in self._attention_wavefront_tasks:
+            self._attention_wavefront_tasks[key] = asyncio.create_task(
+                self._flush_attention_wavefront_key(key)
+            )
         return await future
 
     async def initialize_cluster(self):
@@ -160,6 +329,7 @@ class GlobalScheduler:
         return infos
 
     async def submit_request(self, prompt: str, return_metrics: bool = False, max_new_tokens: int | None = None):
+        self._inflight_request_count += 1
         request_start = time.time()
         stage_timing = _empty_stage_timing()
         prefill = self.prefill_nodes[0]
@@ -185,6 +355,7 @@ class GlobalScheduler:
             prefill_out["initial_kv"],
             max_tokens,
         )
+        self._active_decode_requests += 1
         stage_timing["scheduler"]["attention_init_rpc_s"] += time.perf_counter() - rpc_started
         stage_timing["actors"]["attention_init_compute_s"] += float(
             init_result.get("profile", {}).get("compute_s", 0.0)
@@ -194,6 +365,10 @@ class GlobalScheduler:
             for step in range(1, max_tokens):
                 stage_timing["counts"]["decode_steps"] += 1
                 position = prompt_len + step - 1
+                rpc_started = time.perf_counter()
+                await self._synchronize_decode_step(step)
+                stage_timing["scheduler"].setdefault("decode_step_sync_wait_s", 0.0)
+                stage_timing["scheduler"]["decode_step_sync_wait_s"] += time.perf_counter() - rpc_started
                 rpc_started = time.perf_counter()
                 start_token_result = await dense.start_token.remote(current_token, position)
                 stage_timing["scheduler"]["start_token_rpc_s"] += time.perf_counter() - rpc_started
@@ -213,7 +388,7 @@ class GlobalScheduler:
                     )
 
                     rpc_started = time.perf_counter()
-                    attention_result = await self._batched_attention_decode(attention, prepared)
+                    attention_result = await self._batched_attention_decode(attention, prepared, step)
                     stage_timing["scheduler"]["attention_decode_rpc_s"] += time.perf_counter() - rpc_started
                     stage_timing["actors"]["attention_decode_compute_s"] += float(
                         attention_result.get("profile", {}).get("compute_s", 0.0)
@@ -244,6 +419,11 @@ class GlobalScheduler:
             attention_debug_before_free = None
             if return_metrics:
                 attention_debug_before_free = await attention.get_info.remote()
+            self._inflight_request_count = max(0, self._inflight_request_count - 1)
+            self._active_decode_requests = max(0, self._active_decode_requests - 1)
+            await self._maybe_flush_decode_step_syncs()
+            await self._maybe_flush_attention_layer_barriers()
+            await self._maybe_flush_attention_wavefronts()
             rpc_started = time.perf_counter()
             await attention.free_request.remote(request_id)
             stage_timing["scheduler"]["free_request_rpc_s"] += time.perf_counter() - rpc_started
@@ -285,7 +465,23 @@ class GlobalScheduler:
                 "flushes": int(self.attention_batch_flushes),
                 "total_items": int(self.attention_batch_total_items),
                 "max_observed_size": int(self.attention_batch_max_observed),
-                "pending": len(self._attention_batch_queue),
+                "pending": sum(len(batch) for batch in self._attention_wavefront_batches.values()),
+            }
+            metrics["scheduler_decode_step_sync"] = {
+                "window_s": float(self.decode_step_sync_window_s),
+                "max_size": int(self.decode_step_sync_max_size),
+                "flushes": int(self.decode_step_sync_flushes),
+                "total_items": int(self.decode_step_sync_total_items),
+                "max_observed_size": int(self.decode_step_sync_max_observed),
+                "pending": sum(len(batch) for batch in self._decode_step_sync_batches.values()),
+            }
+            metrics["scheduler_attention_layer_barrier"] = {
+                "window_s": float(self.attention_layer_barrier_window_s),
+                "max_size": int(self.attention_layer_barrier_max_size),
+                "flushes": int(self.attention_layer_barrier_flushes),
+                "total_items": int(self.attention_layer_barrier_total_items),
+                "max_observed_size": int(self.attention_layer_barrier_max_observed),
+                "pending": sum(len(batch) for batch in self._attention_layer_barrier_batches.values()),
             }
             metrics["attention_backend_before_free"] = attention_debug_before_free
             metrics["attention_backend"] = await attention.get_info.remote()

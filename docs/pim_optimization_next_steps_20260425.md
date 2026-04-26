@@ -1147,3 +1147,150 @@ Updated direction:
    - helper round reduction
    - throughput
    - latency under `concurrency > 1`
+
+### Scheduler wavefront batching checkpoint
+
+That next scheduler step is now in place.
+
+What we added:
+
+- explicit scheduler-side batching keyed by `(decode_step, layer_idx)`
+- one direct batched attention RPC per ready wavefront
+- metrics that record:
+  - scheduler flush count
+  - total batched items
+  - max observed batch size
+
+What we learned:
+
+- `10 ms` scheduler wait is enough to reliably produce batch size `2` on the
+  current two-request light workload
+- `5 ms` is usually not enough
+- so arrival skew is still on the order of multiple milliseconds even after
+  the earlier actor-side batching support
+- batching reduces attention round count, but end-to-end latency does not yet
+  improve because the synchronization delay dominates
+
+Immediate implication:
+
+- the problem is no longer “how do we batch attention?”
+- the problem is “how do we align requests cheaply enough that batching wins?”
+
+### Updated next direction
+
+The next scheduler experiments should therefore move one stage earlier than the
+attention RPC itself.
+
+Recommended order:
+
+1. add decode-step synchronization before the per-step dense/attention loop
+   starts
+2. remeasure whether that reduces the attention wavefront wait needed to reach
+   batch size `2`
+3. if successful, try shrinking or removing the attention-side time window
+4. only after that decide whether stronger barrier scheduling is worth it
+
+Rationale:
+
+- a decode-step alignment point is cheaper than a per-layer blind wait
+- if requests start the step together, the downstream layer wavefronts should
+  arrive with much smaller skew
+- that gives batching a better chance to help without paying a large explicit
+  wait on every attention wavefront
+
+### Decode-step sync follow-up
+
+That decode-step alignment path has now passed the first real end-to-end
+stress tests.
+
+What changed next:
+
+- we fixed a target-size bug in step sync
+- after the fix, scheduler-side attention batching became genuinely active in
+  trace runs rather than only in direct validation
+
+What we learned:
+
+- `concurrency = 2` now reaches real attention batch size `2`
+- `concurrency = 4` reaches batch size `3`
+- `concurrency = 8` reaches batch size `4` with a short `5 ms` attention
+  window
+- `concurrency = 8` can reach batch size `5` when the attention-side wait is
+  extended to `10 ms`
+
+Immediate implication:
+
+- the scheduler path is no longer blocked on missing implementation
+- the limiting factor has shifted again:
+  - from "can requests meet at the same step?"
+  - to "how much extra waiting is needed for them to also meet at the same
+    layer?"
+
+### Updated next direction
+
+The next optimization should therefore be more structural than another round
+of window sweeps.
+
+Recommended order:
+
+1. prototype a stronger layer-level coordination mode
+   - for example, a bounded per-layer barrier for the active decode wave
+2. compare it against the current time-window wavefront scheme
+   - batch size achieved
+   - extra wait introduced
+   - end-to-end latency
+3. only after that decide whether adaptive windows are still worth refining
+
+Why this is now the right next step:
+
+- larger windows do increase achieved wavefront batch size
+- but the gain currently comes from more waiting, not smarter coordination
+- the evidence now suggests a structured scheduler barrier could deliver the
+  same or larger batches with less blind per-layer delay
+
+### Layer-barrier follow-up
+
+We have now tried that first structured barrier.
+
+What changed:
+
+- explicit layer-level barrier keyed by `(decode_step, layer_idx)`
+- released requests carry an expected wavefront size into the attention batch
+
+What we learned:
+
+- this barrier is mechanically correct and keeps latency competitive
+- but in the current form it still tops out at attention batch size `4`
+  on the `concurrency = 8`, `max_new_tokens = 4` trace
+- the earlier pure `10 ms` attention-window scheme is still the only path so
+  far that reaches batch size `5`
+- adding a small residual attention window on top of the barrier does not fix
+  that gap
+
+Immediate implication:
+
+- the problem is no longer "we need any structured barrier"
+- the problem is "the current barrier still does not preserve a decode cohort
+  tightly enough across successive layers"
+
+### Updated next direction
+
+The next scheduler experiment should move from per-layer bounded waiting to a
+more explicit decode-wave execution model.
+
+Recommended order:
+
+1. form an active decode wave at step entry
+2. keep that wave together across all layers of the step whenever feasible
+3. only allow partial shrink when requests naturally finish or stall
+4. compare against the current schemes on:
+   - achieved max batch size
+   - helper round count
+   - end-to-end latency
+
+Why this is the right next step now:
+
+- pure time windows can get batch size `5`, but by waiting more
+- the current barrier keeps latency lower, but still stalls at batch size `4`
+- the missing ingredient now appears to be cohort persistence through the
+  per-layer decode pipeline, not another small tuning of window sizes

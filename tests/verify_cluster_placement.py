@@ -28,6 +28,10 @@ def parse_args():
     parser.add_argument("--pim-qk-mixed-heads", type=int, default=2)
     parser.add_argument("--pim-qk-mixed-window", type=int, default=128)
     parser.add_argument("--pim-length", type=int, default=128)
+    parser.add_argument("--decode-step-sync-window-s", type=float, default=0.0)
+    parser.add_argument("--decode-step-sync-max-size", type=int, default=8)
+    parser.add_argument("--attention-layer-barrier-window-s", type=float, default=0.0)
+    parser.add_argument("--attention-layer-barrier-max-size", type=int, default=8)
     parser.add_argument("--attention-rpc-batch-window-s", type=float, default=0.001)
     parser.add_argument("--attention-rpc-batch-max-size", type=int, default=8)
     parser.add_argument("--attention-actor-batch-window-s", type=float, default=0.001)
@@ -67,6 +71,10 @@ def main():
         pim_qk_mixed_heads=args.pim_qk_mixed_heads,
         pim_qk_mixed_window=args.pim_qk_mixed_window,
         pim_length=args.pim_length,
+        decode_step_sync_window_s=args.decode_step_sync_window_s,
+        decode_step_sync_max_size=args.decode_step_sync_max_size,
+        attention_layer_barrier_window_s=args.attention_layer_barrier_window_s,
+        attention_layer_barrier_max_size=args.attention_layer_barrier_max_size,
         attention_rpc_batch_window_s=args.attention_rpc_batch_window_s,
         attention_rpc_batch_max_size=args.attention_rpc_batch_max_size,
         attention_actor_batch_window_s=args.attention_actor_batch_window_s,

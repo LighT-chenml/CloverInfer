@@ -1869,3 +1869,349 @@ Updated takeaway:
   - orchestrate decode requests so they reach the attention boundary together
   - or explicitly batch layer work in the scheduler instead of hoping
     opportunistic overlap is enough
+
+### 36. Scheduler-side explicit attention batching checkpoint
+
+We then moved one level upward and added explicit scheduler-managed attention
+batching keyed by `(decode_step, layer_idx)`.
+
+What changed:
+
+- the scheduler no longer depends only on opportunistic overlap at the actor
+  boundary
+- concurrent requests reaching the same decode step and layer are now queued
+  into one scheduler-side wavefront bucket
+- the scheduler can flush that bucket either:
+  - immediately when it reaches the current target batch size
+  - or after a short wait window
+- the attention node receives one direct `decode_layer_batch(...)` RPC for that
+  wavefront
+
+Correctness:
+
+- three-machine placement verification still passed with the new config path
+- batched decode results remained numerically clean
+
+Important validation result:
+
+- with `attention_rpc_batch_window_s = 0.01` and actor-side batching disabled,
+  direct concurrent validation showed the scheduler really was merging work:
+  - `scheduler_attention_batching.flushes = 12`
+  - `scheduler_attention_batching.total_items = 24`
+  - `scheduler_attention_batching.max_observed_size = 2`
+  - backend `decode_batch_calls = 12`
+  - backend `decode_batch_items = 24`
+
+Observed on the end-to-end light trace:
+
+- batching now happens reliably at the scheduler level
+- but end-to-end latency still became worse:
+  - direct two-request check: about `1.48 s` per request
+  - saved four-sample trace: `avg_latency = 2.975 s`
+
+Artifacts:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc2_tok2_dpu256_fp32_balanced_rotated_schedbatch10ms_upmemav.jsonl`
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc2_tok2_dpu256_fp32_balanced_rotated_schedbatch5ms_upmemav.jsonl`
+
+Interpretation:
+
+- missing batch machinery is no longer the main problem
+- scheduler-managed batching does reduce attention round count
+- however, under this light workload the waiting cost needed to create the
+  batch is larger than the saved backend work
+
+### 37. Wavefront batching refinement
+
+We then refined the scheduler queue from a generic time-window batch into an
+explicit wavefront map keyed by `(decode_step, layer_idx)`.
+
+Why this matters:
+
+- this is structurally closer to the real decode dependency graph
+- it prevents unrelated layer work from being mixed together
+- it gives us a cleaner base for later decode-step coordination
+
+Observed result:
+
+- the structural refactor is correct
+- but it does not remove the arrival-skew problem by itself
+- on the current workload:
+  - a `10 ms` wait is still enough to get `max_observed_size = 2`
+  - a `5 ms` wait is still usually too short and falls back to
+    `max_observed_size = 1`
+
+Updated takeaway:
+
+- we now have working batching at three levels:
+  - backend batched decode
+  - attention-actor micro-batching
+  - scheduler-side wavefront batching
+- the new bottleneck is request synchronization cost, not missing batch APIs
+- the next step should therefore coordinate requests earlier in the decode
+  pipeline so same-step work reaches the attention wavefront together
+
+### 38. Decode-step sync bug fix and first real scheduler batching
+
+We then fixed a scheduler bug in the new decode-step synchronization path.
+
+Root cause:
+
+- the step-sync target size was derived from "requests already inside decode"
+- the first request reaching a step therefore often saw target size `1`
+- it was released immediately and never really waited for peer requests
+
+Fix:
+
+- derive the step-sync target from the current inflight request count instead
+
+Immediate result on the earlier `concurrency = 2`, `max_new_tokens = 2`
+light trace:
+
+- scheduler wavefront batching became truly active
+- `scheduler_attention_batching.max_observed_size = 2`
+- backend `decode_batch_calls / decode_batch_items = 36 / 48`
+- `avg_latency = 2.7789 s`
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc2_tok2_dpu256_fp32_balanced_rotated_stepsync5ms_fix_schedbatch5ms_upmemav.jsonl`
+
+Interpretation:
+
+- the previous batching ceiling was partly an implementation bug, not just
+  workload shape
+- after the fix, scheduler-coordinated attention merging is now genuinely
+  working end to end
+
+### 39. Concurrency scaling checkpoint
+
+We then increased decode concurrency to see whether the same scheduler path
+could scale the wavefront batch size upward.
+
+#### `concurrency = 4`, `max_new_tokens = 2`
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval8_conc4_tok2_dpu256_fp32_balanced_rotated_stepsync5ms_fix_schedbatch5ms_upmemav.jsonl`
+
+Observed:
+
+- `scheduler_attention_batching.max_observed_size = 3`
+- `scheduler_decode_step_sync.max_observed_size = 2`
+- backend `decode_batch_calls / decode_batch_items = 59 / 96`
+- `avg_latency = 4.7446 s`
+
+Interpretation:
+
+- the wavefront batch size does grow with concurrency
+- but short decode still limits how often all requests align on the same layer
+
+#### `concurrency = 4`, longer decode
+
+Artifacts:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval8_conc4_tok4_dpu256_fp32_balanced_rotated_stepsync5ms_fix_schedbatch5ms_upmemav.jsonl`
+- `artifacts/pim_allocator_trace_opt125m_humaneval8_conc4_tok8_dpu256_fp32_balanced_rotated_stepsync5ms_fix_schedbatch5ms_upmemav.jsonl`
+
+Observed:
+
+- `tok4`:
+  - `scheduler_attention_batching.max_observed_size = 3`
+  - `scheduler_decode_step_sync.max_observed_size = 3`
+  - `avg_latency = 11.7315 s`
+- `tok8`:
+  - `scheduler_attention_batching.max_observed_size = 3`
+  - `scheduler_decode_step_sync.max_observed_size = 3`
+  - `avg_latency = 27.2719 s`
+
+Interpretation:
+
+- longer decode makes the batching path more active and more stable
+- however, with `concurrency = 4` the practical wavefront ceiling on this
+  setup remains `3`
+- the next limiter is no longer decode lifetime alone, but residual
+  per-layer arrival skew
+
+### 40. `concurrency = 8` and batch-target sensitivity
+
+We then pushed decode concurrency to `8` and compared two scheduler target
+policies.
+
+Workload:
+
+- `concurrency = 8`
+- `max_new_tokens = 4`
+- step-sync window `5 ms`
+
+Artifacts:
+
+- target `8`:
+  - `artifacts/pim_allocator_trace_opt125m_humaneval8_conc8_tok4_dpu256_fp32_balanced_rotated_stepsync5ms_fix_batchtarget8_upmemav.jsonl`
+- target `4`:
+  - `artifacts/pim_allocator_trace_opt125m_humaneval8_conc8_tok4_dpu256_fp32_balanced_rotated_stepsync5ms_fix_batchtarget4_upmemav.jsonl`
+
+Observed:
+
+- target `8`:
+  - `scheduler_attention_batching.max_observed_size = 4`
+  - `scheduler_decode_step_sync.max_observed_size = 5`
+  - backend `decode_batch_calls / decode_batch_items = 123 / 288`
+  - `avg_latency = 23.2235 s`
+- target `4`:
+  - `scheduler_attention_batching.max_observed_size = 4`
+  - `scheduler_decode_step_sync.max_observed_size = 4`
+  - backend `decode_batch_calls / decode_batch_items = 146 / 288`
+  - `avg_latency = 23.3370 s`
+
+Interpretation:
+
+- the batching ceiling continues to rise with concurrency:
+  - we now reliably reach attention wavefront batch size `4`
+- reducing the target size from `8` to `4` does not increase the achieved
+  attention batch size
+- it mostly increases flush count, i.e. it is more eager but not more
+  productive on this workload
+
+### 41. Attention-window sensitivity above the step-sync path
+
+The next question was:
+
+- if step sync can briefly align more than `4` requests,
+  why does attention wavefront batching still stop at `4`?
+
+We tested a larger scheduler attention window:
+
+- step-sync window `5 ms`
+- attention wavefront window `10 ms`
+- `concurrency = 8`
+- `max_new_tokens = 4`
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval8_conc8_tok4_dpu256_fp32_balanced_rotated_stepsync5ms_fix_schedbatch10ms_target8_upmemav.jsonl`
+
+Observed:
+
+- `scheduler_attention_batching.max_observed_size = 5`
+- backend `decode_batch_calls / decode_batch_items = 113 / 288`
+- `avg_latency = 23.7549 s`
+
+Interpretation:
+
+- the residual bottleneck is indeed per-layer arrival skew, not an absolute
+  structural limit of the current scheduler batching path
+- a larger attention-side wait can recover a larger wavefront batch
+- but it does so by paying additional waiting latency
+
+Updated takeaway:
+
+- current scheduler coordination can now reach:
+  - batch size `2` at `concurrency = 2`
+  - batch size `3` at `concurrency = 4`
+  - batch size `4` at `concurrency = 8` with a short attention window
+  - batch size `5` at `concurrency = 8` with a longer attention window
+- the next system question is no longer whether batching is possible
+- the next question is how to achieve the larger wavefronts with less
+  explicit waiting
+
+### 42. Layer-barrier scheduler checkpoint
+
+We then implemented a stronger scheduler-side coordination path:
+
+- add an explicit layer barrier keyed by `(decode_step, layer_idx)`
+- release a bounded group of requests together at the layer boundary
+- let the attention wavefront inherit that expected group size
+
+This is structurally stronger than a pure attention-side time window because:
+
+- grouping happens before the attention RPC boundary
+- the batch has an explicit expected size instead of only "wait and hope"
+
+#### Barrier-only result
+
+Workload:
+
+- `concurrency = 8`
+- `max_new_tokens = 4`
+- step sync `5 ms`
+- attention wavefront window `0 ms`
+
+Artifacts:
+
+- barrier `5 ms`:
+  - `artifacts/pim_allocator_trace_opt125m_humaneval8_conc8_tok4_dpu256_fp32_balanced_rotated_stepsync5ms_layerbarrier5ms_target8_attn0_upmemav.jsonl`
+- barrier `10 ms`:
+  - `artifacts/pim_allocator_trace_opt125m_humaneval8_conc8_tok4_dpu256_fp32_balanced_rotated_stepsync5ms_layerbarrier10ms_target8_attn0_upmemav.jsonl`
+
+Observed:
+
+- barrier `5 ms`:
+  - `scheduler_attention_layer_barrier.max_observed_size = 4`
+  - `scheduler_attention_batching.max_observed_size = 4`
+  - backend `decode_batch_calls / decode_batch_items = 150 / 288`
+  - `avg_latency = 23.1171 s`
+- barrier `10 ms`:
+  - `scheduler_attention_layer_barrier.max_observed_size = 4`
+  - `scheduler_attention_batching.max_observed_size = 4`
+  - backend `decode_batch_calls / decode_batch_items = 112 / 288`
+  - `avg_latency = 23.1939 s`
+
+Interpretation:
+
+- the explicit layer barrier is functionally correct
+- it is slightly more latency-friendly than the earlier `10 ms` pure
+  attention-window scheme
+- however, in this current form it still does not recover batch size `5`
+  by itself
+
+#### Barrier + short residual attention window
+
+We also tested a hybrid path:
+
+- layer barrier `5 ms`
+- plus a short attention wavefront window `5 ms`
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval8_conc8_tok4_dpu256_fp32_balanced_rotated_stepsync5ms_layerbarrier5ms_attn5ms_target8_upmemav.jsonl`
+
+Observed:
+
+- `scheduler_attention_layer_barrier.max_observed_size = 4`
+- `scheduler_attention_batching.max_observed_size = 4`
+- backend `decode_batch_calls / decode_batch_items = 145 / 288`
+- `avg_latency = 23.3052 s`
+
+Interpretation:
+
+- a short residual attention window does not raise the achieved batch ceiling
+  above the barrier-only result here
+- so the remaining gap versus the earlier batch-size-`5` run is not solved by
+  merely stacking a small extra window on top of the current barrier
+
+### 43. Updated scheduler takeaway
+
+At this point the evidence is:
+
+- pure short wavefront window:
+  - best latency among the simple schemes
+  - but only reaches batch size `4`
+- longer wavefront window:
+  - reaches batch size `5`
+  - but pays more waiting latency
+- current explicit layer barrier:
+  - improves structure and keeps latency low
+  - but still tops out at batch size `4`
+
+Updated interpretation:
+
+- the remaining limitation is not just "requests did not meet at the
+  attention boundary"
+- the remaining limitation is that the current scheduler still does not keep a
+  decode wave tightly coupled through the whole per-layer pipeline
+
+The next stronger scheduler idea should therefore be:
+
+- keep an explicit active decode wave together across the layer loop
+- instead of independently waiting at each layer key

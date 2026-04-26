@@ -31,6 +31,10 @@ class ClusterConfig(BaseModel):
     pim_head_grouping_policy: str = "balanced"
     pim_dpu_placement_policy: str = "rotated"
     pim_resident_kv_dtype: str = "fp32"
+    decode_step_sync_window_s: float = 0.0
+    decode_step_sync_max_size: int = 8
+    attention_layer_barrier_window_s: float = 0.0
+    attention_layer_barrier_max_size: int = 8
     attention_rpc_batch_window_s: float = 0.001
     attention_rpc_batch_max_size: int = 8
     attention_actor_batch_window_s: float = 0.001
