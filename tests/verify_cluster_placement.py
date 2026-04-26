@@ -28,6 +28,10 @@ def parse_args():
     parser.add_argument("--pim-qk-mixed-heads", type=int, default=2)
     parser.add_argument("--pim-qk-mixed-window", type=int, default=128)
     parser.add_argument("--pim-length", type=int, default=128)
+    parser.add_argument("--attention-rpc-batch-window-s", type=float, default=0.001)
+    parser.add_argument("--attention-rpc-batch-max-size", type=int, default=8)
+    parser.add_argument("--attention-actor-batch-window-s", type=float, default=0.001)
+    parser.add_argument("--attention-actor-batch-max-size", type=int, default=8)
     parser.add_argument("--expected-prefill-ip", default="192.168.123.3")
     parser.add_argument("--expected-dense-ip", default="192.168.123.4")
     parser.add_argument("--expected-attention-ip", default="192.168.123.7")
@@ -63,6 +67,10 @@ def main():
         pim_qk_mixed_heads=args.pim_qk_mixed_heads,
         pim_qk_mixed_window=args.pim_qk_mixed_window,
         pim_length=args.pim_length,
+        attention_rpc_batch_window_s=args.attention_rpc_batch_window_s,
+        attention_rpc_batch_max_size=args.attention_rpc_batch_max_size,
+        attention_actor_batch_window_s=args.attention_actor_batch_window_s,
+        attention_actor_batch_max_size=args.attention_actor_batch_max_size,
     )
     model = ModelConfig(model_path=args.model, max_new_tokens=args.max_new_tokens)
 

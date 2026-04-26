@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import os
+import asyncio
 import socket
 import time
 from typing import Dict, List
@@ -74,23 +74,44 @@ class AttentionNode:
         config: ModelConfig,
         backend: str = "cpu",
         backend_kwargs: Dict[str, object] | None = None,
+        decode_batch_window_s: float = 0.001,
+        decode_batch_max_size: int = 8,
     ):
         self.node_id = node_id
         self.config = config
         self.backend_name = backend
         self.device = "cpu"
         backend_kwargs = backend_kwargs or {}
+        decode_batch_window_s = float(backend_kwargs.pop("decode_batch_window_s", decode_batch_window_s))
+        decode_batch_max_size = int(backend_kwargs.pop("decode_batch_max_size", decode_batch_max_size))
         if backend == "cpu":
             self.backend = CpuAttentionBackend()
         elif backend == "pim_naive":
             self.backend = PimNaiveAttentionBackend(**backend_kwargs)
         else:
             raise ValueError(f"Unsupported attention backend for now: {backend}")
+        self.decode_batch_window_s = max(0.0, float(decode_batch_window_s))
+        self.decode_batch_max_size = max(1, int(decode_batch_max_size))
+        self.decode_batch_enabled = hasattr(self.backend, "decode_layer_batch")
+        self.decode_batch_flushes = 0
+        self.decode_batch_total_items = 0
+        self.decode_batch_max_observed = 0
+        self._decode_batch_queue: list[tuple[dict, asyncio.Future]] = []
+        self._decode_batch_task: asyncio.Task | None = None
         print(f"AttentionNode {node_id} initialized with {backend} backend")
 
     def get_info(self):
         info = _actor_info(self.node_id, "attention", self.device)
         info["backend"] = self.backend_name
+        info["decode_batching"] = {
+            "enabled": bool(self.decode_batch_enabled),
+            "window_s": float(self.decode_batch_window_s),
+            "max_size": int(self.decode_batch_max_size),
+            "flushes": int(self.decode_batch_flushes),
+            "total_items": int(self.decode_batch_total_items),
+            "max_observed_size": int(self.decode_batch_max_observed),
+            "pending": len(self._decode_batch_queue),
+        }
         if hasattr(self.backend, "get_debug_info"):
             info["backend_debug"] = self.backend.get_debug_info()
         return info
@@ -110,23 +131,83 @@ class AttentionNode:
             },
         }
 
-    def decode_layer(self, payload):
+    async def _flush_decode_layer_batch(self):
+        try:
+            if self.decode_batch_window_s > 0:
+                await asyncio.sleep(self.decode_batch_window_s)
+            while self._decode_batch_queue:
+                batch = self._decode_batch_queue[: self.decode_batch_max_size]
+                del self._decode_batch_queue[: self.decode_batch_max_size]
+                payloads = [item[0] for item in batch]
+                futures = [item[1] for item in batch]
+                self.decode_batch_flushes += 1
+                self.decode_batch_total_items += len(payloads)
+                self.decode_batch_max_observed = max(self.decode_batch_max_observed, len(payloads))
+                started_at = time.perf_counter()
+                try:
+                    contexts = self.backend.decode_layer_batch(payloads)
+                    per_item_compute_s = float(time.perf_counter() - started_at) / max(len(payloads), 1)
+                    for future, context in zip(futures, contexts):
+                        if not future.done():
+                            future.set_result(
+                                {
+                                    "context": context,
+                                    "profile": {
+                                        "compute_s": per_item_compute_s,
+                                        "batch_size": len(payloads),
+                                    },
+                                }
+                            )
+                except Exception as exc:
+                    for future in futures:
+                        if not future.done():
+                            future.set_exception(exc)
+        finally:
+            self._decode_batch_task = None
+            if self._decode_batch_queue:
+                self._decode_batch_task = asyncio.create_task(self._flush_decode_layer_batch())
+
+    async def decode_layer(self, payload):
+        if not self.decode_batch_enabled:
+            started_at = time.perf_counter()
+            context = self.backend.decode_layer(
+                payload["request_id"],
+                int(payload["layer_idx"]),
+                payload["query"],
+                payload["key"],
+                payload["value"],
+                float(payload.get("score_scale", 1.0)),
+            )
+            finished_at = time.perf_counter()
+            return {
+                "context": context,
+                "profile": {
+                    "compute_s": float(finished_at - started_at),
+                    "batch_size": 1,
+                },
+            }
+
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._decode_batch_queue.append((payload, future))
+        if self._decode_batch_task is None:
+            self._decode_batch_task = asyncio.create_task(self._flush_decode_layer_batch())
+        return await future
+
+    def decode_layer_batch(self, payloads):
         started_at = time.perf_counter()
-        context = self.backend.decode_layer(
-            payload["request_id"],
-            int(payload["layer_idx"]),
-            payload["query"],
-            payload["key"],
-            payload["value"],
-            float(payload.get("score_scale", 1.0)),
-        )
-        finished_at = time.perf_counter()
-        return {
-            "context": context,
-            "profile": {
-                "compute_s": float(finished_at - started_at),
-            },
-        }
+        contexts = self.backend.decode_layer_batch(payloads)
+        per_item_compute_s = float(time.perf_counter() - started_at) / max(len(contexts), 1)
+        return [
+            {
+                "context": context,
+                "profile": {
+                    "compute_s": per_item_compute_s,
+                    "batch_size": len(contexts),
+                },
+            }
+            for context in contexts
+        ]
 
     def get_context_len(self, request_id: str):
         return self.backend.get_context_len(request_id)

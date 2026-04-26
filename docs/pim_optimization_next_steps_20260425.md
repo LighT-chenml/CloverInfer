@@ -957,3 +957,193 @@ Updated direction:
    - revisit grouped-query layout / row staging
    - or design an active-set launch variant that does not broadcast the whole
      runner set
+
+### Python packing cleanup checkpoint
+
+We also tried the lightweight version of the "reduce host-side packing/copy"
+idea before touching the kernel again.
+
+What changed:
+
+- use streamed helper writes instead of building one giant bytes object
+- replace large `struct.unpack(...)` result tuples with `numpy.frombuffer`
+  readback
+- fast-path already-CPU / already-`fp32` tensors
+- avoid per-head query lists plus `torch.stack(...)` in mixed-`QK`
+
+Result:
+
+- mixed-`QK` stayed essentially flat:
+  - `1.2104 s -> 1.2095 s`
+- no-mixed-`QK` improved a little:
+  - `1.0835 s -> 1.0605 s`
+
+Immediate implication:
+
+- there is a small general helper-client serialization win here
+- but the dominant mixed-`QK` bottleneck is still not this Python-side packing
+  layer
+
+Updated direction:
+
+1. keep the lighter helper-client serialization path because it is cleaner and
+   slightly better on the general path
+2. lower the priority of further Python-only packing cleanup for mixed-`QK`
+3. move the next effort to changes that affect the actual mixed-`QK`
+   execution structure:
+   - active-set launch instead of whole-runner launch
+   - rethinking grouped row staging / kernel flow
+   - or changing the batching granularity above the current per-layer rounds
+
+### Active-rank launch checkpoint
+
+We implemented the first active-set-style structural step:
+the batched mixed-`QK` helper path now launches against only the active ranks
+of the round instead of always using the full runner set.
+
+Result:
+
+- correctness stayed clean
+- `4 DPU` small-trace performance stayed flat:
+  - `1.2095 s -> 1.2120 s`
+
+Immediate implication:
+
+- this is not a small-trace speedup
+- but it is still the right structural step before testing larger multi-rank
+  DPU counts, because the batched path is no longer hard-wired to
+  whole-runner launch
+
+Updated direction:
+
+1. keep the active-rank launch path as the structural baseline for future
+   grouped mixed-`QK` work
+2. stop expecting more signal from repeated `4 DPU` single-rank attribution on
+   this exact mechanism
+3. next use this path in experiments where it can actually matter:
+   - multi-rank / larger-DPU regimes
+   - or combine it with deeper mixed-`QK` kernel / staging changes
+
+### Large-DPU active-rank result
+
+We did the intended follow-up and tested the active-rank path directly on
+larger multi-rank DPU counts.
+
+Result:
+
+- `256 DPU`: `avg_latency = 1.9515 s`
+- `512 DPU`: `avg_latency = 1.9673 s`
+- both are much worse than the `4 DPU` small-trace result:
+  - `1.2120 s`
+
+Important observation:
+
+- utilization collapses as DPU count grows:
+  - `256 DPU`: average usage ratio is about `0.00494`
+  - `512 DPU`: average usage ratio is about `0.00244`
+
+Immediate implication:
+
+- active-rank launch removed the whole-runner launch dependency, which was
+  necessary
+- but the next bottleneck is now clearly workload granularity
+- the current mixed-`QK` decomposition is spreading too little useful work over
+  too many DPUs
+
+Updated direction:
+
+1. stop scaling DPU count upward for this exact light grouped mixed-`QK`
+   decomposition without changing the workload granularity
+2. next optimization should reduce over-distribution, for example:
+   - pack more heads / groups per active unit
+   - keep fewer DPUs active for light requests
+   - or batch more requests / layers together before launch
+3. treat "more DPUs" as a second-order knob that only helps after the per-launch
+   work granularity is increased
+
+### Light-workload group compaction checkpoint
+
+We implemented the first direct granularity fix above the helper/kernel layer:
+compact the resident head grouping itself for light workloads.
+
+Result:
+
+- correctness stayed clean
+- `256 DPU` improved from `1.9515 s` to `1.8611 s`
+- `512 DPU` improved from `1.9673 s` to `1.9031 s`
+
+Immediate implication:
+
+- the earlier diagnosis was correct
+- the next bottleneck after active-rank launch was indeed over-distribution at
+  resident group granularity
+- we can improve larger-DPU end-to-end latency without changing the helper
+  protocol again, simply by activating fewer resident groups for light requests
+
+What this checkpoint changed in practice:
+
+- for small `seq_len * head_dim`, each resident group now keeps more heads
+- the backend also enforces a minimum live-KV-work target per group
+- on the current OPT-125M light decode verification path, this compacted each
+  layer to a single resident group
+
+What it did not solve:
+
+- overall pool utilization is still extremely low at `256/512 DPU`
+- the persistent pool is still much larger than the useful active working set
+- the gain is real but modest, so granularity is not fully fixed yet
+
+Updated direction:
+
+1. keep this compact-group path as the new larger-DPU baseline
+2. next attack granularity one level higher than per-layer grouping:
+   - batch multiple requests into one helper round when possible
+   - or accumulate more work per launch inside the decode path
+3. consider making the grouping heuristic explicitly request-aware, for example:
+   - include current context length
+   - include active mixed-`QK` head count
+   - include expected decode concurrency
+4. only revisit "use even more DPUs" after the active work per launch has grown
+
+### Attention micro-batching checkpoint
+
+We implemented the first request-level batching capability inside the attention
+node and backend.
+
+Result:
+
+- correctness stayed clean
+- direct concurrent validation showed real request merging:
+  - `max_observed_size = 2`
+  - `decode_batch_calls = 23`
+  - `decode_batch_items = 24`
+- but the current `trace_pim_allocator.py` workload still did not naturally
+  feed enough overlapping `decode_layer` RPCs into the attention actor:
+  - `max_observed_size = 1` in the saved trace artifact
+  - `avg_latency = 2.9912 s` at `concurrency = 2`
+
+Immediate implication:
+
+- the batching mechanism is no longer missing
+- the new bottleneck is when and how requests arrive at the attention boundary
+- opportunistic batching with a tiny actor-side window is not enough under the
+  current scheduler / driver rhythm
+
+What this means structurally:
+
+- attention-side batching is now available as a primitive
+- but to extract stable gains, we likely need scheduler-side coordination such
+  as:
+  - explicit per-layer decode batching
+  - decode-step barrier alignment across requests
+  - or a scheduler-managed queue that flushes grouped attention work on purpose
+
+Updated direction:
+
+1. keep the actor-side micro-batcher and batched backend path
+2. move the next optimization step upward into the scheduler:
+   - make overlapping decode requests arrive together at the attention node
+3. after scheduler-side batching exists, remeasure:
+   - helper round reduction
+   - throughput
+   - latency under `concurrency > 1`

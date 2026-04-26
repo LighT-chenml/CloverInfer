@@ -60,6 +60,7 @@ def build_trace_row(
 ) -> Dict[str, object]:
     attention_before_free = metrics.get("attention_backend_before_free", {})
     backend_debug = attention_before_free.get("backend_debug", {})
+    decode_batching = attention_before_free.get("decode_batching", {})
     resident_store_debug = backend_debug.get("resident_store_debug", {})
     allocator_stats = resident_store_debug.get("allocator_stats", [])
     return {
@@ -81,7 +82,13 @@ def build_trace_row(
         "resident_shadow_max_abs_diff": float(backend_debug.get("resident_shadow_max_abs_diff", 0.0)),
         "resident_av_enabled": bool(backend_debug.get("resident_av_enabled", False)),
         "resident_av_ops": int(backend_debug.get("resident_av_ops", 0)),
+        "resident_av_batch_calls": int(backend_debug.get("resident_av_batch_calls", 0)),
         "resident_av_shadow_max_abs_diff": float(backend_debug.get("resident_av_shadow_max_abs_diff", 0.0)),
+        "qk_batch_calls": int(backend_debug.get("qk_batch_calls", 0)),
+        "decode_batch_calls": int(backend_debug.get("decode_batch_calls", 0)),
+        "decode_batch_items": int(backend_debug.get("decode_batch_items", 0)),
+        "attention_decode_batching": decode_batching,
+        "scheduler_attention_batching": metrics.get("scheduler_attention_batching", {}),
         "resident_total_live_elems": int(backend_debug.get("resident_total_live_elems", 0)),
         "resident_total_capacity_elems": int(backend_debug.get("resident_total_capacity_elems", 0)),
         "resident_request_footprints": backend_debug.get("resident_request_footprints", []),
@@ -117,6 +124,10 @@ def main():
     parser.add_argument("--no-pim-qk-mixed-enabled", action="store_true")
     parser.add_argument("--pim-qk-mixed-heads", type=int, default=2)
     parser.add_argument("--pim-qk-mixed-window", type=int, default=128)
+    parser.add_argument("--attention-rpc-batch-window-s", type=float, default=0.001)
+    parser.add_argument("--attention-rpc-batch-max-size", type=int, default=8)
+    parser.add_argument("--attention-actor-batch-window-s", type=float, default=0.001)
+    parser.add_argument("--attention-actor-batch-max-size", type=int, default=8)
     parser.add_argument("--concurrency", type=int, default=1)
     args = parser.parse_args()
 
@@ -158,6 +169,10 @@ def main():
         pim_qk_mixed_heads=args.pim_qk_mixed_heads,
         pim_qk_mixed_window=args.pim_qk_mixed_window,
         pim_length=args.pim_length,
+        attention_rpc_batch_window_s=args.attention_rpc_batch_window_s,
+        attention_rpc_batch_max_size=args.attention_rpc_batch_max_size,
+        attention_actor_batch_window_s=args.attention_actor_batch_window_s,
+        attention_actor_batch_max_size=args.attention_actor_batch_max_size,
     )
     model = ModelConfig(
         model_name=args.model_name,

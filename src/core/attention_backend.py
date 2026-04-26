@@ -121,6 +121,19 @@ class CpuAttentionBackend:
 
         return context.unsqueeze(0)
 
+    def decode_layer_batch(self, items: List[Dict[str, object]]) -> List[torch.Tensor]:
+        return [
+            self.decode_layer(
+                str(item["request_id"]),
+                int(item["layer_idx"]),
+                item["query"],
+                item["key"],
+                item["value"],
+                float(item.get("score_scale", 1.0)),
+            )
+            for item in items
+        ]
+
     def get_context_len(self, request_id: str) -> int:
         return self.context_lens[request_id]
 
@@ -190,6 +203,8 @@ class PimNaiveAttentionBackend:
         self.qk_mixed_last_diag: Dict[str, object] = {}
         self.qk_mixed_last_diag_path = ""
         self.qk_batch_calls = 0
+        self.decode_batch_calls = 0
+        self.decode_batch_items = 0
         self.qk_helper_started = False
         self.qk_helper_restarts = 0
         self.qk_helper: subprocess.Popen | None = None
@@ -208,6 +223,7 @@ class PimNaiveAttentionBackend:
         self.resident_shadow_max_abs_diff = 0.0
         self.resident_av_enabled = isinstance(self.resident_store, UpmemKVSlotStore)
         self.resident_av_ops = 0
+        self.resident_av_batch_calls = 0
         self.resident_av_shadow_max_abs_diff = 0.0
         self._run_dot_smoke_test()
 
@@ -262,6 +278,28 @@ class PimNaiveAttentionBackend:
             "layers": layer_summaries,
         }
 
+    def _effective_head_group_count(self, seq_len: int, num_heads: int, head_dim: int) -> int:
+        max_groups = max(1, min(self.num_dpus, num_heads))
+        if max_groups <= 1:
+            return 1
+
+        # Small decode workloads regress when we spread a layer across too many
+        # tiny resident groups. Keep more heads together until each group has a
+        # meaningful amount of KV work to amortize helper and launch overheads.
+        per_head_live_elems = max(1, int(seq_len) * int(head_dim))
+        total_live_elems = per_head_live_elems * int(num_heads)
+        if per_head_live_elems <= 8_192:
+            min_heads_per_group = 4
+        elif per_head_live_elems <= 32_768:
+            min_heads_per_group = 2
+        else:
+            min_heads_per_group = 1
+
+        max_groups_by_heads = max(1, math.ceil(int(num_heads) / min_heads_per_group))
+        target_group_live_elems = 32_768
+        max_groups_by_work = max(1, math.ceil(total_live_elems / target_group_live_elems))
+        return max(1, min(max_groups, max_groups_by_heads, max_groups_by_work))
+
     def _build_head_groups(
         self,
         request_id: str,
@@ -274,7 +312,7 @@ class PimNaiveAttentionBackend:
         if num_heads <= 0:
             raise ValueError(f"layer {layer_idx} in request {request_id} has no attention heads")
 
-        num_groups = max(1, min(self.num_dpus, num_heads))
+        num_groups = self._effective_head_group_count(seq_len, num_heads, head_dim)
         capacity = max(self.length, seq_len + max(0, int(decode_reserve_tokens)))
         head_groups = []
         request_hash = sum(ord(ch) for ch in request_id)
@@ -688,20 +726,12 @@ class PimNaiveAttentionBackend:
         )
         return seq_len
 
-    def decode_layer(
+    def _normalize_decode_tensors(
         self,
-        request_id: str,
-        layer_idx: int,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        score_scale: float = 1.0,
-    ) -> torch.Tensor:
-        if request_id not in self.cpu_backend.k_cache:
-            raise KeyError(f"Unknown request {request_id}")
-        if request_id not in self.request_states:
-            raise KeyError(f"Missing resident metadata for request {request_id}")
-
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         q = query.detach().cpu().contiguous()
         k_new = key.detach().cpu().contiguous()
         v_new = value.detach().cpu().contiguous()
@@ -712,7 +742,22 @@ class PimNaiveAttentionBackend:
             k_new = k_new.squeeze(0)
         if v_new.dim() == 3:
             v_new = v_new.squeeze(0)
+        return q, k_new, v_new
 
+    def _prepare_decode_record(self, item: Dict[str, object]) -> Dict[str, object]:
+        request_id = str(item["request_id"])
+        layer_idx = int(item["layer_idx"])
+        score_scale = float(item.get("score_scale", 1.0))
+        if request_id not in self.cpu_backend.k_cache:
+            raise KeyError(f"Unknown request {request_id}")
+        if request_id not in self.request_states:
+            raise KeyError(f"Missing resident metadata for request {request_id}")
+
+        q, k_new, v_new = self._normalize_decode_tensors(
+            item["query"],
+            item["key"],
+            item["value"],
+        )
         request_state = self.request_states[request_id]
         if layer_idx >= request_state.num_layers:
             raise IndexError(
@@ -729,7 +774,6 @@ class PimNaiveAttentionBackend:
         )
 
         use_resident_av = self.resident_compute_enabled and self.resident_av_enabled
-
         if self.resident_compute_enabled and not use_resident_av:
             keys, values = self._materialize_layer_kv(request_state, layer_idx)
             self._update_resident_shadow_diff(request_id, layer_idx, keys, values)
@@ -737,103 +781,107 @@ class PimNaiveAttentionBackend:
             keys = self.cpu_backend.k_cache[request_id][layer_idx]
             values = self.cpu_backend.v_cache[request_id][layer_idx]
 
-        scores = torch.einsum("hd,lhd->hl", q.float(), keys.float()) * float(score_scale)
-        if self.qk_mixed_enabled:
-            try:
-                window = min(self.qk_mixed_window, keys.shape[0])
-                mixed_heads = min(self.qk_mixed_heads, scores.shape[0])
-                head_diffs = []
-                had_diag_issue = False
-                if mixed_heads > 0:
-                    layer_state = request_state.layer_states[layer_idx]
-                    grouped_slot_queries: Dict[tuple[str, str], Dict[str, object]] = {}
-                    head_to_slot_row: list[tuple[tuple[str, str], int]] = []
-                    for head in range(mixed_heads):
-                        group = self._head_group_for_head(layer_state, head)
-                        slot_key = (group.k_slot, group.v_slot)
-                        if slot_key not in grouped_slot_queries:
-                            grouped_slot_queries[slot_key] = {
-                                "local_head_indices": [],
-                                "queries": [],
-                                "window": int(window),
-                            }
-                        slot_entry = grouped_slot_queries[slot_key]
-                        slot_entry["local_head_indices"].append(int(head - group.head_start))
-                        slot_entry["queries"].append(q[head].contiguous())
-                        head_to_slot_row.append((slot_key, len(slot_entry["local_head_indices"]) - 1))
-                    slot_queries = [
-                        (
-                            slot_key[0],
-                            slot_key[1],
-                            list(entry["local_head_indices"]),
-                            int(entry["window"]),
-                            torch.stack(entry["queries"], dim=0).contiguous(),
-                        )
-                        for slot_key, entry in grouped_slot_queries.items()
-                    ]
-                    slot_score_mats = self.resident_store.qk_slot_scores_batch(slot_queries)
-                    self.qk_batch_calls += 1
-                    slot_score_map = {
-                        (slot_query[0], slot_query[1]): score_mat.to(scores.dtype) * float(score_scale)
-                        for slot_query, score_mat in zip(slot_queries, slot_score_mats)
+        q_fp32 = q if q.dtype == torch.float32 and q.is_contiguous() else q.to(torch.float32).contiguous()
+        scores = torch.einsum("hd,lhd->hl", q_fp32, keys.float()) * score_scale
+        return {
+            "request_id": request_id,
+            "request_state": request_state,
+            "layer_idx": layer_idx,
+            "query_dtype": q.dtype,
+            "q_fp32": q_fp32,
+            "keys": keys,
+            "values": values,
+            "scores": scores,
+            "score_scale": score_scale,
+            "use_resident_av": use_resident_av,
+        }
+
+    def _apply_qk_mixed_batch(self, records: List[Dict[str, object]]) -> None:
+        if not self.qk_mixed_enabled:
+            self.qk_mixed_last_head_diffs = []
+            self.qk_mixed_last_max_abs_diff = 0.0
+            self.qk_mixed_last_diag = {}
+            self.qk_mixed_last_diag_path = ""
+            return
+
+        flat_slot_queries: list[tuple[str, str, list[int], int, torch.Tensor]] = []
+        slot_query_refs: list[tuple[Dict[str, object], tuple[str, str]]] = []
+        total_mixed_heads = 0
+
+        for record in records:
+            scores = record["scores"]
+            keys = record["keys"]
+            mixed_heads = min(self.qk_mixed_heads, int(scores.shape[0]))
+            record["mixed_head_diffs"] = []
+            record["head_to_slot_row"] = []
+            record["slot_score_map"] = {}
+            if mixed_heads <= 0:
+                continue
+
+            total_mixed_heads += mixed_heads
+            layer_state = record["request_state"].layer_states[record["layer_idx"]]
+            window = min(self.qk_mixed_window, int(keys.shape[0]))
+            grouped_slot_queries: Dict[tuple[str, str], Dict[str, object]] = {}
+            head_to_slot_row: list[tuple[tuple[str, str], int]] = []
+            for head in range(mixed_heads):
+                group = self._head_group_for_head(layer_state, head)
+                slot_key = (group.k_slot, group.v_slot)
+                if slot_key not in grouped_slot_queries:
+                    grouped_slot_queries[slot_key] = {
+                        "local_head_indices": [],
+                        "head_rows": [],
+                        "window": int(window),
                     }
-                    for head, (slot_key, row_idx) in enumerate(head_to_slot_row):
-                        head_scores = slot_score_map[slot_key][row_idx]
-                        cpu_window_scores = scores[head, -int(head_scores.shape[0]) :].clone()
-                        dpu_has_nan = bool(torch.isnan(head_scores).any().item()) if head_scores.numel() > 0 else False
-                        cpu_has_nan = bool(torch.isnan(cpu_window_scores).any().item()) if cpu_window_scores.numel() > 0 else False
-                        dpu_has_inf = bool(torch.isinf(head_scores).any().item()) if head_scores.numel() > 0 else False
-                        cpu_has_inf = bool(torch.isinf(cpu_window_scores).any().item()) if cpu_window_scores.numel() > 0 else False
-                        diff = float(torch.max(torch.abs(head_scores - cpu_window_scores)).item()) if head_scores.numel() > 0 else 0.0
-                        head_diffs.append(diff)
-                        if (dpu_has_nan or cpu_has_nan or dpu_has_inf or cpu_has_inf) and not self.qk_mixed_last_diag:
-                            had_diag_issue = True
-                            diag_payload = {
-                                "request_id": str(request_id),
-                                "layer_idx": int(layer_idx),
-                                "head": int(head),
-                                "slot_key": (str(slot_key[0]), str(slot_key[1])),
-                                "row_idx": int(row_idx),
-                                "window": int(head_scores.shape[0]),
-                                "local_query": q[head].detach().cpu().to(torch.float32).contiguous(),
-                                "slot_item_queries": torch.stack(
-                                    grouped_slot_queries[slot_key]["queries"], dim=0
-                                ).detach().cpu().to(torch.float32).contiguous(),
-                                "slot_item_local_head_indices": torch.tensor(
-                                    grouped_slot_queries[slot_key]["local_head_indices"],
-                                    dtype=torch.int64,
-                                ),
-                                "cpu_window_keys": keys[-int(head_scores.shape[0]) :, head].detach().cpu().to(torch.float32).contiguous(),
-                                "dpu_scores": head_scores.detach().cpu().to(torch.float32).contiguous(),
-                                "cpu_scores": cpu_window_scores.detach().cpu().to(torch.float32).contiguous(),
-                            }
-                            try:
-                                resident_k_full, resident_v_full = self.resident_store.materialize_group(
-                                    str(slot_key[0]),
-                                    str(slot_key[1]),
-                                )
-                                group = self._head_group_for_head(layer_state, head)
-                                local_head_idx = int(head - group.head_start)
-                                resident_window_keys = resident_k_full[
-                                    -int(head_scores.shape[0]) :,
-                                    local_head_idx,
-                                    : int(q.shape[-1]),
-                                ].detach().cpu().to(torch.float32).contiguous()
-                                diag_payload["resident_window_keys"] = resident_window_keys
-                                diag_payload["resident_window_key_diff_max"] = float(
-                                    torch.max(torch.abs(resident_window_keys - diag_payload["cpu_window_keys"])).item()
-                                ) if resident_window_keys.numel() > 0 else 0.0
-                            except Exception as diag_materialize_exc:
-                                diag_payload["resident_window_keys_error"] = repr(diag_materialize_exc)
-                            diag_dir = os.path.join(self.repo_root, "artifacts")
-                            os.makedirs(diag_dir, exist_ok=True)
-                            self.qk_mixed_last_diag_path = os.path.join(
-                                diag_dir,
-                                f"qk_mixed_nan_case_{request_id}_layer{layer_idx}_head{head}.pt",
-                            )
-                            torch.save(diag_payload, self.qk_mixed_last_diag_path)
+                slot_entry = grouped_slot_queries[slot_key]
+                slot_entry["local_head_indices"].append(int(head - group.head_start))
+                slot_entry["head_rows"].append(int(head))
+                head_to_slot_row.append((slot_key, len(slot_entry["local_head_indices"]) - 1))
+
+            record["head_to_slot_row"] = head_to_slot_row
+            for slot_key, entry in grouped_slot_queries.items():
+                slot_query = (
+                    slot_key[0],
+                    slot_key[1],
+                    list(entry["local_head_indices"]),
+                    int(entry["window"]),
+                    record["q_fp32"][list(entry["head_rows"])].contiguous(),
+                )
+                flat_slot_queries.append(slot_query)
+                slot_query_refs.append((record, slot_key))
+
+        if total_mixed_heads <= 0:
+            self.qk_mixed_last_head_diffs = []
+            self.qk_mixed_last_max_abs_diff = 0.0
+            self.qk_mixed_last_diag = {}
+            self.qk_mixed_last_diag_path = ""
+            return
+
+        try:
+            if flat_slot_queries:
+                slot_score_mats = self.resident_store.qk_slot_scores_batch(flat_slot_queries)
+                self.qk_batch_calls += 1
+                for (record, slot_key), score_mat in zip(slot_query_refs, slot_score_mats):
+                    record["slot_score_map"][slot_key] = score_mat.to(record["scores"].dtype) * float(record["score_scale"])
+
+            head_diffs: list[float] = []
+            self.qk_mixed_last_diag = {}
+            self.qk_mixed_last_diag_path = ""
+            for record in records:
+                for head, (slot_key, row_idx) in enumerate(record["head_to_slot_row"]):
+                    head_scores = record["slot_score_map"][slot_key][row_idx]
+                    cpu_window_scores = record["scores"][head, -int(head_scores.shape[0]) :].clone()
+                    diff = float(torch.max(torch.abs(head_scores - cpu_window_scores)).item()) if head_scores.numel() > 0 else 0.0
+                    record["mixed_head_diffs"].append(diff)
+                    head_diffs.append(diff)
+                    if not self.qk_mixed_last_diag and head_scores.numel() > 0:
+                        dpu_has_nan = bool(torch.isnan(head_scores).any().item())
+                        cpu_has_nan = bool(torch.isnan(cpu_window_scores).any().item())
+                        dpu_has_inf = bool(torch.isinf(head_scores).any().item())
+                        cpu_has_inf = bool(torch.isinf(cpu_window_scores).any().item())
+                        if dpu_has_nan or cpu_has_nan or dpu_has_inf or cpu_has_inf:
                             self.qk_mixed_last_diag = {
-                                "layer_idx": int(layer_idx),
+                                "request_id": str(record["request_id"]),
+                                "layer_idx": int(record["layer_idx"]),
                                 "head": int(head),
                                 "slot_key": [str(slot_key[0]), str(slot_key[1])],
                                 "row_idx": int(row_idx),
@@ -844,45 +892,90 @@ class PimNaiveAttentionBackend:
                                 "cpu_has_inf": cpu_has_inf,
                                 "dpu_preview": head_scores[: min(8, head_scores.shape[0])].detach().cpu().tolist(),
                                 "cpu_preview": cpu_window_scores[: min(8, cpu_window_scores.shape[0])].detach().cpu().tolist(),
-                                "resident_window_key_diff_max": float(diag_payload.get("resident_window_key_diff_max", 0.0)),
-                                "dump_path": self.qk_mixed_last_diag_path,
                             }
-                        if head_scores.numel() > 0:
-                            scores[head, -int(head_scores.shape[0]) :] = head_scores
-                self.qk_mixed_last_head_diffs = head_diffs
-                self.qk_mixed_last_max_abs_diff = max(head_diffs) if head_diffs else 0.0
-                if not head_diffs or not had_diag_issue:
-                    self.qk_mixed_last_diag = {}
-                    self.qk_mixed_last_diag_path = ""
-                self.qk_mixed_count += mixed_heads
-            except Exception:
-                self.qk_check_failures += 1
-                raise
+                    if head_scores.numel() > 0:
+                        record["scores"][head, -int(head_scores.shape[0]) :] = head_scores
 
-        weights = torch.softmax(scores, dim=-1)
-        if use_resident_av:
-            layer_state = request_state.layer_states[layer_idx]
-            slot_weights = [
-                (
-                    group.k_slot,
-                    group.v_slot,
-                    weights[group.head_start:group.head_end, :].contiguous(),
-                )
-                for group in layer_state.head_groups
+            self.qk_mixed_last_head_diffs = head_diffs
+            self.qk_mixed_last_max_abs_diff = max(head_diffs) if head_diffs else 0.0
+            self.qk_mixed_count += total_mixed_heads
+        except Exception:
+            self.qk_check_failures += 1
+            raise
+
+    def _finalize_decode_records(self, records: List[Dict[str, object]]) -> List[torch.Tensor]:
+        outputs: List[torch.Tensor] = []
+        flat_slot_weights: list[tuple[str, str, torch.Tensor]] = []
+        slot_weight_refs: list[tuple[int, int]] = []
+
+        for record_idx, record in enumerate(records):
+            weights = torch.softmax(record["scores"], dim=-1)
+            record["weights"] = weights
+            if record["use_resident_av"]:
+                layer_state = record["request_state"].layer_states[record["layer_idx"]]
+                slot_weights = [
+                    (
+                        group.k_slot,
+                        group.v_slot,
+                        weights[group.head_start:group.head_end, :].contiguous(),
+                    )
+                    for group in layer_state.head_groups
+                ]
+                flat_slot_weights.extend(slot_weights)
+                slot_weight_refs.append((record_idx, len(slot_weights)))
+            else:
+                record["context"] = torch.einsum("hl,lhd->hd", weights, record["values"].float()).to(record["query_dtype"])
+
+        if flat_slot_weights:
+            group_contexts = self.resident_store.weighted_value_sum_batch(flat_slot_weights)
+            self.resident_av_batch_calls += 1
+            offset = 0
+            for record_idx, group_count in slot_weight_refs:
+                record = records[record_idx]
+                context = torch.cat(group_contexts[offset : offset + group_count], dim=0).to(record["query_dtype"])
+                offset += group_count
+                cpu_context = torch.einsum("hl,lhd->hd", record["weights"], record["values"].float()).to(record["query_dtype"])
+                av_diff = float(torch.max(torch.abs(context.float() - cpu_context.float())).item())
+                self.resident_av_shadow_max_abs_diff = max(self.resident_av_shadow_max_abs_diff, av_diff)
+                self.resident_av_ops += 1
+                record["context"] = context
+
+        for record in records:
+            if record["layer_idx"] == len(self.cpu_backend.k_cache[record["request_id"]]) - 1:
+                self.cpu_backend.context_lens[record["request_id"]] += 1
+            outputs.append(record["context"].unsqueeze(0))
+        return outputs
+
+    def decode_layer_batch(self, items: List[Dict[str, object]]) -> List[torch.Tensor]:
+        if not items:
+            return []
+        self.decode_batch_calls += 1
+        self.decode_batch_items += len(items)
+        records = [self._prepare_decode_record(item) for item in items]
+        self._apply_qk_mixed_batch(records)
+        return self._finalize_decode_records(records)
+
+    def decode_layer(
+        self,
+        request_id: str,
+        layer_idx: int,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        score_scale: float = 1.0,
+    ) -> torch.Tensor:
+        return self.decode_layer_batch(
+            [
+                {
+                    "request_id": request_id,
+                    "layer_idx": layer_idx,
+                    "query": query,
+                    "key": key,
+                    "value": value,
+                    "score_scale": score_scale,
+                }
             ]
-            group_contexts = self.resident_store.weighted_value_sum_batch(slot_weights)
-            context = torch.cat(group_contexts, dim=0).to(query.dtype)
-            cpu_context = torch.einsum("hl,lhd->hd", weights, values.float()).to(query.dtype)
-            av_diff = float(torch.max(torch.abs(context.float() - cpu_context.float())).item())
-            self.resident_av_shadow_max_abs_diff = max(self.resident_av_shadow_max_abs_diff, av_diff)
-            self.resident_av_ops += 1
-        else:
-            context = torch.einsum("hl,lhd->hd", weights, values.float()).to(query.dtype)
-
-        if layer_idx == len(self.cpu_backend.k_cache[request_id]) - 1:
-            self.cpu_backend.context_lens[request_id] += 1
-
-        return context.unsqueeze(0)
+        )[0]
 
     def get_context_len(self, request_id: str) -> int:
         return self.cpu_backend.get_context_len(request_id)
@@ -938,6 +1031,8 @@ class PimNaiveAttentionBackend:
             "qk_mixed_last_diag": self.qk_mixed_last_diag,
             "qk_mixed_last_diag_path": self.qk_mixed_last_diag_path,
             "qk_batch_calls": self.qk_batch_calls,
+            "decode_batch_calls": self.decode_batch_calls,
+            "decode_batch_items": self.decode_batch_items,
             "qk_helper_started": self.qk_helper_started,
             "qk_helper_restarts": self.qk_helper_restarts,
             "resident_metadata_enabled": self.resident_metadata_enabled,
@@ -954,6 +1049,7 @@ class PimNaiveAttentionBackend:
             "resident_materialize_ops": self.resident_materialize_ops,
             "resident_shadow_max_abs_diff": self.resident_shadow_max_abs_diff,
             "resident_av_ops": self.resident_av_ops,
+            "resident_av_batch_calls": self.resident_av_batch_calls,
             "resident_av_shadow_max_abs_diff": self.resident_av_shadow_max_abs_diff,
             "resident_total_live_elems": total_live_elems,
             "resident_total_capacity_elems": total_capacity_elems,

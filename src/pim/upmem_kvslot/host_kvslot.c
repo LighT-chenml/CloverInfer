@@ -1,4 +1,5 @@
 #include <dpu.h>
+#include <dpu_management.h>
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -31,6 +32,10 @@ typedef struct {
 typedef struct {
     struct dpu_set_t dpu_set;
     uint32_t nr_dpus;
+    uint32_t nr_ranks;
+    struct dpu_rank_t **ranks;
+    struct dpu_set_t *physical_dpus;
+    uint32_t *physical_dpu_rank_indices;
     host_slot_t *slots;
     uint32_t *next_free_elem;
     free_range_t *free_ranges;
@@ -81,6 +86,10 @@ static int execute_batched_qk_round(
     qk_slot_item_t *items,
     const uint32_t *round_indices,
     uint32_t round_count);
+static qk_slot_item_t *find_qk_round_item_for_dpu(
+    kvslot_runner_t *runner,
+    qk_slot_item_t **items_by_dpu,
+    struct dpu_set_t dpu);
 static int can_use_batched_av_round(
     kvslot_runner_t *runner,
     av_item_t *items,
@@ -315,8 +324,6 @@ static int runner_get_dpu_and_slot(
     struct dpu_set_t *target_out,
     host_slot_t **slot_out)
 {
-    struct dpu_set_t dpu;
-    uint32_t each_dpu;
     uint32_t physical_dpu_id;
     uint32_t local_slot_id;
     if (runner == NULL || target_out == NULL || slot_out == NULL || runner->nr_dpus == 0) {
@@ -327,15 +334,12 @@ static int runner_get_dpu_and_slot(
     if (local_slot_id >= KVSLOT_MAX_SLOTS_PER_DPU) {
         return 1;
     }
-    DPU_FOREACH(runner->dpu_set, dpu, each_dpu)
-    {
-        if (each_dpu == physical_dpu_id) {
-            *target_out = dpu;
-            *slot_out = &runner->slots[slot_table_index(physical_dpu_id, local_slot_id)];
-            return 0;
-        }
+    if (runner->physical_dpus == NULL) {
+        return 1;
     }
-    return 1;
+    *target_out = runner->physical_dpus[physical_dpu_id];
+    *slot_out = &runner->slots[slot_table_index(physical_dpu_id, local_slot_id)];
+    return 0;
 }
 
 static int runner_init(kvslot_runner_t *runner, uint32_t requested_dpus)
@@ -344,24 +348,91 @@ static int runner_init(kvslot_runner_t *runner, uint32_t requested_dpus)
         return 1;
     }
     runner->nr_dpus = 0;
+    runner->nr_ranks = 0;
+    runner->ranks = NULL;
+    runner->physical_dpus = NULL;
+    runner->physical_dpu_rank_indices = NULL;
     runner->slots = NULL;
     runner->next_free_elem = NULL;
     runner->free_ranges = NULL;
     runner->num_free_ranges = NULL;
     DPU_ASSERT(dpu_alloc(requested_dpus, NULL, &runner->dpu_set));
     DPU_ASSERT(dpu_get_nr_dpus(runner->dpu_set, &runner->nr_dpus));
+    DPU_ASSERT(dpu_get_nr_ranks(runner->dpu_set, &runner->nr_ranks));
     DPU_ASSERT(dpu_load(runner->dpu_set, DPU_BINARY, NULL));
     if (runner->nr_dpus != requested_dpus) {
         fprintf(stderr, "Requested %u DPUs, allocated %u DPUs\n", requested_dpus, runner->nr_dpus);
         dpu_free(runner->dpu_set);
         runner->nr_dpus = 0;
+        runner->nr_ranks = 0;
         return 1;
+    }
+    runner->ranks = calloc(runner->nr_ranks, sizeof(*runner->ranks));
+    runner->physical_dpus = calloc(runner->nr_dpus, sizeof(*runner->physical_dpus));
+    runner->physical_dpu_rank_indices = calloc(runner->nr_dpus, sizeof(*runner->physical_dpu_rank_indices));
+    if (runner->ranks == NULL || runner->physical_dpus == NULL || runner->physical_dpu_rank_indices == NULL) {
+        fprintf(stderr, "Failed to allocate DPU topology metadata\n");
+        free(runner->physical_dpu_rank_indices);
+        runner->physical_dpu_rank_indices = NULL;
+        free(runner->physical_dpus);
+        runner->physical_dpus = NULL;
+        free(runner->ranks);
+        runner->ranks = NULL;
+        dpu_free(runner->dpu_set);
+        runner->nr_dpus = 0;
+        runner->nr_ranks = 0;
+        return 1;
+    }
+    {
+        struct dpu_set_t rank_set;
+        uint32_t each_rank = 0;
+        DPU_RANK_FOREACH(runner->dpu_set, rank_set, each_rank)
+        {
+            runner->ranks[each_rank] = dpu_rank_from_set(rank_set);
+        }
+    }
+    {
+        struct dpu_set_t dpu;
+        uint32_t each_dpu = 0;
+        DPU_FOREACH(runner->dpu_set, dpu, each_dpu)
+        {
+            struct dpu_t *dpu_ptr = dpu_from_set(dpu);
+            struct dpu_rank_t *rank_ptr = dpu_get_rank(dpu_ptr);
+            uint32_t rank_idx = 0;
+            runner->physical_dpus[each_dpu] = dpu;
+            for (; rank_idx < runner->nr_ranks; ++rank_idx) {
+                if (runner->ranks[rank_idx] == rank_ptr) {
+                    break;
+                }
+            }
+            if (rank_idx == runner->nr_ranks) {
+                fprintf(stderr, "Failed to resolve rank for DPU %u\n", each_dpu);
+                free(runner->physical_dpu_rank_indices);
+                runner->physical_dpu_rank_indices = NULL;
+                free(runner->physical_dpus);
+                runner->physical_dpus = NULL;
+                free(runner->ranks);
+                runner->ranks = NULL;
+                dpu_free(runner->dpu_set);
+                runner->nr_dpus = 0;
+                runner->nr_ranks = 0;
+                return 1;
+            }
+            runner->physical_dpu_rank_indices[each_dpu] = rank_idx;
+        }
     }
     runner->slots = calloc((size_t)runner->nr_dpus * KVSLOT_MAX_SLOTS_PER_DPU, sizeof(host_slot_t));
     if (runner->slots == NULL) {
         fprintf(stderr, "Failed to allocate slot table\n");
+        free(runner->physical_dpu_rank_indices);
+        runner->physical_dpu_rank_indices = NULL;
+        free(runner->physical_dpus);
+        runner->physical_dpus = NULL;
+        free(runner->ranks);
+        runner->ranks = NULL;
         dpu_free(runner->dpu_set);
         runner->nr_dpus = 0;
+        runner->nr_ranks = 0;
         return 1;
     }
     runner->next_free_elem = calloc(runner->nr_dpus, sizeof(uint32_t));
@@ -369,8 +440,15 @@ static int runner_init(kvslot_runner_t *runner, uint32_t requested_dpus)
         fprintf(stderr, "Failed to allocate next_free_elem table\n");
         free(runner->slots);
         runner->slots = NULL;
+        free(runner->physical_dpu_rank_indices);
+        runner->physical_dpu_rank_indices = NULL;
+        free(runner->physical_dpus);
+        runner->physical_dpus = NULL;
+        free(runner->ranks);
+        runner->ranks = NULL;
         dpu_free(runner->dpu_set);
         runner->nr_dpus = 0;
+        runner->nr_ranks = 0;
         return 1;
     }
     runner->free_ranges = calloc((size_t)runner->nr_dpus * kvslot_max_free_ranges_per_dpu(), sizeof(free_range_t));
@@ -380,8 +458,15 @@ static int runner_init(kvslot_runner_t *runner, uint32_t requested_dpus)
         runner->next_free_elem = NULL;
         free(runner->slots);
         runner->slots = NULL;
+        free(runner->physical_dpu_rank_indices);
+        runner->physical_dpu_rank_indices = NULL;
+        free(runner->physical_dpus);
+        runner->physical_dpus = NULL;
+        free(runner->ranks);
+        runner->ranks = NULL;
         dpu_free(runner->dpu_set);
         runner->nr_dpus = 0;
+        runner->nr_ranks = 0;
         return 1;
     }
     runner->num_free_ranges = calloc(runner->nr_dpus, sizeof(uint32_t));
@@ -393,8 +478,15 @@ static int runner_init(kvslot_runner_t *runner, uint32_t requested_dpus)
         runner->next_free_elem = NULL;
         free(runner->slots);
         runner->slots = NULL;
+        free(runner->physical_dpu_rank_indices);
+        runner->physical_dpu_rank_indices = NULL;
+        free(runner->physical_dpus);
+        runner->physical_dpus = NULL;
+        free(runner->ranks);
+        runner->ranks = NULL;
         dpu_free(runner->dpu_set);
         runner->nr_dpus = 0;
+        runner->nr_ranks = 0;
         return 1;
     }
     return 0;
@@ -418,10 +510,17 @@ static void runner_destroy(kvslot_runner_t *runner)
     runner->free_ranges = NULL;
     free(runner->num_free_ranges);
     runner->num_free_ranges = NULL;
+    free(runner->physical_dpu_rank_indices);
+    runner->physical_dpu_rank_indices = NULL;
+    free(runner->physical_dpus);
+    runner->physical_dpus = NULL;
+    free(runner->ranks);
+    runner->ranks = NULL;
     if (runner->nr_dpus > 0) {
         dpu_free(runner->dpu_set);
         runner->nr_dpus = 0;
     }
+    runner->nr_ranks = 0;
 }
 
 static int handle_allocate(kvslot_runner_t *runner, uint32_t slot_id)
@@ -1135,13 +1234,15 @@ static int can_use_batched_qk_round(
     uint32_t num_heads;
     uint32_t window;
     uint32_t head_dim;
+    uint32_t active_rank_count = 0;
     size_t query_bytes;
     size_t score_bytes;
+    uint8_t *rank_used = NULL;
 
     if (runner == NULL || items == NULL || round_indices == NULL || round_count <= 1) {
         return 0;
     }
-    if (runner->nr_dpus > 16u) {
+    if (runner->nr_ranks == 0 || runner->physical_dpu_rank_indices == NULL) {
         return 0;
     }
 
@@ -1155,11 +1256,37 @@ static int can_use_batched_qk_round(
         return 0;
     }
 
+    rank_used = calloc(runner->nr_ranks, sizeof(*rank_used));
+    if (rank_used == NULL) {
+        return 0;
+    }
     for (uint32_t pos = 1; pos < round_count; ++pos) {
         qk_slot_item_t *item = &items[round_indices[pos]];
         if (!item->ready || item->num_heads != num_heads || item->window != window || item->head_dim != head_dim) {
+            free(rank_used);
             return 0;
         }
+    }
+    for (uint32_t pos = 0; pos < round_count; ++pos) {
+        qk_slot_item_t *item = &items[round_indices[pos]];
+        uint32_t rank_idx;
+        if (item->physical_dpu_id >= runner->nr_dpus) {
+            free(rank_used);
+            return 0;
+        }
+        rank_idx = runner->physical_dpu_rank_indices[item->physical_dpu_id];
+        if (rank_idx >= runner->nr_ranks) {
+            free(rank_used);
+            return 0;
+        }
+        if (!rank_used[rank_idx]) {
+            rank_used[rank_idx] = 1;
+            active_rank_count += 1;
+        }
+    }
+    free(rank_used);
+    if (active_rank_count > 16u) {
+        return 0;
     }
     return 1;
 }
@@ -1180,11 +1307,14 @@ static int execute_batched_qk_round(
     uint32_t num_heads;
     uint32_t window;
     uint32_t head_dim;
+    uint32_t active_rank_count = 0;
     size_t head_index_bytes;
     size_t query_bytes;
     size_t score_bytes;
+    uint8_t *rank_used = NULL;
+    struct dpu_rank_t **active_ranks = NULL;
+    struct dpu_set_t launch_set;
     struct dpu_set_t dpu;
-    uint32_t each_dpu = 0;
 
     if (!can_use_batched_qk_round(runner, items, round_indices, round_count)) {
         return 1;
@@ -1204,6 +1334,7 @@ static int execute_batched_qk_round(
     head_index_bytes = (size_t)num_heads * sizeof(uint32_t);
     query_bytes = (size_t)num_heads * head_dim * sizeof(float);
     score_bytes = (size_t)num_heads * window * sizeof(uint32_t);
+    memset(&launch_set, 0, sizeof(launch_set));
 
     for (uint32_t pos = 0; pos < round_count; ++pos) {
         qk_slot_item_t *item = &items[round_indices[pos]];
@@ -1214,11 +1345,46 @@ static int execute_batched_qk_round(
         }
         items_by_dpu[item->physical_dpu_id] = item;
     }
+    rank_used = calloc(runner->nr_ranks, sizeof(*rank_used));
+    if (rank_used == NULL) {
+        fprintf(stderr, "Failed to allocate batched qk rank mask\n");
+        free(items_by_dpu);
+        return 1;
+    }
+    for (uint32_t pos = 0; pos < round_count; ++pos) {
+        uint32_t rank_idx = runner->physical_dpu_rank_indices[items[round_indices[pos]].physical_dpu_id];
+        if (!rank_used[rank_idx]) {
+            rank_used[rank_idx] = 1;
+            active_rank_count += 1;
+        }
+    }
+    active_ranks = calloc(active_rank_count > 0 ? active_rank_count : 1u, sizeof(*active_ranks));
+    if (active_ranks == NULL) {
+        fprintf(stderr, "Failed to allocate batched qk active ranks\n");
+        free(rank_used);
+        free(items_by_dpu);
+        return 1;
+    }
+    if (active_rank_count == runner->nr_ranks) {
+        launch_set = runner->dpu_set;
+    } else {
+        uint32_t out_rank = 0;
+        for (uint32_t rank_idx = 0; rank_idx < runner->nr_ranks; ++rank_idx) {
+            if (rank_used[rank_idx]) {
+                active_ranks[out_rank++] = runner->ranks[rank_idx];
+            }
+        }
+        launch_set.kind = DPU_SET_RANKS;
+        launch_set.list.nr_ranks = active_rank_count;
+        launch_set.list.ranks = active_ranks;
+    }
 
     if (head_index_bytes > 0) {
         dummy_head_indices = calloc(1, head_index_bytes);
         if (dummy_head_indices == NULL) {
             fprintf(stderr, "Failed to allocate batched qk dummy head indices\n");
+            free(active_ranks);
+            free(rank_used);
             free(items_by_dpu);
             return 1;
         }
@@ -1228,6 +1394,8 @@ static int execute_batched_qk_round(
         if (dummy_queries == NULL) {
             fprintf(stderr, "Failed to allocate batched qk dummy queries\n");
             free(dummy_head_indices);
+            free(active_ranks);
+            free(rank_used);
             free(items_by_dpu);
             return 1;
         }
@@ -1238,31 +1406,33 @@ static int execute_batched_qk_round(
             fprintf(stderr, "Failed to allocate batched qk dummy scores\n");
             free(dummy_queries);
             free(dummy_head_indices);
+            free(active_ranks);
+            free(rank_used);
             free(items_by_dpu);
             return 1;
         }
     }
 
-    DPU_ASSERT(dpu_broadcast_to(runner->dpu_set, "kvslot_kernel_command", 0, &kernel_command, sizeof(kernel_command), DPU_XFER_DEFAULT));
+    DPU_ASSERT(dpu_broadcast_to(launch_set, "kvslot_kernel_command", 0, &kernel_command, sizeof(kernel_command), DPU_XFER_DEFAULT));
 
-    DPU_FOREACH(runner->dpu_set, dpu, each_dpu) {
-        qk_slot_item_t *item = items_by_dpu[each_dpu];
+    DPU_FOREACH(launch_set, dpu) {
+        qk_slot_item_t *item = find_qk_round_item_for_dpu(runner, items_by_dpu, dpu);
         DPU_ASSERT(dpu_prepare_xfer(dpu, item != NULL ? (void *)&item->runtime_args : (void *)&zero_runtime_args));
     }
     DPU_ASSERT(dpu_push_xfer(
-        runner->dpu_set,
+        launch_set,
         DPU_XFER_TO_DPU,
         "runtime_slot_args",
         0,
         sizeof(zero_runtime_args),
         DPU_XFER_DEFAULT));
 
-    DPU_FOREACH(runner->dpu_set, dpu, each_dpu) {
-        qk_slot_item_t *item = items_by_dpu[each_dpu];
+    DPU_FOREACH(launch_set, dpu) {
+        qk_slot_item_t *item = find_qk_round_item_for_dpu(runner, items_by_dpu, dpu);
         DPU_ASSERT(dpu_prepare_xfer(dpu, item != NULL ? (void *)&item->slot_args : (void *)&zero_slot_args));
     }
     DPU_ASSERT(dpu_push_xfer(
-        runner->dpu_set,
+        launch_set,
         DPU_XFER_TO_DPU,
         "qk_slot_args",
         0,
@@ -1270,12 +1440,12 @@ static int execute_batched_qk_round(
         DPU_XFER_DEFAULT));
 
     if (head_index_bytes > 0) {
-        DPU_FOREACH(runner->dpu_set, dpu, each_dpu) {
-            qk_slot_item_t *item = items_by_dpu[each_dpu];
+        DPU_FOREACH(launch_set, dpu) {
+            qk_slot_item_t *item = find_qk_round_item_for_dpu(runner, items_by_dpu, dpu);
             DPU_ASSERT(dpu_prepare_xfer(dpu, item != NULL ? (void *)item->local_head_indices : (void *)dummy_head_indices));
         }
         DPU_ASSERT(dpu_push_xfer(
-            runner->dpu_set,
+            launch_set,
             DPU_XFER_TO_DPU,
             "qk_slot_head_indices",
             0,
@@ -1284,12 +1454,12 @@ static int execute_batched_qk_round(
     }
 
     if (query_bytes > 0) {
-        DPU_FOREACH(runner->dpu_set, dpu, each_dpu) {
-            qk_slot_item_t *item = items_by_dpu[each_dpu];
+        DPU_FOREACH(launch_set, dpu) {
+            qk_slot_item_t *item = find_qk_round_item_for_dpu(runner, items_by_dpu, dpu);
             DPU_ASSERT(dpu_prepare_xfer(dpu, item != NULL ? (void *)item->queries : (void *)dummy_queries));
         }
         DPU_ASSERT(dpu_push_xfer(
-            runner->dpu_set,
+            launch_set,
             DPU_XFER_TO_DPU,
             "qk_query",
             0,
@@ -1297,15 +1467,15 @@ static int execute_batched_qk_round(
             DPU_XFER_DEFAULT));
     }
 
-    DPU_ASSERT(dpu_launch(runner->dpu_set, DPU_SYNCHRONOUS));
+    DPU_ASSERT(dpu_launch(launch_set, DPU_SYNCHRONOUS));
 
     if (score_bytes > 0) {
-        DPU_FOREACH(runner->dpu_set, dpu, each_dpu) {
-            qk_slot_item_t *item = items_by_dpu[each_dpu];
+        DPU_FOREACH(launch_set, dpu) {
+            qk_slot_item_t *item = find_qk_round_item_for_dpu(runner, items_by_dpu, dpu);
             DPU_ASSERT(dpu_prepare_xfer(dpu, item != NULL ? (void *)item->raw_scores : (void *)dummy_scores));
         }
         DPU_ASSERT(dpu_push_xfer(
-            runner->dpu_set,
+            launch_set,
             DPU_XFER_FROM_DPU,
             "qk_slot_scores_bits",
             0,
@@ -1313,11 +1483,37 @@ static int execute_batched_qk_round(
             DPU_XFER_DEFAULT));
     }
 
+    free(active_ranks);
+    free(rank_used);
     free(dummy_scores);
     free(dummy_queries);
     free(dummy_head_indices);
     free(items_by_dpu);
     return 0;
+}
+
+static qk_slot_item_t *find_qk_round_item_for_dpu(
+    kvslot_runner_t *runner,
+    qk_slot_item_t **items_by_dpu,
+    struct dpu_set_t dpu)
+{
+    struct dpu_t *target_ptr;
+    if (runner == NULL || items_by_dpu == NULL || runner->physical_dpus == NULL) {
+        return NULL;
+    }
+    target_ptr = dpu_from_set(dpu);
+    if (target_ptr == NULL) {
+        return NULL;
+    }
+    for (uint32_t physical_dpu_id = 0; physical_dpu_id < runner->nr_dpus; ++physical_dpu_id) {
+        if (items_by_dpu[physical_dpu_id] == NULL) {
+            continue;
+        }
+        if (dpu_from_set(runner->physical_dpus[physical_dpu_id]) == target_ptr) {
+            return items_by_dpu[physical_dpu_id];
+        }
+    }
+    return NULL;
 }
 
 static void cleanup_av_item(av_item_t *item)

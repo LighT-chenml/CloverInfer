@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import numpy as np
 import struct
 import subprocess
 from typing import Dict
@@ -154,6 +155,13 @@ class _KVSlotHelperClient:
         proc.stdin.write(payload)
         proc.stdin.flush()
 
+    def _write_parts(self, parts: list[bytes | memoryview]) -> None:
+        proc = self._ensure_proc()
+        assert proc.stdin is not None
+        for part in parts:
+            proc.stdin.write(part)
+        proc.stdin.flush()
+
     def _read_exact(self, n: int) -> bytes:
         proc = self._ensure_proc()
         assert proc.stdout is not None
@@ -263,32 +271,36 @@ class _KVSlotHelperClient:
 
         q_i32 = queries.detach().cpu().to(torch.int32).contiguous()
         k_i32 = keys.detach().cpu().to(torch.int32).contiguous()
-        header = struct.pack("<IIII", self.MAGIC, self.CMD_QK_BATCH, 0, 0)
-        args = struct.pack("<IIII", head_dim, num_keys, num_queries, 0)
-        payload = header + args + q_i32.numpy().tobytes(order="C") + k_i32.numpy().tobytes(order="C")
-        self._write(payload)
+        q_np = q_i32.numpy()
+        k_np = k_i32.numpy()
+        self._write_parts(
+            [
+                struct.pack("<IIII", self.MAGIC, self.CMD_QK_BATCH, 0, 0),
+                struct.pack("<IIII", head_dim, num_keys, num_queries, 0),
+                memoryview(q_np).cast("B"),
+                memoryview(k_np).cast("B"),
+            ]
+        )
         out_header = struct.unpack("<IIII", self._read_exact(16))
         out_head_dim, out_num_keys, out_num_queries = (int(out_header[0]), int(out_header[1]), int(out_header[2]))
         if out_head_dim != head_dim or out_num_keys != num_keys or out_num_queries != num_queries:
             raise RuntimeError("kvslot helper returned an invalid qk batch header")
         raw_scores = self._read_exact(num_queries * num_keys * 8)
-        scores = torch.tensor(
-            struct.unpack(f"<{num_queries * num_keys}q", raw_scores),
-            dtype=torch.int64,
-        ).view(num_queries, num_keys)
+        scores = torch.from_numpy(np.frombuffer(raw_scores, dtype="<i8").copy()).view(num_queries, num_keys)
         return scores
 
     def qk_slot_scores_batch(self, slot_queries: list[tuple[int, list[int], int, torch.Tensor]]) -> list[torch.Tensor]:
         if not slot_queries:
             return []
 
-        header = struct.pack("<IIII", self.MAGIC, self.CMD_QK_SLOT_BATCH, 0, 0)
-        args = struct.pack("<IIII", int(len(slot_queries)), 0, 0, 0)
-        payload_parts = [header, args]
+        payload_parts: list[bytes | memoryview] = [
+            struct.pack("<IIII", self.MAGIC, self.CMD_QK_SLOT_BATCH, 0, 0),
+            struct.pack("<IIII", int(len(slot_queries)), 0, 0, 0),
+        ]
         expected_meta = []
 
         for slot_id, local_head_indices, window, queries in slot_queries:
-            q = queries.detach().cpu().to(torch.float32).contiguous()
+            q = queries if queries.device.type == "cpu" and queries.dtype == torch.float32 and queries.is_contiguous() else queries.detach().cpu().to(torch.float32).contiguous()
             if q.dim() != 2:
                 raise ValueError(f"slot queries must be 2D, got shape {tuple(q.shape)}")
             num_heads = int(q.shape[0])
@@ -308,10 +320,10 @@ class _KVSlotHelperClient:
                 )
             )
             payload_parts.append(struct.pack(f"<{num_heads}I", *[int(idx) for idx in local_head_indices]))
-            payload_parts.append(q.numpy().tobytes(order="C"))
+            payload_parts.append(memoryview(q.numpy()).cast("B"))
             expected_meta.append((num_heads, int(window)))
 
-        self._write(b"".join(payload_parts))
+        self._write_parts(payload_parts)
 
         out_args = struct.unpack("<IIII", self._read_exact(16))
         out_num_items = int(out_args[0])
@@ -331,10 +343,7 @@ class _KVSlotHelperClient:
                     f"index={idx} expected=({expected_heads}, {expected_window}) actual=({actual_heads}, {actual_window})"
                 )
             raw_scores = self._read_exact(actual_heads * actual_window * 4)
-            scores = torch.tensor(
-                struct.unpack(f"<{actual_heads * actual_window}f", raw_scores),
-                dtype=torch.float32,
-            ).view(actual_heads, actual_window)
+            scores = torch.from_numpy(np.frombuffer(raw_scores, dtype="<f4").copy()).view(actual_heads, actual_window)
             scores_per_item.append(scores)
         return scores_per_item
 
@@ -343,9 +352,13 @@ class _KVSlotHelperClient:
         if w.dim() != 2:
             raise ValueError(f"weights must be 2D, got shape {tuple(w.shape)}")
 
-        header = struct.pack("<IIII", self.MAGIC, self.CMD_AV, slot_id, 0)
-        payload = header + w.numpy().tobytes(order="C")
-        self._write(payload)
+        w_np = w.numpy()
+        self._write_parts(
+            [
+                struct.pack("<IIII", self.MAGIC, self.CMD_AV, slot_id, 0),
+                memoryview(w_np).cast("B"),
+            ]
+        )
 
         out = struct.unpack("<IIIII", self._read_exact(20))
         _, seq_len, group_heads, head_dim, _ = (int(item) for item in out)
@@ -355,30 +368,28 @@ class _KVSlotHelperClient:
                 f"weights={tuple(w.shape)} header=({seq_len}, {group_heads}, {head_dim})"
             )
         raw_context = self._read_exact(group_heads * head_dim * 4)
-        context = torch.tensor(
-            struct.unpack(f"<{group_heads * head_dim}f", raw_context),
-            dtype=torch.float32,
-        ).view(group_heads, head_dim)
+        context = torch.from_numpy(np.frombuffer(raw_context, dtype="<f4").copy()).view(group_heads, head_dim)
         return context
 
     def weighted_value_sum_batch(self, slot_weights: list[tuple[int, torch.Tensor]]) -> list[torch.Tensor]:
         if not slot_weights:
             return []
 
-        header = struct.pack("<IIII", self.MAGIC, self.CMD_AV_BATCH, 0, 0)
-        args = struct.pack("<IIII", int(len(slot_weights)), 0, 0, 0)
-        payload_parts = [header, args]
+        payload_parts: list[bytes | memoryview] = [
+            struct.pack("<IIII", self.MAGIC, self.CMD_AV_BATCH, 0, 0),
+            struct.pack("<IIII", int(len(slot_weights)), 0, 0, 0),
+        ]
         expected_meta = []
 
         for slot_id, weights in slot_weights:
-            w = weights.detach().cpu().to(torch.float32).contiguous()
+            w = weights if weights.device.type == "cpu" and weights.dtype == torch.float32 and weights.is_contiguous() else weights.detach().cpu().to(torch.float32).contiguous()
             if w.dim() != 2:
                 raise ValueError(f"weights must be 2D, got shape {tuple(w.shape)}")
             payload_parts.append(struct.pack("<IIII", self.MAGIC, self.CMD_AV, int(slot_id), 0))
-            payload_parts.append(w.numpy().tobytes(order="C"))
+            payload_parts.append(memoryview(w.numpy()).cast("B"))
             expected_meta.append((int(slot_id), int(w.shape[0]), int(w.shape[1])))
 
-        self._write(b"".join(payload_parts))
+        self._write_parts(payload_parts)
 
         out_args = struct.unpack("<IIII", self._read_exact(16))
         out_num_slots = int(out_args[0])
@@ -397,10 +408,7 @@ class _KVSlotHelperClient:
                     f"index={idx} weights=({expected_heads}, {expected_seq_len}) header=({seq_len}, {group_heads}, {head_dim})"
                 )
             raw_context = self._read_exact(group_heads * head_dim * 4)
-            context = torch.tensor(
-                struct.unpack(f"<{group_heads * head_dim}f", raw_context),
-                dtype=torch.float32,
-            ).view(group_heads, head_dim)
+            context = torch.from_numpy(np.frombuffer(raw_context, dtype="<f4").copy()).view(group_heads, head_dim)
             contexts.append(context)
         return contexts
 

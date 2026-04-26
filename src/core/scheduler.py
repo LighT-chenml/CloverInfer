@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Dict, List
 
@@ -60,6 +61,48 @@ class GlobalScheduler:
             "num_heads": int(model_config.num_heads),
             "vocab_size": 0,
         }
+        self.attention_batch_window_s = max(0.0, float(cluster_config.attention_rpc_batch_window_s))
+        self.attention_batch_max_size = max(1, int(cluster_config.attention_rpc_batch_max_size))
+        self.attention_batch_flushes = 0
+        self.attention_batch_total_items = 0
+        self.attention_batch_max_observed = 0
+        self._attention_batch_queue: list[tuple[dict, asyncio.Future, object]] = []
+        self._attention_batch_task: asyncio.Task | None = None
+
+    async def _flush_attention_batch(self):
+        try:
+            if self.attention_batch_window_s > 0:
+                await asyncio.sleep(self.attention_batch_window_s)
+            while self._attention_batch_queue:
+                batch = self._attention_batch_queue[: self.attention_batch_max_size]
+                del self._attention_batch_queue[: self.attention_batch_max_size]
+                payloads = [item[0] for item in batch]
+                futures = [item[1] for item in batch]
+                attention = batch[0][2]
+                self.attention_batch_flushes += 1
+                self.attention_batch_total_items += len(payloads)
+                self.attention_batch_max_observed = max(self.attention_batch_max_observed, len(payloads))
+                try:
+                    results = await attention.decode_layer_batch.remote(payloads)
+                    for future, result in zip(futures, results):
+                        if not future.done():
+                            future.set_result(result)
+                except Exception as exc:
+                    for future in futures:
+                        if not future.done():
+                            future.set_exception(exc)
+        finally:
+            self._attention_batch_task = None
+            if self._attention_batch_queue:
+                self._attention_batch_task = asyncio.create_task(self._flush_attention_batch())
+
+    async def _batched_attention_decode(self, attention, prepared):
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._attention_batch_queue.append((prepared, future, attention))
+        if self._attention_batch_task is None:
+            self._attention_batch_task = asyncio.create_task(self._flush_attention_batch())
+        return await future
 
     async def initialize_cluster(self):
         gpu_prefill = 1 if self.cluster_config.use_gpu_for_prefill else 0
@@ -77,6 +120,8 @@ class GlobalScheduler:
                 "qk_mixed_enabled": bool(self.cluster_config.pim_qk_mixed_enabled),
                 "qk_mixed_heads": int(self.cluster_config.pim_qk_mixed_heads),
                 "qk_mixed_window": int(self.cluster_config.pim_qk_mixed_window),
+                "decode_batch_window_s": float(self.cluster_config.attention_actor_batch_window_s),
+                "decode_batch_max_size": int(self.cluster_config.attention_actor_batch_max_size),
             }
 
         self.prefill_nodes = [
@@ -168,7 +213,7 @@ class GlobalScheduler:
                     )
 
                     rpc_started = time.perf_counter()
-                    attention_result = await attention.decode_layer.remote(prepared)
+                    attention_result = await self._batched_attention_decode(attention, prepared)
                     stage_timing["scheduler"]["attention_decode_rpc_s"] += time.perf_counter() - rpc_started
                     stage_timing["actors"]["attention_decode_compute_s"] += float(
                         attention_result.get("profile", {}).get("compute_s", 0.0)
@@ -234,6 +279,14 @@ class GlobalScheduler:
                 0.0,
                 float(latency - scheduler_rpc_total),
             )
+            metrics["scheduler_attention_batching"] = {
+                "window_s": float(self.attention_batch_window_s),
+                "max_size": int(self.attention_batch_max_size),
+                "flushes": int(self.attention_batch_flushes),
+                "total_items": int(self.attention_batch_total_items),
+                "max_observed_size": int(self.attention_batch_max_observed),
+                "pending": len(self._attention_batch_queue),
+            }
             metrics["attention_backend_before_free"] = attention_debug_before_free
             metrics["attention_backend"] = await attention.get_info.remote()
             return generated_text, metrics
