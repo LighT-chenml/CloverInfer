@@ -888,3 +888,635 @@ Current trustworthy takeaway:
 - keep the compact-layout fix
 - treat the token-parallel compact-score kernel as the current correct
   small-trace mixed-`QK` baseline
+
+### 22. First K-read optimization pass inside the token-parallel grouped mixed-QK kernel
+
+We then started the next planned kernel-side optimization round by reducing
+`K` read overhead without changing the host/helper protocol.
+
+#### 22a. fp32 pair-read fast path
+
+What changed:
+
+- grouped mixed-`QK` keeps the same token-parallel structure
+- for `fp32` rows that are pair-aligned, the kernel now reads two adjacent
+  `K` values with one `mram_read`
+- non-aligned or unsupported cases still fall back to the older scalar path
+
+Correctness:
+
+- minimal three-machine verification still passed
+- `qk_mixed_last_max_abs_diff = 0.0`
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc1_tok2_dpu4_fp32_balanced_rotated_residentqk_slotqk_grouped_kernelmulti_tokenparallel_compactreadback_pairkfastpath_upmemav.jsonl`
+
+Observed:
+
+- `avg_latency = 1.8189 s`
+- `avg_tpot = 1.6370 s`
+
+Comparison:
+
+- token-parallel compact-score baseline:
+  - `avg_latency = 1.8203 s`
+  - `avg_tpot = 1.6384 s`
+- plus fp32 pair-read fast path:
+  - `avg_latency = 1.8189 s`
+  - `avg_tpot = 1.6370 s`
+
+Interpretation:
+
+- the gain is small but real
+- this supports the current hypothesis that `K`-side MRAM access is still part
+  of the remaining bottleneck
+- it is worth keeping this fast path because it improves performance without
+  complicating correctness or protocol behavior
+
+#### 22b. Larger four-float read attempt
+
+We then tried pushing the same idea one step further with a larger aligned
+`K` read block.
+
+What changed:
+
+- for stricter alignment conditions, the kernel attempted to read four
+  adjacent `fp32` values in one larger chunk
+- the earlier pair-read fast path remained available as fallback
+
+Correctness:
+
+- minimal three-machine verification still passed
+- `qk_mixed_last_max_abs_diff = 0.0`
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc1_tok2_dpu4_fp32_balanced_rotated_residentqk_slotqk_grouped_kernelmulti_tokenparallel_compactreadback_quadkfastpath_upmemav.jsonl`
+
+Observed:
+
+- `avg_latency = 1.8280 s`
+- `avg_tpot = 1.6459 s`
+
+Comparison:
+
+- pair-read fast path:
+  - `avg_latency = 1.8189 s`
+  - `avg_tpot = 1.6370 s`
+- larger four-float read attempt:
+  - `avg_latency = 1.8280 s`
+  - `avg_tpot = 1.6459 s`
+
+Interpretation:
+
+- larger block reads were not automatically better on this kernel
+- the four-float variant regressed relative to both:
+  - the pair-read version
+  - the original token-parallel compact-score baseline
+- this suggests the next useful direction is not simply "make the read block
+  larger"
+
+Updated takeaway:
+
+- keep the fp32 pair-read fast path
+- discard the four-float read attempt as a negative result
+- the next kernel round should focus on better `K` tiling / staging strategy,
+  not blindly larger contiguous reads
+
+### 23. Small K-tile staging by reading fp32 directly into a float WRAM tile
+
+We then tried the next more structured `K`-side optimization step.
+
+What changed:
+
+- the grouped mixed-`QK` kernel still keeps the token-parallel work split
+- for aligned `fp32` rows, the kernel now reads a small `K` tile directly into
+  a WRAM `float` buffer
+- the dot product then reuses those `float` values directly instead of
+  converting each element through repeated `u32_bits_to_float(...)`
+- the earlier pair-read path still covers the remaining aligned tail
+- non-aligned or unsupported cases still fall back to the generic path
+
+Correctness:
+
+- minimal three-machine verification still passed
+- `qk_mixed_last_max_abs_diff = 0.0`
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc1_tok2_dpu4_fp32_balanced_rotated_residentqk_slotqk_grouped_kernelmulti_tokenparallel_compactreadback_ktile8float_upmemav.jsonl`
+
+Observed:
+
+- `avg_latency = 1.8019 s`
+- `avg_tpot = 1.6224 s`
+- `avg_ttft = 0.1795 s`
+
+Comparison:
+
+- token-parallel compact-score baseline:
+  - `avg_latency = 1.8203 s`
+  - `avg_tpot = 1.6384 s`
+  - `avg_ttft = 0.1819 s`
+- fp32 pair-read fast path:
+  - `avg_latency = 1.8189 s`
+  - `avg_tpot = 1.6370 s`
+  - `avg_ttft = 0.1819 s`
+- small `K` tile read directly into `float` WRAM:
+  - `avg_latency = 1.8019 s`
+  - `avg_tpot = 1.6224 s`
+  - `avg_ttft = 0.1795 s`
+
+Interpretation:
+
+- this is a clearer improvement than the earlier pair-read micro-optimization
+- the gain suggests that reducing per-element unpack / conversion overhead is
+  worthwhile in addition to reducing raw MRAM read count
+- a small structured tile is more effective than simply making the direct read
+  block larger
+
+Updated takeaway:
+
+- the current strongest trustworthy grouped mixed-`QK` kernel is now the
+  token-parallel compact-score version with small `fp32` `K`-tile staging
+- the next likely direction is to refine tile shape / staging order further,
+  not to go back to larger unstructured direct reads
+
+### 24. Inner-loop base-hoisting / branch-hoisting attempt on top of small K-tile staging
+
+We then tried one more engineering-oriented cleanup pass on top of the
+`ktile8float` kernel.
+
+What changed:
+
+- token-row base arithmetic was partially hoisted / rewritten into a
+  recurrence-style inner loop
+- some fast-path condition checks were moved outside the hottest inner loop
+- the small `fp32` `K`-tile staging structure itself stayed the same
+
+Correctness:
+
+- minimal three-machine verification still passed
+- `qk_mixed_last_max_abs_diff = 0.0`
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc1_tok2_dpu4_fp32_balanced_rotated_residentqk_slotqk_grouped_kernelmulti_tokenparallel_compactreadback_ktile8float_hoistedbase_upmemav.jsonl`
+
+Observed:
+
+- `avg_latency = 1.8228 s`
+- `avg_tpot = 1.6354 s`
+- `avg_ttft = 0.1874 s`
+
+Comparison:
+
+- small `K` tile read directly into `float` WRAM:
+  - `avg_latency = 1.8019 s`
+  - `avg_tpot = 1.6224 s`
+  - `avg_ttft = 0.1795 s`
+- plus base-hoisting / branch-hoisting cleanup:
+  - `avg_latency = 1.8228 s`
+  - `avg_tpot = 1.6354 s`
+  - `avg_ttft = 0.1874 s`
+
+Interpretation:
+
+- this engineering cleanup did not help the current kernel
+- the regression suggests the current bottleneck is not simply index arithmetic
+  inside the inner loop
+- the more valuable gains are still coming from memory-access structure, not
+  from algebraic loop rewrites alone
+
+Updated takeaway:
+
+- keep the simpler `ktile8float` version as the active kernel baseline
+- record this as a negative result
+- deprioritize further pure index-hoisting / branch-hoisting tweaks unless a
+  profiler later points back to them directly
+
+### 25. K-tile size sweep: 8-float vs 16-float direct fp32 staging
+
+We then checked whether the current small-tile win would continue if the tile
+size grew further.
+
+What changed:
+
+- the grouped mixed-`QK` kernel kept the same structure as the current
+  `ktile8float` baseline
+- only the direct `fp32` `K`-tile size changed from `8` to `16`
+- host/helper protocol remained unchanged
+
+Correctness:
+
+- minimal three-machine verification still passed
+- `qk_mixed_last_max_abs_diff = 0.0`
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc1_tok2_dpu4_fp32_balanced_rotated_residentqk_slotqk_grouped_kernelmulti_tokenparallel_compactreadback_ktile16float_upmemav.jsonl`
+
+Observed:
+
+- `avg_latency = 1.8181 s`
+- `avg_tpot = 1.6341 s`
+- `avg_ttft = 0.1839 s`
+
+Comparison:
+
+- token-parallel compact-score baseline:
+  - `avg_latency = 1.8203 s`
+  - `avg_tpot = 1.6384 s`
+  - `avg_ttft = 0.1819 s`
+- pair-read fast path:
+  - `avg_latency = 1.8189 s`
+  - `avg_tpot = 1.6370 s`
+  - `avg_ttft = 0.1819 s`
+- small `8-float` `K` tile:
+  - `avg_latency = 1.8019 s`
+  - `avg_tpot = 1.6224 s`
+  - `avg_ttft = 0.1795 s`
+- larger `16-float` `K` tile:
+  - `avg_latency = 1.8181 s`
+  - `avg_tpot = 1.6341 s`
+  - `avg_ttft = 0.1839 s`
+
+Interpretation:
+
+- increasing the tile from `8` to `16` did not preserve the earlier win
+- `16-float` staging is still slightly better than the original baseline, but
+  clearly worse than the `8-float` tile
+- this is another sign that the current local optimum is a small structured
+  tile, not an arbitrarily larger one
+
+Updated takeaway:
+
+- keep `ktile8float` as the active kernel baseline
+- record `ktile16float` as a negative tile-size result
+- future kernel work should pivot away from simply enlarging the staging tile
+
+### 26. Bottleneck attribution by disabling mixed-QK
+
+Before continuing to optimize grouped mixed-`QK`, we ran a quick attribution
+experiment to see how much of the remaining latency still came from that path
+versus resident `AV`.
+
+What changed:
+
+- keep resident `AV` enabled
+- disable mixed-`QK` replacement entirely
+- leave the rest of the resident-KV path unchanged
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc1_tok2_dpu4_fp32_balanced_rotated_nomixedqk_upmemav.jsonl`
+
+Observed:
+
+- `avg_latency = 1.6745 s`
+- `avg_tpot = 1.4918 s`
+- `avg_ttft = 0.1827 s`
+
+Comparison:
+
+- current best mixed-`QK` + resident `AV` kernel before this attribution check:
+  - `avg_latency = 1.8019 s`
+  - `avg_tpot = 1.6224 s`
+- same path with mixed-`QK` disabled:
+  - `avg_latency = 1.6745 s`
+  - `avg_tpot = 1.4918 s`
+
+Interpretation:
+
+- grouped mixed-`QK` is still contributing a meaningful latency increment
+- but the resident `AV` path itself remains a large absolute part of the total
+  decode cost
+- this was enough evidence to justify switching the next exploration round to
+  the `AV` kernel
+
+### 27. First resident-AV kernel optimization: same-head adjacent-dim fast path
+
+We then tried the first direct `AV` kernel optimization.
+
+What changed:
+
+- when one output pair corresponds to two adjacent dims from the same head:
+  - reuse the same attention weight for both dims
+  - on aligned `fp32` rows, read the two `V` values together
+- all other `AV` cases fall back to the older path
+
+Correctness:
+
+- minimal three-machine verification still passed
+- `resident_av_shadow_max_abs_diff` stayed within the current tolerance
+- mixed-`QK` correctness stayed exact
+
+Artifact with mixed-`QK` enabled:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc1_tok2_dpu4_fp32_balanced_rotated_residentqk_slotqk_grouped_kernelmulti_tokenparallel_compactreadback_ktile8float_avpairdim_upmemav.jsonl`
+
+Observed with mixed-`QK` enabled:
+
+- `avg_latency = 1.7883 s`
+- `avg_tpot = 1.6092 s`
+- `avg_ttft = 0.1790 s`
+
+Comparison against the best prior mixed-`QK` + resident `AV` baseline:
+
+- `ktile8float` mixed-`QK` baseline:
+  - `avg_latency = 1.8019 s`
+  - `avg_tpot = 1.6224 s`
+  - `avg_ttft = 0.1795 s`
+- plus `AV` same-head adjacent-dim fast path:
+  - `avg_latency = 1.7883 s`
+  - `avg_tpot = 1.6092 s`
+  - `avg_ttft = 0.1790 s`
+
+Artifact with mixed-`QK` disabled:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc1_tok2_dpu4_fp32_balanced_rotated_nomixedqk_avpairdim_upmemav.jsonl`
+
+Observed with mixed-`QK` disabled:
+
+- `avg_latency = 1.6420 s`
+- `avg_tpot = 1.4632 s`
+- `avg_ttft = 0.1788 s`
+
+Comparison against the earlier no-mixed-`QK` resident-`AV` path:
+
+- no mixed-`QK`, old `AV` path:
+  - `avg_latency = 1.6745 s`
+  - `avg_tpot = 1.4918 s`
+  - `avg_ttft = 0.1827 s`
+- no mixed-`QK`, optimized `AV` path:
+  - `avg_latency = 1.6420 s`
+  - `avg_tpot = 1.4632 s`
+  - `avg_ttft = 0.1788 s`
+
+Interpretation:
+
+- this `AV` optimization gives a real win both:
+  - with grouped mixed-`QK` enabled
+  - and with grouped mixed-`QK` disabled
+- that means the gain is genuinely from the `AV` kernel, not from an accidental
+  interaction with the mixed-`QK` path
+
+Updated takeaway:
+
+- the best current end-to-end resident attention baseline is now:
+  - grouped mixed-`QK` with `ktile8float`
+  - plus the `AV` same-head adjacent-dim fast path
+- switching some optimization attention toward resident `AV` was the right
+  move after the earlier attribution check
+
+### 28. Resident-AV weight-tile checkpoint
+
+We then tried a deeper `AV` optimization on top of the same-head adjacent-dim
+fast path.
+
+What changed:
+
+- for same-head adjacent-dim output pairs, the kernel stages `8` consecutive
+  attention weights at once
+- the goal is to reduce repeated scalar weight reads while keeping the earlier
+  paired-`V` fast path
+
+#### First attempt was invalid
+
+Our first `weight-tile[8]` implementation looked faster, but it was not a safe
+result.
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc1_tok2_dpu4_fp32_balanced_rotated_residentqk_slotqk_grouped_kernelmulti_tokenparallel_compactreadback_ktile8float_avweighttile8_upmemav.jsonl`
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc1_tok2_dpu4_fp32_balanced_rotated_nomixedqk_avweighttile8_upmemav.jsonl`
+
+Observed:
+
+- mixed-`QK`: `avg_latency = 1.7573 s`
+- no mixed-`QK`: `avg_latency = 1.6240 s`
+- but `resident_av_shadow_max_abs_diff` jumped to about `2.03`
+
+Root cause:
+
+- the tiled weight path bypassed the earlier aligned packed-read logic
+- this introduced a correctness bug in the staged `AV` weight reads
+
+Interpretation:
+
+- those faster numbers must be treated as invalid
+- they should not be used as a baseline or reported as a real optimization
+
+#### Corrected aligned version
+
+We then fixed the tiled weight path by reading packed aligned `uint64` weight
+pairs and unpacking them in WRAM before reuse.
+
+Artifact with mixed-`QK` enabled:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc1_tok2_dpu4_fp32_balanced_rotated_residentqk_slotqk_grouped_kernelmulti_tokenparallel_compactreadback_ktile8float_avweighttile8_aligned_upmemav.jsonl`
+
+Observed with mixed-`QK` enabled:
+
+- `avg_latency = 1.7764 s`
+- `avg_tpot = 1.5986 s`
+- `avg_ttft = 0.1778 s`
+- `max_resident_av_shadow_max_abs_diff = 0.0001220703125`
+
+Artifact with mixed-`QK` disabled:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc1_tok2_dpu4_fp32_balanced_rotated_nomixedqk_avweighttile8_aligned_upmemav.jsonl`
+
+Observed with mixed-`QK` disabled:
+
+- `avg_latency = 1.6168 s`
+- `avg_tpot = 1.4386 s`
+- `avg_ttft = 0.1782 s`
+- `max_resident_av_shadow_max_abs_diff = 0.000030517578125`
+
+Comparison against the current pair-dim `AV` baseline:
+
+- mixed-`QK` + `avpairdim`:
+  - `avg_latency = 1.7883 s`
+  - `avg_tpot = 1.6092 s`
+- mixed-`QK` + aligned `avweighttile8`:
+  - `avg_latency = 1.7764 s`
+  - `avg_tpot = 1.5986 s`
+- no mixed-`QK` + `avpairdim`:
+  - `avg_latency = 1.6420 s`
+  - `avg_tpot = 1.4632 s`
+- no mixed-`QK` + aligned `avweighttile8`:
+  - `avg_latency = 1.6168 s`
+  - `avg_tpot = 1.4386 s`
+
+Interpretation:
+
+- after fixing the alignment bug, the `AV` weight-tiling direction still gives
+  a real positive result
+- the gain is smaller than the invalid first attempt suggested, but it is
+  still consistent in both:
+  - mixed-`QK`
+  - no mixed-`QK`
+- the current trustworthy small-trace resident-attention baseline is now:
+  - grouped mixed-`QK` with `ktile8float`
+  - `AV` same-head adjacent-dim fast path
+  - aligned `AV` weight-tile staging
+
+### 29. Helper-side AV batch push-xfer checkpoint
+
+We then moved the next optimization step out of the DPU kernel and into
+`host_kvslot`.
+
+What changed:
+
+- in `AV_BATCH`, if one launch round has:
+  - one item per physical DPU
+  - matching padded weight/context sizes
+  - and `nr_dpus <= 16`
+- then the helper now uses:
+  - one batched `runtime_slot_args` push-xfer
+  - one batched `av_weights_bits` push-xfer
+  - one whole-set launch
+  - one batched `av_context_bits` pull-xfer
+- instead of per-item:
+  - `dpu_copy_to`
+  - `dpu_launch`
+  - `dpu_copy_from`
+
+This is intentionally gated to the small-DPU regime so it does not accidentally
+turn a large-DPU run into a "launch the whole machine for a tiny round" path.
+
+Artifact with mixed-`QK` enabled:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc1_tok2_dpu4_fp32_balanced_rotated_avbatchpushxfer_upmemav.jsonl`
+
+Observed with mixed-`QK` enabled:
+
+- `avg_latency = 1.1833 s`
+- `max_latency = 1.6468 s`
+
+Artifact with mixed-`QK` disabled:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc1_tok2_dpu4_fp32_balanced_rotated_nomixedqk_avbatchpushxfer_upmemav.jsonl`
+
+Observed with mixed-`QK` disabled:
+
+- `avg_latency = 1.0241 s`
+- `max_latency = 1.4638 s`
+
+Comparison against the previous trustworthy resident-`AV` baseline:
+
+- mixed-`QK` + aligned `avweighttile8`:
+  - `avg_latency = 1.7764 s`
+- mixed-`QK` + helper-side AV batch push-xfer:
+  - `avg_latency = 1.1833 s`
+- no mixed-`QK` + aligned `avweighttile8`:
+  - `avg_latency = 1.6168 s`
+- no mixed-`QK` + helper-side AV batch push-xfer:
+  - `avg_latency = 1.0241 s`
+
+Interpretation:
+
+- this is a much larger gain than the earlier kernel-only `AV` micro-steps
+- the dominant small-trace resident-`AV` bottleneck was not just DPU-side
+  arithmetic or unpacking
+- a large fraction of the cost was still in helper-side transfer/launch
+  granularity
+
+Updated takeaway:
+
+- for the current `4 DPU` small-trace regime, helper-side launch/xfer
+  amortization is the strongest `AV` optimization so far
+- this is the new trustworthy small-DPU resident-attention baseline
+
+### 30. Helper-side mixed-QK batch push-xfer checkpoint
+
+We then tried the same helper-side batching idea on `QK_SLOT_BATCH`.
+
+What changed:
+
+- keep the current trusted resident-attention baseline:
+  - grouped resident-slot mixed-`QK`
+  - `ktile8float`
+  - helper-side batched resident `AV`
+- in `QK_SLOT_BATCH`, if one launch round has:
+  - one item per physical DPU
+  - matching `num_heads`
+  - matching `window`
+  - matching `head_dim`
+  - and `nr_dpus <= 16`
+- then the helper now uses:
+  - one batched `runtime_slot_args` push-xfer
+  - one batched `qk_slot_args` push-xfer
+  - one batched `qk_slot_head_indices` push-xfer
+  - one batched `qk_query` push-xfer
+  - one whole-set launch
+  - one batched `qk_slot_scores_bits` pull-xfer
+- otherwise it falls back to the previous per-item path
+
+Correctness:
+
+- placement verification still passed
+- `resident_av_shadow_max_abs_diff = 0.0`
+- `qk_mixed_last_max_abs_diff = 0.0`
+
+Artifacts from the clean serial attribution rerun:
+
+- mixed-`QK` enabled:
+  - `artifacts/pim_allocator_trace_opt125m_humaneval4_conc1_tok2_dpu4_fp32_balanced_rotated_qkbatch_serial_upmemav.jsonl`
+- mixed-`QK` disabled:
+  - `artifacts/pim_allocator_trace_opt125m_humaneval4_conc1_tok2_dpu4_fp32_balanced_rotated_qkbatch_serial_nomixedqk_upmemav.jsonl`
+
+Observed with mixed-`QK` enabled:
+
+- `avg_latency = 1.2104 s`
+- `avg_tpot = 0.9860 s`
+- `avg_ttft = 0.2244 s`
+
+Observed with mixed-`QK` disabled:
+
+- `avg_latency = 1.0835 s`
+- `avg_tpot = 0.8562 s`
+- `avg_ttft = 0.2273 s`
+
+Comparison against the previous trustworthy AV-batched baseline:
+
+- previous mixed-`QK` baseline:
+  - `avg_latency = 1.1653 s`
+  - `avg_tpot = 0.9790 s`
+  - `avg_ttft = 0.1862 s`
+- helper-side mixed-`QK` batching:
+  - `avg_latency = 1.2104 s`
+  - `avg_tpot = 0.9860 s`
+  - `avg_ttft = 0.2244 s`
+- previous no-mixed-`QK` attribution:
+  - `avg_latency = 1.0260 s`
+  - `avg_tpot = 0.8425 s`
+  - `avg_ttft = 0.1834 s`
+- helper-side no-mixed-`QK` attribution:
+  - `avg_latency = 1.0835 s`
+  - `avg_tpot = 0.8562 s`
+  - `avg_ttft = 0.2273 s`
+
+Interpretation:
+
+- unlike the helper-side resident-`AV` batching step, the analogous
+  helper-side mixed-`QK` batching does not help on the current `4 DPU`
+  small-trace regime
+- correctness is fine, but latency regresses slightly in both:
+  - mixed-`QK`
+  - no mixed-`QK`
+- this suggests the remaining mixed-`QK` bottleneck is not dominated by the
+  same helper launch/xfer granularity issue that previously dominated resident
+  `AV`
+
+Updated takeaway:
+
+- keep the code path only as a correctness-preserving experiment checkpoint
+- do not treat helper-side whole-set mixed-`QK` batching as the next active
+  optimization direction
+- the next mixed-`QK` steps should return to:
+  - kernel/dataflow structure
+  - active-set launch structure for larger DPU counts
+  - or reducing host-side packing/copy work before launch

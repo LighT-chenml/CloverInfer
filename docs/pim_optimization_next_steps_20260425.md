@@ -549,3 +549,411 @@ Updated near-term order:
 2. explore small tiled / packed `K` reads that preserve the compact score
    layout
 3. re-measure whether resident `AV` or mixed-`QK` is now the dominant limiter
+
+### First K-read optimization checkpoint
+
+We have now completed the first small `K`-side optimization pass inside the
+token-parallel grouped mixed-`QK` kernel.
+
+Result:
+
+- a conservative fp32 pair-read fast path gave a small positive result
+- a larger four-float read attempt regressed
+
+Immediate implication:
+
+- the right next step is not simply increasing contiguous read size
+- the better direction is likely a more structured `K` tiling / staging design
+  that matches tasklet ownership and MRAM access order more carefully
+
+Updated near-term order:
+
+1. keep the fp32 pair-read fast path as the current kernel baseline
+2. design a small tiled `K`-read / staging experiment
+3. measure whether that reduces MRAM access overhead more effectively than
+   larger direct reads
+4. only after that, re-evaluate whether the next main bottleneck has shifted
+   toward resident `AV`
+
+### Small K-tile staging checkpoint
+
+We have now completed that next tiled-read experiment.
+
+Result:
+
+- reading a small aligned `fp32` `K` tile directly into a WRAM `float` buffer
+  improved the small-trace baseline more clearly than the earlier pair-read
+  micro-optimization
+
+Immediate implication:
+
+- structured small-tile staging is a better direction than simply increasing
+  direct read block size
+- the grouped mixed-`QK` mainline should now keep this `K`-tile variant as the
+  active kernel baseline
+
+Updated near-term order:
+
+1. keep the small `fp32` `K`-tile staging kernel as the current baseline
+2. refine tile shape / loop structure carefully:
+   - tile size
+   - tail handling
+   - alignment-sensitive fast paths
+3. then re-measure whether mixed-`QK` still dominates over resident `AV`
+
+### Base-hoisting cleanup checkpoint
+
+We also tried a more "engineering cleanup" style optimization on top of the
+small `K`-tile kernel:
+
+- hoist more token-base arithmetic
+- hoist more fast-path checks
+
+Result:
+
+- correctness remained fine
+- performance regressed relative to the simpler `ktile8float` kernel
+
+Immediate implication:
+
+- do not spend more time on pure index-hoisting cleanup right now
+- keep focusing on memory-access structure and tile design instead
+
+### K-tile size sweep checkpoint
+
+We also checked whether growing the direct `fp32` staging tile beyond `8`
+would keep helping.
+
+Result:
+
+- `16-float` staging regressed relative to the `8-float` tile baseline
+
+Immediate implication:
+
+- the next step should not be "try even larger tiles"
+- the current local optimum appears to be a small structured tile rather than a
+  maximal direct read block
+
+Updated near-term order:
+
+1. keep `ktile8float` as the current kernel baseline
+2. stop spending time on larger direct tile sizes for now
+3. move to a different structural direction:
+   - different tasklet/tile ownership
+   - or re-evaluating whether resident `AV` has become the more promising
+     optimization target
+
+### Attribution checkpoint: mixed-QK vs resident AV
+
+We then explicitly disabled mixed-`QK` while keeping resident `AV` enabled.
+
+Result:
+
+- latency dropped materially when mixed-`QK` was removed
+- but the remaining no-mixed-`QK` latency was still large enough that
+  resident `AV` was clearly worth direct optimization
+
+Immediate implication:
+
+- grouped mixed-`QK` still matters
+- but it is no longer the only sensible mainline
+- it is now justified to optimize resident `AV` directly
+
+### First resident-AV optimization checkpoint
+
+We then implemented a same-head adjacent-dim fast path in the `AV` kernel.
+
+Result:
+
+- the optimization improved end-to-end latency with mixed-`QK` enabled
+- it also improved latency when mixed-`QK` was disabled
+
+Immediate implication:
+
+- the `AV` gain is real and independent
+- resident `AV` should remain an active optimization branch rather than only a
+  secondary concern
+
+Updated near-term order:
+
+1. keep:
+   - `ktile8float` for grouped mixed-`QK`
+   - same-head adjacent-dim fast path for resident `AV`
+2. continue exploring resident `AV` structure next
+3. only then decide whether the next stronger lever is:
+   - more `AV` kernel restructuring
+   - or a return to grouped mixed-`QK`
+
+### Resident-AV weight-tile checkpoint
+
+We next pushed one step deeper into the resident-`AV` kernel.
+
+What changed:
+
+- for same-head adjacent-dim output pairs, stage `8` consecutive attention
+  weights together in WRAM
+- keep the earlier paired-`V` reuse path on top of that
+
+Important reset:
+
+- the first implementation of this idea produced faster numbers
+- but those numbers were invalid because the staged weight path broke aligned
+  packed-weight decoding
+- the tell was `resident_av_shadow_max_abs_diff` jumping to about `2.03`
+
+So the workflow lesson here is:
+
+1. do not trust a faster `AV` result unless the resident-`AV` shadow diff stays
+   near the earlier tolerance
+2. keep the invalid first `avweighttile8` run only as a debugging note, not as
+   an optimization result
+
+We then fixed the bug by:
+
+- reading aligned packed `uint64` weight pairs from MRAM
+- unpacking the needed `fp32` weights in WRAM
+- preserving the original logical index semantics
+
+Corrected result:
+
+- mixed-`QK` + aligned `avweighttile8`:
+  - `avg_latency = 1.7764 s`
+  - `avg_tpot = 1.5986 s`
+- no mixed-`QK` + aligned `avweighttile8`:
+  - `avg_latency = 1.6168 s`
+  - `avg_tpot = 1.4386 s`
+- resident-`AV` shadow diff returned to the earlier small-tolerance regime
+
+Immediate implication:
+
+- the underlying direction is still valid after the bug fix
+- staged weight reuse is a real resident-`AV` lever, not just a measurement
+  artifact
+- but every deeper resident-`AV` kernel change now needs explicit shadow-diff
+  scrutiny because silent layout bugs are easy to introduce
+
+Updated near-term order:
+
+1. keep:
+   - grouped mixed-`QK` `ktile8float`
+   - resident-`AV` pair-dim fast path
+   - aligned resident-`AV` `weight_tile[8]`
+2. continue with the next resident-`AV` structural step:
+   - reduce repeated `V`-side MRAM traffic further
+   - or change tasklet/output ownership to improve reuse
+3. only after that, decide whether the next stronger lever is:
+   - more resident-`AV` kernel restructuring
+   - or switching back to grouped mixed-`QK`
+
+### Resident-AV pair-block checkpoint
+
+We also tried a more aggressive resident-`AV` restructuring step:
+
+- let one tasklet compute a small same-head block of output pairs together
+- reuse one weight row across more output dims than the earlier pair-dim path
+
+What we hoped:
+
+- move from “reuse weight for 2 dims” toward “reuse weight for a small dim
+  block”
+- create a more natural next step toward deeper `V`-side reuse
+
+Result:
+
+- correctness still passed
+- but small-trace performance regressed materially:
+  - `avg_latency = 1.8621 s`
+
+Immediate implication:
+
+- this direction increases per-tasklet work too much in the current kernel
+  structure
+- the extra same-head reuse did not compensate for the lost granularity /
+  parallel balance
+
+Decision:
+
+- do not keep this pair-block kernel in the active code path
+- record it as a useful negative result and revert to the aligned
+  `weight_tile[8]` baseline
+
+Updated near-term order:
+
+1. keep the current trustworthy resident-`AV` baseline:
+   - pair-dim fast path
+   - aligned `weight_tile[8]`
+2. avoid “one tasklet owns many output pairs” style changes for now
+3. instead, try lighter-weight resident-`AV` improvements:
+   - token-side / `V`-side staging
+   - or reduced per-token `V` unpack overhead without enlarging output blocks
+
+### Resident-AV pair-block-2 checkpoint
+
+We then tested a smaller version of that same idea.
+
+What changed:
+
+- instead of one tasklet owning `4` output pairs, let it own only `2`
+- this allows one aligned `16B` `V` read per token for `4` consecutive dims
+- the hope was to keep the extra reuse while avoiding the larger granularity
+  penalty seen in the `pair-block-4` attempt
+
+Result:
+
+- correctness still passed
+- mixed-`QK` small trace was essentially tied with the current best:
+  - `avg_latency = 1.7754 s`
+- but no-mixed-`QK` resident-`AV` attribution regressed:
+  - `avg_latency = 1.6294 s`
+  - compared with the aligned `weight_tile[8]` baseline:
+    - `avg_latency = 1.6168 s`
+
+Immediate implication:
+
+- the tiny mixed-`QK` difference is too small to trust as a real win
+- once mixed-`QK` is removed, the resident-`AV` path itself is slower
+- so this is not a robust resident-`AV` improvement
+
+Decision:
+
+- do not keep `pair-block-2` in the active code path
+- treat both `pair-block-4` and `pair-block-2` as evidence that enlarging
+  output ownership is the wrong local direction for this kernel
+
+Updated near-term order:
+
+1. keep the aligned `weight_tile[8]` resident-`AV` baseline
+2. stop exploring larger output-block ownership for now
+3. focus next on lighter resident-`AV` ideas:
+   - smaller `V` unpack / decode overhead
+   - token-side staging that does not change output granularity
+
+### Resident-AV float-pair read checkpoint
+
+We also tried a very small micro-optimization inside the current same-head
+pair path.
+
+What changed:
+
+- keep the aligned `weight_tile[8]` structure
+- but replace the manual `uint64 -> two fp32` unpack with a direct
+  `float[2]` DMA read for the aligned pair
+
+What we wanted to test:
+
+- whether the current bottleneck still contains a meaningful amount of
+  per-token unpack overhead
+- or whether almost all remaining cost is already in MRAM access / launch
+  structure
+
+Result:
+
+- correctness still passed
+- mixed-`QK` small trace improved slightly:
+  - `avg_latency = 1.7663 s`
+- but no-mixed-`QK` attribution regressed:
+  - `avg_latency = 1.6303 s`
+  - compared with the aligned `weight_tile[8]` baseline:
+    - `avg_latency = 1.6168 s`
+
+Immediate implication:
+
+- this is not a robust resident-`AV` improvement
+- direct float-pair DMA may help one mixed path slightly, but it does not
+  improve the resident-`AV` kernel itself consistently
+
+Decision:
+
+- do not keep this micro-optimization in the active code path
+- treat it as another sign that the remaining problem is more structural than
+  unpack-only
+
+Updated near-term order:
+
+1. keep the aligned `weight_tile[8]` baseline
+2. stop spending time on tiny `V` unpack micro-optimizations for now
+3. move the next effort up one level:
+   - host/helper amortization around resident `AV`
+   - or a more structural kernel/data-layout change rather than local unpack
+
+### Helper-side AV batch push-xfer checkpoint
+
+We then tried the first real helper-side structural optimization for
+resident-`AV`.
+
+What changed:
+
+- inside one `AV_BATCH` launch round, when:
+  - there is at most one item per physical DPU
+  - all items have matching padded weight/context sizes
+  - and the total DPU count is small (`<= 16`)
+- the helper now uses batched UPMEM xfers:
+  - one set-wide push for `runtime_slot_args`
+  - one set-wide push for `av_weights_bits`
+  - one set-wide launch
+  - one set-wide pull for `av_context_bits`
+- instead of doing `copy_to + launch + copy_from` separately for each item
+
+Result:
+
+- mixed-`QK` small trace dropped to:
+  - `avg_latency = 1.1833 s`
+- no-mixed-`QK` small trace dropped to:
+  - `avg_latency = 1.0241 s`
+
+Immediate implication:
+
+- this is the first resident-`AV` optimization in a while that is clearly
+  larger than local measurement noise
+- the main small-trace bottleneck was still helper-side transfer / launch
+  granularity, not only kernel arithmetic
+- moving the optimization one level up was the right decision
+
+Important scope note:
+
+- the fast path is deliberately gated to small DPU counts
+- we should not blindly reuse this exact whole-set launch pattern for
+  `512/1020 DPU` experiments without rethinking the active-set issue
+
+Updated near-term order:
+
+1. keep this helper-side AV batch push-xfer path as the active small-DPU
+   resident-`AV` baseline
+2. re-measure whether mixed-`QK` is now the dominant remaining limiter again
+3. for larger-DPU regimes, design a variant that preserves the same batching
+   idea without forcing a whole-machine launch for tiny rounds
+
+### Mixed-QK helper-batching checkpoint
+
+We tested the most obvious follow-up after the AV helper win:
+apply the same whole-set batched helper pattern to `QK_SLOT_BATCH`.
+
+Result:
+
+- correctness stayed clean
+- but the optimization did not improve the small `4 DPU` trace
+- serial attribution gave:
+  - mixed-`QK`: `1.2104 s`
+  - no mixed-`QK`: `1.0835 s`
+- compared with the previous trustworthy AV-batched baseline:
+  - mixed-`QK`: `1.1653 s`
+  - no mixed-`QK`: `1.0260 s`
+
+Immediate implication:
+
+- the helper-side mixed-`QK` path is not the same kind of bottleneck that
+  resident `AV` was
+- even though the implementation is structurally analogous, the cost center
+  does not move in the same way
+
+Updated direction:
+
+1. keep the current helper-side mixed-`QK` batching code as an experiment
+   checkpoint, not as the promoted baseline
+2. stop prioritizing more "whole-set helper batching" variants for grouped
+   mixed-`QK` in the small-DPU regime
+3. shift the next effort back to mixed-`QK` structure itself:
+   - reduce host-side packing/copy work
+   - revisit grouped-query layout / row staging
+   - or design an active-set launch variant that does not broadcast the whole
+     runner set

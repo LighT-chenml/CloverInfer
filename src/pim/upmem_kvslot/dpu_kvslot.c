@@ -221,23 +221,75 @@ static void run_av_kernel(void)
         uint32_t head_idx1 = 0;
         uint32_t dim_idx1 = 0;
         int has_second = out_idx1 < total_outputs;
+        int same_head_pair = 0;
 
         if (has_second) {
             head_idx1 = out_idx1 / head_dim;
             dim_idx1 = out_idx1 % head_dim;
+            same_head_pair = head_idx1 == head_idx0;
         }
-        for (uint32_t token_idx = 0; token_idx < seq_len; ++token_idx) {
-            uint32_t weight_idx0 = head_idx0 * seq_len + token_idx;
-            uint32_t value_idx0 = ((token_idx * group_heads) + head_idx0) * head_dim + dim_idx0;
-            float weight0 = read_av_weight(weight_idx0);
-            float value0 = read_v_value(&runtime_slot_args, value_idx0);
-            acc0 += weight0 * value0;
-            if (has_second) {
-                uint32_t weight_idx1 = head_idx1 * seq_len + token_idx;
-                uint32_t value_idx1 = ((token_idx * group_heads) + head_idx1) * head_dim + dim_idx1;
-                float weight1 = read_av_weight(weight_idx1);
-                float value1 = read_v_value(&runtime_slot_args, value_idx1);
-                acc1 += weight1 * value1;
+        if (same_head_pair) {
+            uint32_t token_idx = 0;
+            uint32_t weight_row_base = head_idx0 * seq_len;
+            for (; token_idx + 8u <= seq_len; token_idx += 8u) {
+                uint32_t logical_weight_start = weight_row_base + token_idx;
+                uint32_t weight_pair_base = logical_weight_start & ~1u;
+                uint32_t packed_weight_pairs = (logical_weight_start & 1u) == 0 ? 4u : 5u;
+                __dma_aligned uint64_t packed_weight_tile[5];
+                mram_read(&av_weights_bits[weight_pair_base], packed_weight_tile, packed_weight_pairs * sizeof(uint64_t));
+                for (uint32_t tile_offset = 0; tile_offset < 8u; ++tile_offset) {
+                    uint32_t value_idx0 = (((token_idx + tile_offset) * group_heads) + head_idx0) * head_dim + dim_idx0;
+                    uint32_t logical_weight_idx = logical_weight_start + tile_offset;
+                    uint32_t packed_rel_idx = logical_weight_idx - weight_pair_base;
+                    uint64_t packed_weight = packed_weight_tile[packed_rel_idx / 2u];
+                    float weight0 = u32_bits_to_float(
+                        (packed_rel_idx & 1u) == 0 ? (uint32_t)(packed_weight & 0xffffffffu)
+                                                   : (uint32_t)(packed_weight >> 32));
+                    if (runtime_slot_args.dtype_code == KVSLOT_DTYPE_FP32 && (value_idx0 % 2u) == 0) {
+                        uint64_t packed_v = 0;
+                        uint32_t word_idx0 = runtime_slot_args.elem_offset + value_idx0;
+                        mram_read(&v_cache[word_idx0], &packed_v, sizeof(packed_v));
+                        acc0 += weight0 * u32_bits_to_float((uint32_t)(packed_v & 0xffffffffu));
+                        acc1 += weight0 * u32_bits_to_float((uint32_t)(packed_v >> 32));
+                    } else {
+                        float value0 = read_v_value(&runtime_slot_args, value_idx0);
+                        float value1 = read_v_value(&runtime_slot_args, value_idx0 + 1u);
+                        acc0 += weight0 * value0;
+                        acc1 += weight0 * value1;
+                    }
+                }
+            }
+            for (; token_idx < seq_len; ++token_idx) {
+                uint32_t weight_idx0 = head_idx0 * seq_len + token_idx;
+                uint32_t value_idx0 = ((token_idx * group_heads) + head_idx0) * head_dim + dim_idx0;
+                float weight0 = read_av_weight(weight_idx0);
+                if (runtime_slot_args.dtype_code == KVSLOT_DTYPE_FP32 && (value_idx0 % 2u) == 0) {
+                    uint64_t packed_v = 0;
+                    uint32_t word_idx0 = runtime_slot_args.elem_offset + value_idx0;
+                    mram_read(&v_cache[word_idx0], &packed_v, sizeof(packed_v));
+                    acc0 += weight0 * u32_bits_to_float((uint32_t)(packed_v & 0xffffffffu));
+                    acc1 += weight0 * u32_bits_to_float((uint32_t)(packed_v >> 32));
+                } else {
+                    float value0 = read_v_value(&runtime_slot_args, value_idx0);
+                    float value1 = read_v_value(&runtime_slot_args, value_idx0 + 1u);
+                    acc0 += weight0 * value0;
+                    acc1 += weight0 * value1;
+                }
+            }
+        } else {
+            for (uint32_t token_idx = 0; token_idx < seq_len; ++token_idx) {
+                uint32_t weight_idx0 = head_idx0 * seq_len + token_idx;
+                uint32_t value_idx0 = ((token_idx * group_heads) + head_idx0) * head_dim + dim_idx0;
+                float weight0 = read_av_weight(weight_idx0);
+                float value0 = read_v_value(&runtime_slot_args, value_idx0);
+                acc0 += weight0 * value0;
+                if (has_second) {
+                    uint32_t weight_idx1 = head_idx1 * seq_len + token_idx;
+                    uint32_t value_idx1 = ((token_idx * group_heads) + head_idx1) * head_dim + dim_idx1;
+                    float weight1 = read_av_weight(weight_idx1);
+                    float value1 = read_v_value(&runtime_slot_args, value_idx1);
+                    acc1 += weight1 * value1;
+                }
             }
         }
         write_av_context_pair(pair_idx, float_to_u32_bits(acc0), float_to_u32_bits(acc1));
@@ -301,11 +353,39 @@ static void run_qk_slot_kernel(void)
         barrier_wait(&kvslot_barrier);
         for (uint32_t token_offset = tasklet_id; token_offset < window; token_offset += NR_TASKLETS) {
             uint32_t token_idx = seq_len - window + token_offset;
+            uint32_t key_row_base = runtime_slot_args.elem_offset + (((token_idx * group_heads) + local_head_idx) * slot_head_dim);
             float local_sum = 0.0f;
-            for (uint32_t dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
-                uint32_t logical_idx = ((token_idx * group_heads) + local_head_idx) * slot_head_dim + dim_idx;
-                float key_value = read_k_value(&runtime_slot_args, logical_idx);
-                local_sum += qk_slot_query_row[dim_idx] * key_value;
+            if (runtime_slot_args.dtype_code == KVSLOT_DTYPE_FP32 && (key_row_base % 2u) == 0) {
+                uint32_t dim_idx = 0;
+                float k_tile[8];
+                for (; dim_idx + 8u <= head_dim; dim_idx += 8u) {
+                    mram_read(&k_cache[key_row_base + dim_idx], k_tile, sizeof(k_tile));
+                    local_sum += qk_slot_query_row[dim_idx] * k_tile[0];
+                    local_sum += qk_slot_query_row[dim_idx + 1u] * k_tile[1];
+                    local_sum += qk_slot_query_row[dim_idx + 2u] * k_tile[2];
+                    local_sum += qk_slot_query_row[dim_idx + 3u] * k_tile[3];
+                    local_sum += qk_slot_query_row[dim_idx + 4u] * k_tile[4];
+                    local_sum += qk_slot_query_row[dim_idx + 5u] * k_tile[5];
+                    local_sum += qk_slot_query_row[dim_idx + 6u] * k_tile[6];
+                    local_sum += qk_slot_query_row[dim_idx + 7u] * k_tile[7];
+                }
+                if ((slot_head_dim % 2u) == 0) {
+                    for (; dim_idx + 2u <= head_dim; dim_idx += 2u) {
+                        uint64_t packed_k = 0;
+                        mram_read(&k_cache[key_row_base + dim_idx], &packed_k, sizeof(packed_k));
+                        local_sum += qk_slot_query_row[dim_idx] * u32_bits_to_float((uint32_t)(packed_k & 0xffffffffu));
+                        local_sum += qk_slot_query_row[dim_idx + 1u] * u32_bits_to_float((uint32_t)(packed_k >> 32));
+                    }
+                }
+                for (; dim_idx < head_dim; ++dim_idx) {
+                    float key_value = read_k_value(&runtime_slot_args, key_row_base - runtime_slot_args.elem_offset + dim_idx);
+                    local_sum += qk_slot_query_row[dim_idx] * key_value;
+                }
+            } else {
+                for (uint32_t dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
+                    float key_value = read_k_value(&runtime_slot_args, key_row_base - runtime_slot_args.elem_offset + dim_idx);
+                    local_sum += qk_slot_query_row[dim_idx] * key_value;
+                }
             }
             qk_slot_score_local[(size_t)head_row * window + token_offset] = float_to_u32_bits(local_sum);
         }
