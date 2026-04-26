@@ -1,6 +1,7 @@
 #include <dpu.h>
 #include <dpu_management.h>
 #include <inttypes.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,6 +68,7 @@ typedef struct {
     uint32_t physical_dpu_id;
     uint32_t num_heads;
     uint32_t window;
+    uint32_t score_stride;
     uint32_t head_dim;
     uint32_t *local_head_indices;
     float *queries;
@@ -100,6 +102,13 @@ static int execute_batched_av_round(
     av_item_t *items,
     const uint32_t *round_indices,
     uint32_t round_count);
+static av_item_t *find_av_round_item_for_dpu(
+    kvslot_runner_t *runner,
+    av_item_t **items_by_dpu,
+    struct dpu_set_t dpu);
+static int prepare_av_item_header(kvslot_runner_t *runner, uint32_t slot_id, av_item_t *item);
+static int read_av_item_weights(av_item_t *item);
+static int softmax_av_item_scores_inplace(av_item_t *item);
 
 static size_t slot_table_index(uint32_t physical_dpu_id, uint32_t local_slot_id)
 {
@@ -1049,10 +1058,14 @@ static int handle_qk_slot_batch(kvslot_runner_t *runner)
         item->physical_dpu_id = slot_id % runner->nr_dpus;
         item->num_heads = num_heads;
         item->window = window;
+        item->score_stride = (window + 1u) & ~1u;
         item->head_dim = head_dim;
         item->local_head_indices = calloc(num_heads, sizeof(*item->local_head_indices));
         item->queries = calloc((size_t)num_heads * head_dim, sizeof(*item->queries));
-        item->raw_scores = calloc((window > 0 ? window : 1) * num_heads, sizeof(*item->raw_scores));
+        item->raw_scores = calloc(
+            (size_t)(item->score_stride > 0 ? item->score_stride : 1u) * num_heads,
+            sizeof(*item->raw_scores)
+        );
         if (item->local_head_indices == NULL || item->queries == NULL || item->raw_scores == NULL) {
             fprintf(stderr, "Failed to allocate qk slot batch buffers\n");
             rc = 1;
@@ -1149,7 +1162,7 @@ static int handle_qk_slot_batch(kvslot_runner_t *runner)
                 union {
                     uint32_t u;
                     float f;
-                } bits = {.u = item->raw_scores[(size_t)head_idx * item->window + pos]};
+                } bits = {.u = item->raw_scores[(size_t)head_idx * item->score_stride + pos]};
                 if (write_exact(stdout, &bits.f, sizeof(bits.f)) != 0) {
                     fprintf(stderr, "Failed to write qk slot batch score %u:%u:%u\n", idx, head_idx, pos);
                     rc = 1;
@@ -1209,18 +1222,41 @@ static int launch_qk_slot_item_async(const qk_slot_item_t *item)
 
 static int finish_qk_slot_item(qk_slot_item_t *item)
 {
+    size_t score_bytes;
+    size_t aligned_score_bytes;
+    uint32_t *aligned_scores = NULL;
+
     if (item == NULL || !item->ready) {
         return 1;
     }
     DPU_ASSERT(dpu_sync(item->target_dpu));
     if (item->window > 0) {
+        score_bytes = (size_t)item->num_heads * item->score_stride * sizeof(*item->raw_scores);
+        aligned_score_bytes = (score_bytes + 7u) & ~((size_t)7u);
+        if (aligned_score_bytes == score_bytes) {
+            DPU_ASSERT(dpu_copy_from(
+                item->target_dpu,
+                "qk_slot_scores_bits",
+                0,
+                item->raw_scores,
+                score_bytes
+            ));
+            return 0;
+        }
+        aligned_scores = calloc(1, aligned_score_bytes);
+        if (aligned_scores == NULL) {
+            fprintf(stderr, "Failed to allocate aligned qk slot score buffer (%zu bytes)\n", aligned_score_bytes);
+            return 1;
+        }
         DPU_ASSERT(dpu_copy_from(
             item->target_dpu,
             "qk_slot_scores_bits",
             0,
-            item->raw_scores,
-            (size_t)item->num_heads * item->window * sizeof(*item->raw_scores)
+            aligned_scores,
+            aligned_score_bytes
         ));
+        memcpy(item->raw_scores, aligned_scores, score_bytes);
+        free(aligned_scores);
     }
     return 0;
 }
@@ -1250,7 +1286,7 @@ static int can_use_batched_qk_round(
     window = items[round_indices[0]].window;
     head_dim = items[round_indices[0]].head_dim;
     query_bytes = (size_t)num_heads * head_dim * sizeof(float);
-    score_bytes = (size_t)num_heads * window * sizeof(uint32_t);
+    score_bytes = (size_t)num_heads * items[round_indices[0]].score_stride * sizeof(uint32_t);
 
     if ((query_bytes % 8u) != 0 || (score_bytes % 8u) != 0) {
         return 0;
@@ -1334,6 +1370,7 @@ static int execute_batched_qk_round(
     head_index_bytes = (size_t)num_heads * sizeof(uint32_t);
     query_bytes = (size_t)num_heads * head_dim * sizeof(float);
     score_bytes = (size_t)num_heads * window * sizeof(uint32_t);
+    score_bytes = (size_t)num_heads * items[round_indices[0]].score_stride * sizeof(uint32_t);
     memset(&launch_set, 0, sizeof(launch_set));
 
     for (uint32_t pos = 0; pos < round_count; ++pos) {
@@ -1526,7 +1563,7 @@ static void cleanup_av_item(av_item_t *item)
     memset(item, 0, sizeof(*item));
 }
 
-static int prepare_av_item(kvslot_runner_t *runner, uint32_t slot_id, av_item_t *item)
+static int prepare_av_item_header(kvslot_runner_t *runner, uint32_t slot_id, av_item_t *item)
 {
     host_slot_t *slot = NULL;
 
@@ -1562,10 +1599,6 @@ static int prepare_av_item(kvslot_runner_t *runner, uint32_t slot_id, av_item_t 
             fprintf(stderr, "Failed to allocate av weights buffer\n");
             return 1;
         }
-        if (read_exact(stdin, item->weights, item->weight_bytes) != 0) {
-            fprintf(stderr, "Failed to read av weights payload\n");
-            return 1;
-        }
     }
 
     if (item->context_bytes > 0) {
@@ -1591,6 +1624,72 @@ static int prepare_av_item(kvslot_runner_t *runner, uint32_t slot_id, av_item_t 
     item->out.head_dim = slot->head_dim;
     item->out.dtype_code = slot->dtype_code;
     item->ready = 1;
+    return 0;
+}
+
+static int read_av_item_weights(av_item_t *item)
+{
+    if (item == NULL || !item->ready) {
+        return 1;
+    }
+    if (item->weight_bytes == 0) {
+        return 0;
+    }
+    if (read_exact(stdin, item->weights, item->weight_bytes) != 0) {
+        fprintf(stderr, "Failed to read av weights payload\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int softmax_av_item_scores_inplace(av_item_t *item)
+{
+    uint32_t group_heads;
+    uint32_t seq_len;
+
+    if (item == NULL || !item->ready) {
+        return 1;
+    }
+    group_heads = item->slot->group_heads;
+    seq_len = item->slot->seq_len;
+    for (uint32_t head = 0; head < group_heads; ++head) {
+        float row_max;
+        float row_sum = 0.0f;
+        size_t base = (size_t)head * seq_len;
+        if (seq_len == 0) {
+            continue;
+        }
+        row_max = item->weights[base];
+        for (uint32_t pos = 1; pos < seq_len; ++pos) {
+            float value = item->weights[base + pos];
+            if (value > row_max) {
+                row_max = value;
+            }
+        }
+        for (uint32_t pos = 0; pos < seq_len; ++pos) {
+            float exp_value = expf(item->weights[base + pos] - row_max);
+            item->weights[base + pos] = exp_value;
+            row_sum += exp_value;
+        }
+        if (row_sum <= 0.0f) {
+            fprintf(stderr, "Invalid softmax row sum for slot %u head %u\n", item->slot_id, head);
+            return 1;
+        }
+        for (uint32_t pos = 0; pos < seq_len; ++pos) {
+            item->weights[base + pos] /= row_sum;
+        }
+    }
+    return 0;
+}
+
+static int prepare_av_item(kvslot_runner_t *runner, uint32_t slot_id, av_item_t *item)
+{
+    if (prepare_av_item_header(runner, slot_id, item) != 0) {
+        return 1;
+    }
+    if (read_av_item_weights(item) != 0) {
+        return 1;
+    }
     return 0;
 }
 
@@ -1630,11 +1729,13 @@ static int can_use_batched_av_round(
 {
     size_t padded_weight_bytes;
     size_t padded_context_bytes;
+    uint32_t active_rank_count = 0;
+    uint8_t *rank_used = NULL;
 
     if (runner == NULL || items == NULL || round_indices == NULL || round_count <= 1) {
         return 0;
     }
-    if (runner->nr_dpus > 16u) {
+    if (runner->nr_ranks == 0 || runner->physical_dpu_rank_indices == NULL) {
         return 0;
     }
 
@@ -1645,6 +1746,32 @@ static int can_use_batched_av_round(
         if (!item->ready || item->padded_weight_bytes != padded_weight_bytes || item->padded_context_bytes != padded_context_bytes) {
             return 0;
         }
+    }
+
+    rank_used = calloc(runner->nr_ranks, sizeof(*rank_used));
+    if (rank_used == NULL) {
+        return 0;
+    }
+    for (uint32_t pos = 0; pos < round_count; ++pos) {
+        av_item_t *item = &items[round_indices[pos]];
+        uint32_t rank_idx;
+        if (item->physical_dpu_id >= runner->nr_dpus) {
+            free(rank_used);
+            return 0;
+        }
+        rank_idx = runner->physical_dpu_rank_indices[item->physical_dpu_id];
+        if (rank_idx >= runner->nr_ranks) {
+            free(rank_used);
+            return 0;
+        }
+        if (!rank_used[rank_idx]) {
+            rank_used[rank_idx] = 1;
+            active_rank_count += 1;
+        }
+    }
+    free(rank_used);
+    if (active_rank_count > KVSLOT_QK_MAX_ACTIVE_DPUS) {
+        return 0;
     }
     return 1;
 }
@@ -1662,8 +1789,11 @@ static int execute_batched_av_round(
     size_t padded_weight_bytes;
     size_t padded_context_bytes;
     uint32_t kernel_command = KVSLOT_KERNEL_AV;
+    uint32_t active_rank_count = 0;
+    uint8_t *rank_used = NULL;
+    struct dpu_rank_t **active_ranks = NULL;
+    struct dpu_set_t launch_set;
     struct dpu_set_t dpu;
-    uint32_t each_dpu = 0;
 
     if (!can_use_batched_av_round(runner, items, round_indices, round_count)) {
         return 1;
@@ -1677,6 +1807,7 @@ static int execute_batched_av_round(
     memset(&zero_runtime_args, 0, sizeof(zero_runtime_args));
     padded_weight_bytes = items[round_indices[0]].padded_weight_bytes;
     padded_context_bytes = items[round_indices[0]].padded_context_bytes;
+    memset(&launch_set, 0, sizeof(launch_set));
 
     for (uint32_t pos = 0; pos < round_count; ++pos) {
         av_item_t *item = &items[round_indices[pos]];
@@ -1688,10 +1819,46 @@ static int execute_batched_av_round(
         items_by_dpu[item->physical_dpu_id] = item;
     }
 
+    rank_used = calloc(runner->nr_ranks, sizeof(*rank_used));
+    if (rank_used == NULL) {
+        fprintf(stderr, "Failed to allocate batched av rank mask\n");
+        free(items_by_dpu);
+        return 1;
+    }
+    for (uint32_t pos = 0; pos < round_count; ++pos) {
+        uint32_t rank_idx = runner->physical_dpu_rank_indices[items[round_indices[pos]].physical_dpu_id];
+        if (!rank_used[rank_idx]) {
+            rank_used[rank_idx] = 1;
+            active_rank_count += 1;
+        }
+    }
+    active_ranks = calloc(active_rank_count > 0 ? active_rank_count : 1u, sizeof(*active_ranks));
+    if (active_ranks == NULL) {
+        fprintf(stderr, "Failed to allocate batched av active ranks\n");
+        free(rank_used);
+        free(items_by_dpu);
+        return 1;
+    }
+    if (active_rank_count == runner->nr_ranks) {
+        launch_set = runner->dpu_set;
+    } else {
+        uint32_t out_rank = 0;
+        for (uint32_t rank_idx = 0; rank_idx < runner->nr_ranks; ++rank_idx) {
+            if (rank_used[rank_idx]) {
+                active_ranks[out_rank++] = runner->ranks[rank_idx];
+            }
+        }
+        launch_set.kind = DPU_SET_RANKS;
+        launch_set.list.nr_ranks = active_rank_count;
+        launch_set.list.ranks = active_ranks;
+    }
+
     if (padded_weight_bytes > 0) {
         dummy_weights = calloc(1, padded_weight_bytes);
         if (dummy_weights == NULL) {
             fprintf(stderr, "Failed to allocate batched av dummy weights\n");
+            free(active_ranks);
+            free(rank_used);
             free(items_by_dpu);
             return 1;
         }
@@ -1700,20 +1867,22 @@ static int execute_batched_av_round(
         dummy_context = calloc(1, padded_context_bytes);
         if (dummy_context == NULL) {
             fprintf(stderr, "Failed to allocate batched av dummy context\n");
+            free(active_ranks);
+            free(rank_used);
             free(dummy_weights);
             free(items_by_dpu);
             return 1;
         }
     }
 
-    DPU_ASSERT(dpu_broadcast_to(runner->dpu_set, "kvslot_kernel_command", 0, &kernel_command, sizeof(kernel_command), DPU_XFER_DEFAULT));
+    DPU_ASSERT(dpu_broadcast_to(launch_set, "kvslot_kernel_command", 0, &kernel_command, sizeof(kernel_command), DPU_XFER_DEFAULT));
 
-    DPU_FOREACH(runner->dpu_set, dpu, each_dpu) {
-        av_item_t *item = items_by_dpu[each_dpu];
+    DPU_FOREACH(launch_set, dpu) {
+        av_item_t *item = find_av_round_item_for_dpu(runner, items_by_dpu, dpu);
         DPU_ASSERT(dpu_prepare_xfer(dpu, item != NULL ? (void *)&item->runtime_args : (void *)&zero_runtime_args));
     }
     DPU_ASSERT(dpu_push_xfer(
-        runner->dpu_set,
+        launch_set,
         DPU_XFER_TO_DPU,
         "runtime_slot_args",
         0,
@@ -1721,12 +1890,12 @@ static int execute_batched_av_round(
         DPU_XFER_DEFAULT));
 
     if (padded_weight_bytes > 0) {
-        DPU_FOREACH(runner->dpu_set, dpu, each_dpu) {
-            av_item_t *item = items_by_dpu[each_dpu];
+        DPU_FOREACH(launch_set, dpu) {
+            av_item_t *item = find_av_round_item_for_dpu(runner, items_by_dpu, dpu);
             DPU_ASSERT(dpu_prepare_xfer(dpu, item != NULL ? (void *)item->weights : (void *)dummy_weights));
         }
         DPU_ASSERT(dpu_push_xfer(
-            runner->dpu_set,
+            launch_set,
             DPU_XFER_TO_DPU,
             "av_weights_bits",
             0,
@@ -1734,15 +1903,15 @@ static int execute_batched_av_round(
             DPU_XFER_DEFAULT));
     }
 
-    DPU_ASSERT(dpu_launch(runner->dpu_set, DPU_SYNCHRONOUS));
+    DPU_ASSERT(dpu_launch(launch_set, DPU_SYNCHRONOUS));
 
     if (padded_context_bytes > 0) {
-        DPU_FOREACH(runner->dpu_set, dpu, each_dpu) {
-            av_item_t *item = items_by_dpu[each_dpu];
+        DPU_FOREACH(launch_set, dpu) {
+            av_item_t *item = find_av_round_item_for_dpu(runner, items_by_dpu, dpu);
             DPU_ASSERT(dpu_prepare_xfer(dpu, item != NULL ? (void *)item->context : (void *)dummy_context));
         }
         DPU_ASSERT(dpu_push_xfer(
-            runner->dpu_set,
+            launch_set,
             DPU_XFER_FROM_DPU,
             "av_context_bits",
             0,
@@ -1750,10 +1919,36 @@ static int execute_batched_av_round(
             DPU_XFER_DEFAULT));
     }
 
+    free(active_ranks);
+    free(rank_used);
     free(dummy_context);
     free(dummy_weights);
     free(items_by_dpu);
     return 0;
+}
+
+static av_item_t *find_av_round_item_for_dpu(
+    kvslot_runner_t *runner,
+    av_item_t **items_by_dpu,
+    struct dpu_set_t dpu)
+{
+    struct dpu_t *target_ptr;
+    if (runner == NULL || items_by_dpu == NULL || runner->physical_dpus == NULL) {
+        return NULL;
+    }
+    target_ptr = dpu_from_set(dpu);
+    if (target_ptr == NULL) {
+        return NULL;
+    }
+    for (uint32_t physical_dpu_id = 0; physical_dpu_id < runner->nr_dpus; ++physical_dpu_id) {
+        if (items_by_dpu[physical_dpu_id] == NULL) {
+            continue;
+        }
+        if (dpu_from_set(runner->physical_dpus[physical_dpu_id]) == target_ptr) {
+            return items_by_dpu[physical_dpu_id];
+        }
+    }
+    return NULL;
 }
 
 static int write_av_item_response(const av_item_t *item)
@@ -1911,6 +2106,138 @@ cleanup:
     return rc;
 }
 
+static int handle_softmax_av_batch(kvslot_runner_t *runner)
+{
+    kvslot_av_batch_args_t args;
+    av_item_t *items = NULL;
+    uint8_t *processed = NULL;
+    uint8_t *used_dpus = NULL;
+    uint32_t processed_count = 0;
+    int rc = 0;
+
+    if (read_exact(stdin, &args, sizeof(args)) != 0) {
+        fprintf(stderr, "Failed to read softmax av batch args\n");
+        return 1;
+    }
+    if (args.num_slots == 0 || args.num_slots > KVSLOT_MAX_HEADS) {
+        fprintf(stderr, "Invalid softmax av batch num_slots=%u\n", args.num_slots);
+        return 1;
+    }
+
+    items = calloc(args.num_slots, sizeof(*items));
+    processed = calloc(args.num_slots, sizeof(*processed));
+    used_dpus = calloc(runner->nr_dpus, sizeof(*used_dpus));
+    if (items == NULL || processed == NULL || used_dpus == NULL) {
+        fprintf(stderr, "Failed to allocate softmax av batch state\n");
+        rc = 1;
+        goto cleanup;
+    }
+
+    for (uint32_t idx = 0; idx < args.num_slots; ++idx) {
+        kvslot_io_header_t header;
+        if (read_exact(stdin, &header, sizeof(header)) != 0) {
+            fprintf(stderr, "Failed to read softmax av batch item header %u\n", idx);
+            rc = 1;
+            goto cleanup;
+        }
+        if (header.magic != KVSLOT_MAGIC || header.command != KVSLOT_CMD_SOFTMAX_AV_BATCH) {
+            fprintf(stderr, "Invalid softmax av batch item header %u\n", idx);
+            rc = 1;
+            goto cleanup;
+        }
+        if (prepare_av_item_header(runner, header.slot_id, &items[idx]) != 0) {
+            fprintf(stderr, "Failed to prepare softmax av batch item %u\n", idx);
+            rc = 1;
+            goto cleanup;
+        }
+        if (read_av_item_weights(&items[idx]) != 0) {
+            fprintf(stderr, "Failed to read softmax av batch scores %u\n", idx);
+            rc = 1;
+            goto cleanup;
+        }
+        if (softmax_av_item_scores_inplace(&items[idx]) != 0) {
+            fprintf(stderr, "Failed to softmax softmax av batch item %u\n", idx);
+            rc = 1;
+            goto cleanup;
+        }
+    }
+
+    while (processed_count < args.num_slots && rc == 0) {
+        uint32_t round_indices[KVSLOT_MAX_HEADS];
+        uint32_t round_count = 0;
+
+        memset(used_dpus, 0, runner->nr_dpus * sizeof(*used_dpus));
+        for (uint32_t idx = 0; idx < args.num_slots; ++idx) {
+            if (processed[idx]) {
+                continue;
+            }
+            if (used_dpus[items[idx].physical_dpu_id]) {
+                continue;
+            }
+            used_dpus[items[idx].physical_dpu_id] = 1;
+            round_indices[round_count++] = idx;
+        }
+        if (round_count == 0) {
+            fprintf(stderr, "Failed to build softmax av batch launch round\n");
+            rc = 1;
+            break;
+        }
+
+        if (can_use_batched_av_round(runner, items, round_indices, round_count)) {
+            if (execute_batched_av_round(runner, items, round_indices, round_count) != 0) {
+                fprintf(stderr, "Failed to execute batched softmax av round\n");
+                rc = 1;
+            }
+        } else {
+            for (uint32_t pos = 0; pos < round_count; ++pos) {
+                if (launch_av_item_async(&items[round_indices[pos]]) != 0) {
+                    fprintf(stderr, "Failed to launch softmax av batch item %u\n", round_indices[pos]);
+                    rc = 1;
+                    break;
+                }
+            }
+            for (uint32_t pos = 0; pos < round_count && rc == 0; ++pos) {
+                if (finish_av_item(&items[round_indices[pos]]) != 0) {
+                    fprintf(stderr, "Failed to finish softmax av batch item %u\n", round_indices[pos]);
+                    rc = 1;
+                    break;
+                }
+            }
+        }
+        for (uint32_t pos = 0; pos < round_count && rc == 0; ++pos) {
+            processed[round_indices[pos]] = 1;
+            processed_count += 1;
+        }
+    }
+
+    if (rc == 0 && write_exact(stdout, &args, sizeof(args)) != 0) {
+        fprintf(stderr, "Failed to write softmax av batch response header\n");
+        rc = 1;
+    }
+    for (uint32_t idx = 0; idx < args.num_slots && rc == 0; ++idx) {
+        if (write_av_item_response(&items[idx]) != 0) {
+            fprintf(stderr, "Failed to write softmax av batch item %u\n", idx);
+            rc = 1;
+            break;
+        }
+    }
+    if (rc == 0 && flush_exact(stdout) != 0) {
+        fprintf(stderr, "Failed to flush softmax av batch response\n");
+        rc = 1;
+    }
+
+cleanup:
+    if (items != NULL) {
+        for (uint32_t idx = 0; idx < args.num_slots; ++idx) {
+            cleanup_av_item(&items[idx]);
+        }
+    }
+    free(items);
+    free(processed);
+    free(used_dpus);
+    return rc;
+}
+
 static int run_stdio_mode(uint32_t requested_dpus)
 {
     kvslot_runner_t runner;
@@ -1953,6 +2280,8 @@ static int run_stdio_mode(uint32_t requested_dpus)
             rc = handle_av_batch(&runner);
         } else if (header.command == KVSLOT_CMD_QK_SLOT_BATCH) {
             rc = handle_qk_slot_batch(&runner);
+        } else if (header.command == KVSLOT_CMD_SOFTMAX_AV_BATCH) {
+            rc = handle_softmax_av_batch(&runner);
         } else {
             fprintf(stderr, "Unknown kvslot command %u\n", header.command);
             rc = 1;

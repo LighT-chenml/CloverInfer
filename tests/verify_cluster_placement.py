@@ -23,6 +23,14 @@ def parse_args():
     parser.add_argument("--attention-backend", default="cpu", choices=["cpu", "pim_naive"])
     parser.add_argument("--pim-num-dpus", type=int, default=4)
     parser.add_argument("--pim-resident-store-backend", default="host", choices=["host", "upmem_kvslot"])
+    parser.add_argument("--pim-qk-full-enabled", action="store_true")
+    parser.add_argument("--no-pim-qk-full-enabled", action="store_true")
+    parser.add_argument("--pim-qk-full-shadow-check", action="store_true")
+    parser.add_argument("--no-pim-qk-full-shadow-check", action="store_true")
+    parser.add_argument("--pim-softmax-av-fused-enabled", action="store_true")
+    parser.add_argument("--no-pim-softmax-av-fused-enabled", action="store_true")
+    parser.add_argument("--pim-softmax-av-shadow-check", action="store_true")
+    parser.add_argument("--no-pim-softmax-av-shadow-check", action="store_true")
     parser.add_argument("--pim-qk-mixed-enabled", action="store_true")
     parser.add_argument("--no-pim-qk-mixed-enabled", action="store_true")
     parser.add_argument("--pim-qk-mixed-heads", type=int, default=2)
@@ -30,6 +38,7 @@ def parse_args():
     parser.add_argument("--pim-length", type=int, default=128)
     parser.add_argument("--decode-step-sync-window-s", type=float, default=0.0)
     parser.add_argument("--decode-step-sync-max-size", type=int, default=8)
+    parser.add_argument("--attention-decode-wave-persist-enabled", action="store_true")
     parser.add_argument("--attention-layer-barrier-window-s", type=float, default=0.0)
     parser.add_argument("--attention-layer-barrier-max-size", type=int, default=8)
     parser.add_argument("--attention-rpc-batch-window-s", type=float, default=0.001)
@@ -44,11 +53,35 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.pim_qk_full_enabled and args.no_pim_qk_full_enabled:
+        raise ValueError("cannot set both --pim-qk-full-enabled and --no-pim-qk-full-enabled")
+    if args.pim_qk_full_shadow_check and args.no_pim_qk_full_shadow_check:
+        raise ValueError("cannot set both --pim-qk-full-shadow-check and --no-pim-qk-full-shadow-check")
+    if args.pim_softmax_av_fused_enabled and args.no_pim_softmax_av_fused_enabled:
+        raise ValueError("cannot set both --pim-softmax-av-fused-enabled and --no-pim-softmax-av-fused-enabled")
+    if args.pim_softmax_av_shadow_check and args.no_pim_softmax_av_shadow_check:
+        raise ValueError("cannot set both --pim-softmax-av-shadow-check and --no-pim-softmax-av-shadow-check")
     pim_qk_mixed_enabled = True
     if args.pim_qk_mixed_enabled:
         pim_qk_mixed_enabled = True
     if args.no_pim_qk_mixed_enabled:
         pim_qk_mixed_enabled = False
+    pim_qk_full_enabled = False
+    if args.pim_qk_full_enabled:
+        pim_qk_full_enabled = True
+    if args.no_pim_qk_full_enabled:
+        pim_qk_full_enabled = False
+    pim_qk_full_shadow_check = True
+    if args.no_pim_qk_full_shadow_check:
+        pim_qk_full_shadow_check = False
+    pim_softmax_av_fused_enabled = False
+    if args.pim_softmax_av_fused_enabled:
+        pim_softmax_av_fused_enabled = True
+    if args.no_pim_softmax_av_fused_enabled:
+        pim_softmax_av_fused_enabled = False
+    pim_softmax_av_shadow_check = True
+    if args.no_pim_softmax_av_shadow_check:
+        pim_softmax_av_shadow_check = False
 
     ray.init(
         address=args.address,
@@ -67,12 +100,17 @@ def main():
         attention_backend=args.attention_backend,
         pim_num_dpus=args.pim_num_dpus,
         pim_resident_store_backend=args.pim_resident_store_backend,
+        pim_qk_full_enabled=pim_qk_full_enabled,
+        pim_qk_full_shadow_check=pim_qk_full_shadow_check,
+        pim_softmax_av_fused_enabled=pim_softmax_av_fused_enabled,
+        pim_softmax_av_shadow_check=pim_softmax_av_shadow_check,
         pim_qk_mixed_enabled=pim_qk_mixed_enabled,
         pim_qk_mixed_heads=args.pim_qk_mixed_heads,
         pim_qk_mixed_window=args.pim_qk_mixed_window,
         pim_length=args.pim_length,
         decode_step_sync_window_s=args.decode_step_sync_window_s,
         decode_step_sync_max_size=args.decode_step_sync_max_size,
+        attention_decode_wave_persist_enabled=args.attention_decode_wave_persist_enabled,
         attention_layer_barrier_window_s=args.attention_layer_barrier_window_s,
         attention_layer_barrier_max_size=args.attention_layer_barrier_max_size,
         attention_rpc_batch_window_s=args.attention_rpc_batch_window_s,
@@ -98,6 +136,10 @@ def main():
         assert debug["num_dpus"] == args.pim_num_dpus, debug
         assert debug["length"] == args.pim_length, debug
         assert debug["resident_store_backend"] == args.pim_resident_store_backend, debug
+        assert debug["qk_full_enabled"] == pim_qk_full_enabled, debug
+        assert debug["qk_full_shadow_check"] == pim_qk_full_shadow_check, debug
+        assert debug["softmax_av_fused_enabled"] == pim_softmax_av_fused_enabled, debug
+        assert debug["softmax_av_shadow_check"] == pim_softmax_av_shadow_check, debug
         assert debug["qk_mixed_enabled"] == pim_qk_mixed_enabled, debug
         assert debug["qk_mixed_heads"] == args.pim_qk_mixed_heads, debug
         assert debug["qk_mixed_window"] == args.pim_qk_mixed_window, debug
@@ -123,7 +165,10 @@ def main():
         if args.attention_backend == "pim_naive":
             debug = metrics["attention_backend"]["backend_debug"]
             assert debug["resident_append_ops"] > 0, debug
-            if debug.get("resident_av_enabled", False):
+            if pim_softmax_av_fused_enabled:
+                assert debug["softmax_av_fused_ops"] > 0, debug
+                assert debug["softmax_av_fused_shadow_max_abs_diff"] <= FLOAT_TOL, debug
+            elif debug.get("resident_av_enabled", False):
                 assert debug["resident_av_ops"] > 0, debug
                 assert debug["resident_av_shadow_max_abs_diff"] <= FLOAT_TOL, debug
             else:

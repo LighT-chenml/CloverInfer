@@ -23,6 +23,10 @@ class ClusterConfig(BaseModel):
     attention_backend: str = "cpu"
     pim_num_dpus: int = 4
     pim_resident_store_backend: str = "host"
+    pim_qk_full_enabled: bool = False
+    pim_qk_full_shadow_check: bool = True
+    pim_softmax_av_fused_enabled: bool = False
+    pim_softmax_av_shadow_check: bool = True
     pim_qk_mixed_enabled: bool = True
     pim_qk_mixed_heads: int = 2
     pim_qk_mixed_window: int = 128
@@ -33,6 +37,7 @@ class ClusterConfig(BaseModel):
     pim_resident_kv_dtype: str = "fp32"
     decode_step_sync_window_s: float = 0.0
     decode_step_sync_max_size: int = 8
+    attention_decode_wave_persist_enabled: bool = False
     attention_layer_barrier_window_s: float = 0.0
     attention_layer_barrier_max_size: int = 8
     attention_rpc_batch_window_s: float = 0.001

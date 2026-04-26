@@ -20,7 +20,7 @@ $(DPU_TARGET): dpu_kvslot.c common.h | $(BUILD_DIR)
 	$(DPU_CC) -O2 -DNR_TASKLETS=$(NR_TASKLETS) -I. -o $@ dpu_kvslot.c
 
 $(HOST_TARGET): host_kvslot.c common.h $(DPU_TARGET) | $(BUILD_DIR)
-	$(HOST_CC) -O2 -Wall -Wextra -I. -DDPU_BINARY=\"$(abspath $(DPU_TARGET))\" -o $@ host_kvslot.c $(shell $(PKG_CONFIG) --cflags --libs dpu)
+	$(HOST_CC) -O2 -Wall -Wextra -I. -DDPU_BINARY=\"$(abspath $(DPU_TARGET))\" -o $@ host_kvslot.c $(shell $(PKG_CONFIG) --cflags --libs dpu) -lm
 
 clean:
 	rm -rf $(BUILD_DIR)

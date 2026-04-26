@@ -166,6 +166,10 @@ class PimNaiveAttentionBackend:
         resident_kv_dtype: str = "fp32",
         qk_check_interval: int = 1,
         qk_check_limit: int = 1,
+        qk_full_enabled: bool = False,
+        qk_full_shadow_check: bool = True,
+        softmax_av_fused_enabled: bool = False,
+        softmax_av_shadow_check: bool = True,
         qk_mixed_enabled: bool = True,
         qk_mixed_heads: int = 2,
         qk_mixed_window: int = 128,
@@ -194,6 +198,18 @@ class PimNaiveAttentionBackend:
         self.qk_last_output = ""
         self.qk_shadow_max_abs_diff = 0
         self.qk_shadow_last_scores = []
+        self.qk_full_enabled = bool(qk_full_enabled)
+        self.qk_full_shadow_check = bool(qk_full_shadow_check)
+        self.qk_full_count = 0
+        self.qk_full_batch_calls = 0
+        self.qk_full_shadow_checks = 0
+        self.qk_full_shadow_max_abs_diff = 0.0
+        self.qk_full_shadow_last_max_abs_diff = 0.0
+        self.softmax_av_fused_enabled = bool(softmax_av_fused_enabled)
+        self.softmax_av_shadow_check = bool(softmax_av_shadow_check)
+        self.softmax_av_fused_ops = 0
+        self.softmax_av_fused_batch_calls = 0
+        self.softmax_av_fused_shadow_max_abs_diff = 0.0
         self.qk_mixed_enabled = bool(qk_mixed_enabled)
         self.qk_mixed_heads = max(0, int(qk_mixed_heads))
         self.qk_mixed_window = max(1, int(qk_mixed_window))
@@ -782,7 +798,9 @@ class PimNaiveAttentionBackend:
             values = self.cpu_backend.v_cache[request_id][layer_idx]
 
         q_fp32 = q if q.dtype == torch.float32 and q.is_contiguous() else q.to(torch.float32).contiguous()
-        scores = torch.einsum("hd,lhd->hl", q_fp32, keys.float()) * score_scale
+        scores = None
+        if not (self.resident_compute_enabled and self.qk_full_enabled):
+            scores = torch.einsum("hd,lhd->hl", q_fp32, keys.float()) * score_scale
         return {
             "request_id": request_id,
             "request_state": request_state,
@@ -795,6 +813,63 @@ class PimNaiveAttentionBackend:
             "score_scale": score_scale,
             "use_resident_av": use_resident_av,
         }
+
+    def _compute_host_scores(self, record: Dict[str, object]) -> torch.Tensor:
+        return torch.einsum(
+            "hd,lhd->hl",
+            record["q_fp32"],
+            self.cpu_backend.k_cache[record["request_id"]][record["layer_idx"]].float(),
+        ) * float(record["score_scale"])
+
+    def _apply_qk_full_batch(self, records: List[Dict[str, object]]) -> None:
+        if not self.qk_full_enabled:
+            self.qk_full_shadow_last_max_abs_diff = 0.0
+            return
+
+        flat_slot_queries: list[tuple[str, str, list[int], int, torch.Tensor]] = []
+        slot_query_refs: list[tuple[Dict[str, object], int, int]] = []
+
+        for record in records:
+            layer_state = record["request_state"].layer_states[record["layer_idx"]]
+            record["full_qk_group_scores"] = []
+            for group in layer_state.head_groups:
+                flat_slot_queries.append(
+                    (
+                        group.k_slot,
+                        group.v_slot,
+                        list(range(group.group_heads)),
+                        int(group.seq_len),
+                        record["q_fp32"][group.head_start:group.head_end].contiguous(),
+                    )
+                )
+                slot_query_refs.append((record, int(group.head_start), int(group.head_end)))
+
+        if flat_slot_queries:
+            slot_score_mats = self.resident_store.qk_slot_scores_batch(flat_slot_queries)
+            self.qk_batch_calls += 1
+            self.qk_full_batch_calls += 1
+            for (record, head_start, head_end), score_mat in zip(slot_query_refs, slot_score_mats):
+                record["full_qk_group_scores"].append((head_start, head_end, score_mat))
+
+        self.qk_full_shadow_last_max_abs_diff = 0.0
+        for record in records:
+            group_scores = sorted(record.pop("full_qk_group_scores", []), key=lambda item: item[0])
+            if not group_scores:
+                if record["scores"] is None:
+                    record["scores"] = self._compute_host_scores(record)
+                continue
+
+            scores = torch.cat([score_mat for _, _, score_mat in group_scores], dim=0).to(torch.float32)
+            scores = scores * float(record["score_scale"])
+            record["scores"] = scores
+            self.qk_full_count += int(scores.shape[0])
+
+            if self.qk_full_shadow_check:
+                host_scores = self._compute_host_scores(record)
+                diff = float(torch.max(torch.abs(scores - host_scores)).item()) if scores.numel() > 0 else 0.0
+                self.qk_full_shadow_checks += 1
+                self.qk_full_shadow_last_max_abs_diff = max(self.qk_full_shadow_last_max_abs_diff, diff)
+                self.qk_full_shadow_max_abs_diff = max(self.qk_full_shadow_max_abs_diff, diff)
 
     def _apply_qk_mixed_batch(self, records: List[Dict[str, object]]) -> None:
         if not self.qk_mixed_enabled:
@@ -907,24 +982,58 @@ class PimNaiveAttentionBackend:
         outputs: List[torch.Tensor] = []
         flat_slot_weights: list[tuple[str, str, torch.Tensor]] = []
         slot_weight_refs: list[tuple[int, int]] = []
+        flat_slot_scores: list[tuple[str, str, torch.Tensor]] = []
+        slot_score_refs: list[tuple[int, int]] = []
 
         for record_idx, record in enumerate(records):
-            weights = torch.softmax(record["scores"], dim=-1)
-            record["weights"] = weights
-            if record["use_resident_av"]:
+            use_fused_softmax_av = bool(record["use_resident_av"] and self.softmax_av_fused_enabled)
+            if use_fused_softmax_av:
                 layer_state = record["request_state"].layer_states[record["layer_idx"]]
-                slot_weights = [
+                slot_scores = [
                     (
                         group.k_slot,
                         group.v_slot,
-                        weights[group.head_start:group.head_end, :].contiguous(),
+                        record["scores"][group.head_start:group.head_end, :].contiguous(),
                     )
                     for group in layer_state.head_groups
                 ]
-                flat_slot_weights.extend(slot_weights)
-                slot_weight_refs.append((record_idx, len(slot_weights)))
+                flat_slot_scores.extend(slot_scores)
+                slot_score_refs.append((record_idx, len(slot_scores)))
+                if self.softmax_av_shadow_check:
+                    weights = torch.softmax(record["scores"], dim=-1)
+                    record["weights"] = weights
             else:
-                record["context"] = torch.einsum("hl,lhd->hd", weights, record["values"].float()).to(record["query_dtype"])
+                weights = torch.softmax(record["scores"], dim=-1)
+                record["weights"] = weights
+                if record["use_resident_av"]:
+                    layer_state = record["request_state"].layer_states[record["layer_idx"]]
+                    slot_weights = [
+                        (
+                            group.k_slot,
+                            group.v_slot,
+                            weights[group.head_start:group.head_end, :].contiguous(),
+                        )
+                        for group in layer_state.head_groups
+                    ]
+                    flat_slot_weights.extend(slot_weights)
+                    slot_weight_refs.append((record_idx, len(slot_weights)))
+                else:
+                    record["context"] = torch.einsum("hl,lhd->hd", weights, record["values"].float()).to(record["query_dtype"])
+
+        if flat_slot_scores:
+            group_contexts = self.resident_store.softmax_weighted_value_sum_batch(flat_slot_scores)
+            self.softmax_av_fused_batch_calls += 1
+            offset = 0
+            for record_idx, group_count in slot_score_refs:
+                record = records[record_idx]
+                context = torch.cat(group_contexts[offset : offset + group_count], dim=0).to(record["query_dtype"])
+                offset += group_count
+                if self.softmax_av_shadow_check:
+                    cpu_context = torch.einsum("hl,lhd->hd", record["weights"], record["values"].float()).to(record["query_dtype"])
+                    av_diff = float(torch.max(torch.abs(context.float() - cpu_context.float())).item())
+                    self.softmax_av_fused_shadow_max_abs_diff = max(self.softmax_av_fused_shadow_max_abs_diff, av_diff)
+                self.softmax_av_fused_ops += 1
+                record["context"] = context
 
         if flat_slot_weights:
             group_contexts = self.resident_store.weighted_value_sum_batch(flat_slot_weights)
@@ -952,7 +1061,15 @@ class PimNaiveAttentionBackend:
         self.decode_batch_calls += 1
         self.decode_batch_items += len(items)
         records = [self._prepare_decode_record(item) for item in items]
-        self._apply_qk_mixed_batch(records)
+        if self.qk_full_enabled and self.resident_compute_enabled:
+            self.qk_mixed_last_head_diffs = []
+            self.qk_mixed_last_max_abs_diff = 0.0
+            self.qk_mixed_last_diag = {}
+            self.qk_mixed_last_diag_path = ""
+            self._apply_qk_full_batch(records)
+        else:
+            self.qk_full_shadow_last_max_abs_diff = 0.0
+            self._apply_qk_mixed_batch(records)
         return self._finalize_decode_records(records)
 
     def decode_layer(
@@ -1022,6 +1139,18 @@ class PimNaiveAttentionBackend:
             "qk_last_output": self.qk_last_output,
             "qk_shadow_max_abs_diff": self.qk_shadow_max_abs_diff,
             "qk_shadow_last_scores": self.qk_shadow_last_scores,
+            "qk_full_enabled": self.qk_full_enabled,
+            "qk_full_shadow_check": self.qk_full_shadow_check,
+            "qk_full_count": self.qk_full_count,
+            "qk_full_batch_calls": self.qk_full_batch_calls,
+            "qk_full_shadow_checks": self.qk_full_shadow_checks,
+            "qk_full_shadow_max_abs_diff": self.qk_full_shadow_max_abs_diff,
+            "qk_full_shadow_last_max_abs_diff": self.qk_full_shadow_last_max_abs_diff,
+            "softmax_av_fused_enabled": self.softmax_av_fused_enabled,
+            "softmax_av_shadow_check": self.softmax_av_shadow_check,
+            "softmax_av_fused_ops": self.softmax_av_fused_ops,
+            "softmax_av_fused_batch_calls": self.softmax_av_fused_batch_calls,
+            "softmax_av_fused_shadow_max_abs_diff": self.softmax_av_fused_shadow_max_abs_diff,
             "qk_mixed_enabled": self.qk_mixed_enabled,
             "qk_mixed_heads": self.qk_mixed_heads,
             "qk_mixed_window": self.qk_mixed_window,

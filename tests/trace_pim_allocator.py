@@ -84,6 +84,17 @@ def build_trace_row(
         "resident_av_ops": int(backend_debug.get("resident_av_ops", 0)),
         "resident_av_batch_calls": int(backend_debug.get("resident_av_batch_calls", 0)),
         "resident_av_shadow_max_abs_diff": float(backend_debug.get("resident_av_shadow_max_abs_diff", 0.0)),
+        "qk_full_enabled": bool(backend_debug.get("qk_full_enabled", False)),
+        "qk_full_shadow_check": bool(backend_debug.get("qk_full_shadow_check", False)),
+        "qk_full_count": int(backend_debug.get("qk_full_count", 0)),
+        "qk_full_batch_calls": int(backend_debug.get("qk_full_batch_calls", 0)),
+        "qk_full_shadow_checks": int(backend_debug.get("qk_full_shadow_checks", 0)),
+        "qk_full_shadow_max_abs_diff": float(backend_debug.get("qk_full_shadow_max_abs_diff", 0.0)),
+        "softmax_av_fused_enabled": bool(backend_debug.get("softmax_av_fused_enabled", False)),
+        "softmax_av_shadow_check": bool(backend_debug.get("softmax_av_shadow_check", False)),
+        "softmax_av_fused_ops": int(backend_debug.get("softmax_av_fused_ops", 0)),
+        "softmax_av_fused_batch_calls": int(backend_debug.get("softmax_av_fused_batch_calls", 0)),
+        "softmax_av_fused_shadow_max_abs_diff": float(backend_debug.get("softmax_av_fused_shadow_max_abs_diff", 0.0)),
         "qk_batch_calls": int(backend_debug.get("qk_batch_calls", 0)),
         "decode_batch_calls": int(backend_debug.get("decode_batch_calls", 0)),
         "decode_batch_items": int(backend_debug.get("decode_batch_items", 0)),
@@ -122,12 +133,21 @@ def main():
     parser.add_argument("--pim-dpu-placement-policy", default="rotated", choices=["identity", "rotated"])
     parser.add_argument("--pim-resident-kv-dtype", default="fp32", choices=["fp32", "fp16"])
     parser.add_argument("--pim-resident-store-backend", default="upmem_kvslot", choices=["host", "upmem_kvslot"])
+    parser.add_argument("--pim-qk-full-enabled", action="store_true")
+    parser.add_argument("--no-pim-qk-full-enabled", action="store_true")
+    parser.add_argument("--pim-qk-full-shadow-check", action="store_true")
+    parser.add_argument("--no-pim-qk-full-shadow-check", action="store_true")
+    parser.add_argument("--pim-softmax-av-fused-enabled", action="store_true")
+    parser.add_argument("--no-pim-softmax-av-fused-enabled", action="store_true")
+    parser.add_argument("--pim-softmax-av-shadow-check", action="store_true")
+    parser.add_argument("--no-pim-softmax-av-shadow-check", action="store_true")
     parser.add_argument("--pim-qk-mixed-enabled", action="store_true")
     parser.add_argument("--no-pim-qk-mixed-enabled", action="store_true")
     parser.add_argument("--pim-qk-mixed-heads", type=int, default=2)
     parser.add_argument("--pim-qk-mixed-window", type=int, default=128)
     parser.add_argument("--decode-step-sync-window-s", type=float, default=0.0)
     parser.add_argument("--decode-step-sync-max-size", type=int, default=8)
+    parser.add_argument("--attention-decode-wave-persist-enabled", action="store_true")
     parser.add_argument("--attention-layer-barrier-window-s", type=float, default=0.0)
     parser.add_argument("--attention-layer-barrier-max-size", type=int, default=8)
     parser.add_argument("--attention-rpc-batch-window-s", type=float, default=0.001)
@@ -139,12 +159,36 @@ def main():
 
     if args.pim_qk_mixed_enabled and args.no_pim_qk_mixed_enabled:
         raise ValueError("cannot set both --pim-qk-mixed-enabled and --no-pim-qk-mixed-enabled")
+    if args.pim_qk_full_enabled and args.no_pim_qk_full_enabled:
+        raise ValueError("cannot set both --pim-qk-full-enabled and --no-pim-qk-full-enabled")
+    if args.pim_qk_full_shadow_check and args.no_pim_qk_full_shadow_check:
+        raise ValueError("cannot set both --pim-qk-full-shadow-check and --no-pim-qk-full-shadow-check")
+    if args.pim_softmax_av_fused_enabled and args.no_pim_softmax_av_fused_enabled:
+        raise ValueError("cannot set both --pim-softmax-av-fused-enabled and --no-pim-softmax-av-fused-enabled")
+    if args.pim_softmax_av_shadow_check and args.no_pim_softmax_av_shadow_check:
+        raise ValueError("cannot set both --pim-softmax-av-shadow-check and --no-pim-softmax-av-shadow-check")
 
     pim_qk_mixed_enabled = True
     if args.no_pim_qk_mixed_enabled:
         pim_qk_mixed_enabled = False
     elif args.pim_qk_mixed_enabled:
         pim_qk_mixed_enabled = True
+    pim_qk_full_enabled = False
+    if args.pim_qk_full_enabled:
+        pim_qk_full_enabled = True
+    if args.no_pim_qk_full_enabled:
+        pim_qk_full_enabled = False
+    pim_qk_full_shadow_check = True
+    if args.no_pim_qk_full_shadow_check:
+        pim_qk_full_shadow_check = False
+    pim_softmax_av_fused_enabled = False
+    if args.pim_softmax_av_fused_enabled:
+        pim_softmax_av_fused_enabled = True
+    if args.no_pim_softmax_av_fused_enabled:
+        pim_softmax_av_fused_enabled = False
+    pim_softmax_av_shadow_check = True
+    if args.no_pim_softmax_av_shadow_check:
+        pim_softmax_av_shadow_check = False
 
     prompts = load_prompts(args.data, args.limit)
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
@@ -171,12 +215,17 @@ def main():
         pim_head_grouping_policy=args.pim_head_grouping_policy,
         pim_dpu_placement_policy=args.pim_dpu_placement_policy,
         pim_resident_kv_dtype=args.pim_resident_kv_dtype,
+        pim_qk_full_enabled=pim_qk_full_enabled,
+        pim_qk_full_shadow_check=pim_qk_full_shadow_check,
+        pim_softmax_av_fused_enabled=pim_softmax_av_fused_enabled,
+        pim_softmax_av_shadow_check=pim_softmax_av_shadow_check,
         pim_qk_mixed_enabled=pim_qk_mixed_enabled,
         pim_qk_mixed_heads=args.pim_qk_mixed_heads,
         pim_qk_mixed_window=args.pim_qk_mixed_window,
         pim_length=args.pim_length,
         decode_step_sync_window_s=args.decode_step_sync_window_s,
         decode_step_sync_max_size=args.decode_step_sync_max_size,
+        attention_decode_wave_persist_enabled=args.attention_decode_wave_persist_enabled,
         attention_layer_barrier_window_s=args.attention_layer_barrier_window_s,
         attention_layer_barrier_max_size=args.attention_layer_barrier_max_size,
         attention_rpc_batch_window_s=args.attention_rpc_batch_window_s,

@@ -63,10 +63,14 @@ class GlobalScheduler:
         }
         self.decode_step_sync_window_s = max(0.0, float(cluster_config.decode_step_sync_window_s))
         self.decode_step_sync_max_size = max(1, int(cluster_config.decode_step_sync_max_size))
+        self.attention_decode_wave_persist_enabled = bool(
+            getattr(cluster_config, "attention_decode_wave_persist_enabled", False)
+        )
         self.decode_step_sync_flushes = 0
         self.decode_step_sync_total_items = 0
         self.decode_step_sync_max_observed = 0
-        self._decode_step_sync_batches: dict[int, list[asyncio.Future]] = {}
+        self._decode_step_sync_next_cohort_id = 1
+        self._decode_step_sync_batches: dict[int, list[tuple[asyncio.Future, str]]] = {}
         self._decode_step_sync_tasks: dict[int, asyncio.Task] = {}
         self._inflight_request_count = 0
         self.attention_layer_barrier_window_s = max(
@@ -112,12 +116,26 @@ class GlobalScheduler:
         self._decode_step_sync_tasks.pop(step, None)
         if not batch:
             return
+        group_size = len(batch)
+        cohort = None
+        if self.attention_decode_wave_persist_enabled:
+            cohort_id = f"step{int(step)}_cohort{self._decode_step_sync_next_cohort_id}"
+            self._decode_step_sync_next_cohort_id += 1
+            cohort = {
+                "cohort_id": cohort_id,
+                "group_size": int(group_size),
+            }
         self.decode_step_sync_flushes += 1
-        self.decode_step_sync_total_items += len(batch)
-        self.decode_step_sync_max_observed = max(self.decode_step_sync_max_observed, len(batch))
-        for future in batch:
+        self.decode_step_sync_total_items += group_size
+        self.decode_step_sync_max_observed = max(self.decode_step_sync_max_observed, group_size)
+        for future, request_id in batch:
             if not future.done():
-                future.set_result(True)
+                if cohort is None:
+                    future.set_result(None)
+                else:
+                    result = dict(cohort)
+                    result["request_id"] = request_id
+                    future.set_result(result)
 
     async def _maybe_flush_decode_step_syncs(self):
         target_size = self._decode_step_sync_target_size()
@@ -132,13 +150,19 @@ class GlobalScheduler:
                 task.cancel()
             await self._execute_decode_step_sync(step)
 
-    async def _synchronize_decode_step(self, step: int):
+    async def _synchronize_decode_step(self, step: int, request_id: str):
         if self.decode_step_sync_window_s <= 0:
-            return
+            if not self.attention_decode_wave_persist_enabled:
+                return None
+            return {
+                "cohort_id": f"step{int(step)}_solo",
+                "group_size": 1,
+                "request_id": request_id,
+            }
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         batch = self._decode_step_sync_batches.setdefault(int(step), [])
-        batch.append(future)
+        batch.append((future, request_id))
         target_size = self._decode_step_sync_target_size()
         if len(batch) >= target_size:
             task = self._decode_step_sync_tasks.pop(int(step), None)
@@ -249,13 +273,30 @@ class GlobalScheduler:
                 task.cancel()
             await self._execute_attention_wavefront_key(key)
 
-    async def _batched_attention_decode(self, attention, prepared, decode_step: int):
+    async def _batched_attention_decode(
+        self,
+        attention,
+        prepared,
+        decode_step: int,
+        decode_wave: dict[str, object] | None = None,
+    ):
         loop = asyncio.get_running_loop()
         future = loop.create_future()
-        key = (int(decode_step), int(prepared["layer_idx"]))
+        key: tuple[int, int] | tuple[int, int, str]
+        cohort_size = None
+        if self.attention_decode_wave_persist_enabled and decode_wave is not None:
+            cohort_id = str(decode_wave.get("cohort_id", "default"))
+            if "group_size" in decode_wave:
+                cohort_size = max(1, int(decode_wave["group_size"]))
+            key = (int(decode_step), int(prepared["layer_idx"]), cohort_id)
+        else:
+            key = (int(decode_step), int(prepared["layer_idx"]))
         barrier_group_size = await self._synchronize_attention_layer(key)
         batch = self._attention_wavefront_batches.setdefault(key, [])
         batch.append((prepared, future, attention))
+        if cohort_size is not None:
+            current_expected = self._attention_wavefront_expected_sizes.get(key, 1)
+            self._attention_wavefront_expected_sizes[key] = max(current_expected, cohort_size)
         if barrier_group_size is not None:
             current_expected = self._attention_wavefront_expected_sizes.get(key, 1)
             self._attention_wavefront_expected_sizes[key] = max(current_expected, int(barrier_group_size))
@@ -286,6 +327,10 @@ class GlobalScheduler:
                 "head_grouping_policy": str(self.cluster_config.pim_head_grouping_policy),
                 "dpu_placement_policy": str(self.cluster_config.pim_dpu_placement_policy),
                 "resident_kv_dtype": str(self.cluster_config.pim_resident_kv_dtype),
+                "qk_full_enabled": bool(self.cluster_config.pim_qk_full_enabled),
+                "qk_full_shadow_check": bool(self.cluster_config.pim_qk_full_shadow_check),
+                "softmax_av_fused_enabled": bool(self.cluster_config.pim_softmax_av_fused_enabled),
+                "softmax_av_shadow_check": bool(self.cluster_config.pim_softmax_av_shadow_check),
                 "qk_mixed_enabled": bool(self.cluster_config.pim_qk_mixed_enabled),
                 "qk_mixed_heads": int(self.cluster_config.pim_qk_mixed_heads),
                 "qk_mixed_window": int(self.cluster_config.pim_qk_mixed_window),
@@ -366,7 +411,7 @@ class GlobalScheduler:
                 stage_timing["counts"]["decode_steps"] += 1
                 position = prompt_len + step - 1
                 rpc_started = time.perf_counter()
-                await self._synchronize_decode_step(step)
+                decode_wave = await self._synchronize_decode_step(step, request_id)
                 stage_timing["scheduler"].setdefault("decode_step_sync_wait_s", 0.0)
                 stage_timing["scheduler"]["decode_step_sync_wait_s"] += time.perf_counter() - rpc_started
                 rpc_started = time.perf_counter()
@@ -388,7 +433,12 @@ class GlobalScheduler:
                     )
 
                     rpc_started = time.perf_counter()
-                    attention_result = await self._batched_attention_decode(attention, prepared, step)
+                    attention_result = await self._batched_attention_decode(
+                        attention,
+                        prepared,
+                        step,
+                        decode_wave=decode_wave,
+                    )
                     stage_timing["scheduler"]["attention_decode_rpc_s"] += time.perf_counter() - rpc_started
                     stage_timing["actors"]["attention_decode_compute_s"] += float(
                         attention_result.get("profile", {}).get("compute_s", 0.0)

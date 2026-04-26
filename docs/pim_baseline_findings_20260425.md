@@ -196,6 +196,159 @@ The new most informative real-model comparison set is:
 - `8 DPU + fp32 + balanced + rotated`
 - `8 DPU + fp16 + balanced + rotated`
 
+## Full-QK Phase 1 Bring-Up
+
+Date: 2026-04-26
+
+We pushed the decode-time QK path further inward so that resident-slot batched
+QK is now the primary path behind a config flag:
+
+- `pim_qk_full_enabled = True`
+- `pim_qk_mixed_enabled = False`
+
+This is still not full-PIM attention because:
+
+- softmax remains on the host
+- AV still returns through the existing resident-AV path
+
+but it is the first implementation step where the main decode QK path no
+longer depends on host-side full score construction.
+
+### 9. Single-request cluster correctness
+
+Workload:
+
+- cluster: `.3` prefill GPU, `.4` dense GPU, `.7` attention CPU+UPMEM
+- model: `OPT-125M`
+- `max_new_tokens = 2`
+- `256 DPU`
+
+Observed:
+
+- 3-machine placement check passed
+- generation succeeded
+- `qk_full_shadow_max_abs_diff = 0.0`
+- `resident_av_shadow_max_abs_diff = 0.0`
+
+Interpretation:
+
+- the new full-QK path is correctly wired end-to-end for a small decode check
+
+### 10. Real trace with full-QK primary path
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval8_conc8_tok4_dpu256_fp32_balanced_rotated_stepsync0ms_fullqk_retry1.jsonl`
+
+Workload:
+
+- dataset: `dataset/humaneval.jsonl`
+- model: `OPT-125M`
+- `concurrency = 8`
+- `max_new_tokens = 4`
+- `256 DPU`
+- `fp32` resident KV
+- balanced head grouping
+- rotated placement
+
+Observed:
+
+- `avg_latency ~= 21.54 s`
+- `max_latency ~= 21.71 s`
+- the run completed successfully after the helper alignment fix
+- `qk_full_batch_calls` and `resident_av_batch_calls` both grow normally
+- `qk_full_shadow_max_abs_diff = 16.8175`
+
+Interpretation:
+
+- full-QK is now runnable on a real concurrent trace
+- but the path is not yet numerically trustworthy under realistic batching
+- so this should be treated as a Phase 1 bring-up baseline, not a final
+  correctness baseline
+
+### Helper issue discovered during bring-up
+
+While enabling full-window QK score readback, we hit a helper/runtime bug:
+
+- `invalid mram access (size and offset need to be 8-byte aligned)`
+
+Root cause:
+
+- QK slot-score readback length was not always 8-byte aligned
+- the helper read back `num_heads * window * 4` bytes directly from MRAM
+
+Fix:
+
+- `src/pim/upmem_kvslot/host_kvslot.c` now rounds readback size up to 8-byte
+  alignment and then copies the real payload into the output buffer
+
+Effect:
+
+- the earlier full-QK trace crash is gone
+- the trace now finishes, exposing the remaining numerical-diff issue as the
+  next real blocker
+
+### Root cause of the remaining full-QK diff
+
+We then isolated the correctness gap with a direct helper-level repro on `.7`:
+
+- resident KV append was correct
+- helper batched-vs-single QK was correct before append
+- but after append, the newest token score in `qk_slot` became wrong
+
+Root cause:
+
+- the DPU-side `qk_slot_scores_bits` writeback packed two scores into one
+  64-bit word
+- but each head row still used `window` as its MRAM stride
+- for odd `window`, the final packed write of one head overlapped the start of
+  the next head row
+
+This produced the observed pattern:
+
+- earlier tokens correct
+- newest / last token wrong
+- both single-item and batched helper calls wrong in the same way
+
+### Fix
+
+We fixed `qk_slot` score writeback to use a padded per-head stride:
+
+- `score_stride = round_up_even(window)`
+
+Implementation:
+
+- DPU side:
+  - `src/pim/upmem_kvslot/dpu_kvslot.c`
+- helper side:
+  - `src/pim/upmem_kvslot/host_kvslot.c`
+
+The helper now:
+
+- allocates the padded score buffer
+- reads back the padded layout from MRAM
+- serializes only the real `window` scores back to Python
+
+### 11. Full-QK trace after the stride fix
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval8_conc8_tok4_dpu256_fp32_balanced_rotated_stepsync0ms_fullqk_retry2.jsonl`
+
+Observed:
+
+- `avg_latency ~= 15.61 s`
+- `max_latency ~= 15.65 s`
+- `qk_full_shadow_max_abs_diff = 7.629e-06`
+- `resident_av_shadow_max_abs_diff = 2.441e-04`
+- no failures
+
+Interpretation:
+
+- the full-QK correctness gap is now effectively closed for this trace
+- Phase 1 has moved from "runnable but not numerically validated" to a usable
+  correctness-checked baseline
+
 ## Shared-Owner Scheme 2 Status
 
 We then switched from the earlier dual-helper design to a shared-owner layout:
@@ -2215,3 +2368,324 @@ The next stronger scheduler idea should therefore be:
 
 - keep an explicit active decode wave together across the layer loop
 - instead of independently waiting at each layer key
+
+### 44. Decode-wave persistence checkpoint
+
+We then tried the stronger scheduler variant sketched above:
+
+- decode-step sync now returns a persistent cohort id
+- attention batching is keyed by `(decode_step, layer_idx, cohort_id)`
+- the intended effect was to keep the same decode wave coupled across the full
+  layer loop of one decode step
+
+Trace setup:
+
+- `concurrency = 8`
+- `max_new_tokens = 4`
+- `attention_rpc_batch_window_s = 0.0`
+- `attention_actor_batch_window_s = 0.0`
+- `decode_step_sync_window_s = 5 ms`
+- compare `layer barrier = 5 ms` and `10 ms`
+
+Artifacts:
+
+- wavepersist + barrier `5 ms`:
+  - `artifacts/pim_allocator_trace_opt125m_humaneval8_conc8_tok4_dpu256_fp32_balanced_rotated_wavepersist_stepsync5ms_layerbarrier5ms_target8_attn0_upmemav.jsonl`
+- wavepersist + barrier `10 ms`:
+  - `artifacts/pim_allocator_trace_opt125m_humaneval8_conc8_tok4_dpu256_fp32_balanced_rotated_wavepersist_stepsync5ms_layerbarrier10ms_target8_attn0_upmemav.jsonl`
+
+Observed results:
+
+- wavepersist + barrier `5 ms`:
+  - `avg_latency = 27.0421 s`
+  - `scheduler_attention_batching.max_observed_size = 3`
+  - `scheduler_attention_batching.flushes = 203`
+  - `scheduler_attention_layer_barrier.max_observed_size = 3`
+  - `decode_batch_calls = 203`
+- wavepersist + barrier `10 ms`:
+  - `avg_latency = 23.2994 s`
+  - `scheduler_attention_batching.max_observed_size = 3`
+  - `scheduler_attention_batching.flushes = 168`
+  - `scheduler_attention_layer_barrier.max_observed_size = 3`
+  - `decode_batch_calls = 168`
+
+Comparison versus earlier non-wavepersist runs on the same workload:
+
+- pure short wavefront `5 ms`:
+  - `avg_latency = 23.2235 s`
+  - `max_observed_size = 4`
+  - `flushes = 123`
+- pure long wavefront `10 ms`:
+  - `avg_latency = 23.7549 s`
+  - `max_observed_size = 5`
+  - `flushes = 113`
+- layer barrier `5 ms`:
+  - `avg_latency = 23.1171 s`
+  - `max_observed_size = 4`
+  - `flushes = 150`
+- layer barrier `10 ms`:
+  - `avg_latency = 23.1939 s`
+  - `max_observed_size = 4`
+  - `flushes = 112`
+
+Updated interpretation:
+
+- this decode-wave persistence implementation does not help
+- in fact it regresses both batching quality and latency:
+  - batch size falls from `4` or `5` down to `3`
+  - helper / backend rounds increase sharply
+- the current cohort-id mechanism is therefore not preserving a useful active
+  wave in practice
+- the likely failure mode is over-fragmentation:
+  - once requests diverge across cohorts, later layers inherit that split
+  - the scheduler loses cross-request merge opportunities that the simpler
+    time-window schemes still exploited
+
+Conclusion from this checkpoint:
+
+- we should not keep pushing this particular scheduler-cohort design as the
+  main path forward
+- the scheduler evidence is now good enough:
+  - simple windows can buy larger batches, but only with more waiting
+  - the first structured barrier is latency-competitive, but capped at `4`
+  - the first cohort-persistence design is strictly worse than both
+
+### 45. AV rank-subset batched round checkpoint
+
+We then returned to the compute / transport side and fixed a concrete missing
+fast path in the UPMEM kvslot helper:
+
+- the AV batched round had been effectively disabled for larger DPU counts
+- specifically, `can_use_batched_av_round(...)` returned false when
+  `runner->nr_dpus > 16`
+- on our real setup with `256` DPUs, this meant AV never used the intended
+  batched multi-DPU launch path
+
+What changed:
+
+- keep the same AV batched protocol
+- but launch only on the active rank subset, mirroring the batched QK path
+- this removes the artificial large-DPU disable while avoiding a full-system
+  dummy launch across all provisioned DPUs
+
+Important engineering note:
+
+- the harmful decode-wave persistence scheduler path is now gated behind an
+  explicit config flag and is disabled by default again
+- this restores a clean baseline for performance comparison
+
+Comparison workload:
+
+- `concurrency = 8`
+- `max_new_tokens = 4`
+- `decode_step_sync_window_s = 5 ms`
+- compare pure attention window `5 ms` and `10 ms`
+
+Artifacts:
+
+- pure wavefront `5 ms`, old:
+  - `artifacts/pim_allocator_trace_opt125m_humaneval8_conc8_tok4_dpu256_fp32_balanced_rotated_stepsync5ms_fix_batchtarget8_upmemav.jsonl`
+- pure wavefront `5 ms`, AV rank-subset batched:
+  - `artifacts/pim_allocator_trace_opt125m_humaneval8_conc8_tok4_dpu256_fp32_balanced_rotated_stepsync5ms_fix_batchtarget8_upmemav_avrankbatch.jsonl`
+- pure wavefront `10 ms`, old:
+  - `artifacts/pim_allocator_trace_opt125m_humaneval8_conc8_tok4_dpu256_fp32_balanced_rotated_stepsync5ms_fix_schedbatch10ms_target8_upmemav.jsonl`
+- pure wavefront `10 ms`, AV rank-subset batched:
+  - `artifacts/pim_allocator_trace_opt125m_humaneval8_conc8_tok4_dpu256_fp32_balanced_rotated_stepsync5ms_fix_schedbatch10ms_target8_upmemav_avrankbatch.jsonl`
+
+Observed results:
+
+- pure wavefront `5 ms`:
+  - old: `avg_latency = 23.2235 s`, `max_observed_size = 4`, `flushes = 123`
+  - new: `avg_latency = 21.0997 s`, `max_observed_size = 4`, `flushes = 141`
+  - improvement: `-2.1237 s` (`-9.14%`)
+- pure wavefront `10 ms`:
+  - old: `avg_latency = 23.7549 s`, `max_observed_size = 5`, `flushes = 113`
+  - new: `avg_latency = 20.1384 s`, `max_observed_size = 5`, `flushes = 114`
+  - improvement: `-3.6165 s` (`-15.22%`)
+
+Interpretation:
+
+- batching quality did not improve materially:
+  - the `5 ms` run still peaks at batch size `4`
+  - the `10 ms` run still peaks at batch size `5`
+- yet end-to-end latency improved substantially in both cases
+- this strongly suggests the gain came from cheaper AV execution per batched
+  round on large-DPU configurations, not from scheduler effects
+- this is exactly the kind of optimization signal we wanted:
+  - compute / helper overhead is still a large, real bottleneck
+  - reducing it can buy double-digit latency improvement without needing more
+    aggressive waiting or more complex scheduling
+
+Updated takeaway:
+
+- the current best direction is again clearly compute-side optimization
+- scheduler restructuring remains secondary unless future kernel/runtime
+  improvements make additional batching significantly more valuable
+
+### 46. AV kernel repartition attempts that regressed
+
+After the helper-side AV rank-subset fix landed, we tried to push further on
+the DPU kernel itself by changing the AV tasklet work decomposition.
+
+Attempt A: head-centric fp32 AV kernel
+
+- idea:
+  - assign one tasklet a full attention head
+  - reuse one weight row across all head dimensions inside the tasklet
+- expectation:
+  - eliminate most duplicated weight-row MRAM reads
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval8_conc8_tok4_dpu256_fp32_balanced_rotated_stepsync5ms_fix_schedbatch10ms_target8_upmemav_avrankbatch_avheadkernel.jsonl`
+
+Result:
+
+- correctness still passed
+- but performance collapsed badly:
+  - `avg_latency = 58.3023 s`
+  - versus `20.1384 s` for the previous AV-rank-batched baseline
+
+Interpretation:
+
+- this mapping destroyed effective tasklet utilization
+- with only `12` heads in OPT-125m, the kernel no longer exposed enough
+  parallel work to keep the DPU execution efficient
+
+Attempt B: fp32 AV kernel with `8-dim` output blocks
+
+- idea:
+  - keep more parallel blocks than the head-centric version
+  - still reduce repeated weight-row reads relative to the original
+    `2-dim pair` mapping
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval8_conc8_tok4_dpu256_fp32_balanced_rotated_stepsync5ms_fix_schedbatch10ms_target8_upmemav_avrankbatch_avblock8.jsonl`
+
+Result:
+
+- correctness still passed
+- but performance was still worse than the previous baseline:
+  - `avg_latency = 23.5841 s`
+  - versus `20.1384 s` for the previous AV-rank-batched baseline
+
+Interpretation:
+
+- reducing duplicated weight reads alone is not sufficient here
+- the original per-pair mapping keeps enough parallelism to offset that extra
+  duplication
+- our attempted repartitions traded away too much concurrency / balance for
+  the amount of MRAM-read reduction they achieved
+
+Action taken:
+
+- both experimental AV-kernel repartitions were discarded
+- the repository and `.7` runtime were restored to the previous stable kernel
+  that pairs well with the AV rank-subset helper optimization
+
+Updated lesson:
+
+- for this workload, AV kernel optimization is constrained by a careful
+  balance between:
+  - duplicated weight-row traffic
+  - available tasklet parallelism
+  - per-tasklet workload balance
+- future DPU-kernel work should therefore avoid coarse head-level ownership
+  unless it also introduces a stronger mechanism for within-head parallelism
+
+## Helper-Boundary Fused Softmax+AV Baseline
+
+Date: 2026-04-26
+
+We then moved the attention boundary one step further inward:
+
+- full-QK remains on the resident-slot path
+- host-side softmax is removed from the normal decode path
+- per-slot score matrices are sent to the kvslot helper
+- the helper performs row-wise softmax on CPU and reuses the resident-AV path
+- the backend receives only per-group `context`
+
+This gives us the first stable `context-only return` baseline at the
+Python/backend boundary, even though softmax is still helper-CPU-side rather
+than DPU-kernel-side.
+
+### 47. Three-machine cluster correctness with fused softmax+AV
+
+Workload:
+
+- cluster: `.3` prefill GPU, `.4` dense GPU, `.7` attention CPU+UPMEM
+- model: `OPT-125M`
+- `max_new_tokens = 2`
+- `64 DPU`
+- `pim_qk_full_enabled = True`
+- `pim_qk_mixed_enabled = False`
+- `pim_softmax_av_fused_enabled = True`
+
+Observed:
+
+- placement verification passed
+- end-to-end generation succeeded
+- `qk_full_shadow_max_abs_diff = 0.0`
+- `softmax_av_fused_shadow_max_abs_diff = 4.768e-07`
+- `softmax_av_fused_ops = 12`
+- `softmax_av_fused_batch_calls = 12`
+
+Interpretation:
+
+- the new fused path is correctly wired through the real three-machine cluster
+- from the backend perspective, the host no longer performs softmax in the
+  normal path
+
+### 48. Small concurrent fused trace
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc4_tok2_dpu64_fp32_fullqk_fused.jsonl`
+
+Workload:
+
+- dataset: `dataset/humaneval.jsonl`
+- model: `OPT-125M`
+- first `4` samples
+- `concurrency = 4`
+- `max_new_tokens = 2`
+- `64 DPU`
+- `fp32` resident KV
+- full-QK enabled
+- helper-boundary fused softmax+AV enabled
+
+Observed:
+
+- `avg_latency ~= 3.18 s`
+- `max_latency ~= 3.20 s`
+- `max_usage_ratio = 0.2095`
+- `max_live_slot_count = 8`
+- `max_dpu_allocate_failures = 0`
+- `max_fallback_allocations = 0`
+- `max qk_full_shadow_max_abs_diff = 5.722e-06`
+- `max softmax_av_fused_shadow_max_abs_diff = 6.104e-05`
+
+Interpretation:
+
+- the fused boundary is now stable on a small concurrent real trace
+- the current path is numerically trustworthy enough to use as the next
+  experimental baseline
+- this is a better baseline for future full-PIM work than the earlier
+  `host softmax + resident AV` split path
+
+## Updated Baseline Reading
+
+After this step, the attention baselines are best ordered as:
+
+1. disaggregated CPU attention
+2. resident-KV + host-softmax + resident-AV
+3. resident-KV + full-QK + helper-boundary fused softmax+AV
+
+The new third baseline matters because it isolates the next remaining gap more
+cleanly:
+
+- not backend correctness
+- not host-side softmax structure
+- but the fact that softmax is still helper-CPU-side rather than truly inside
+  the PIM-side kernel/data plane

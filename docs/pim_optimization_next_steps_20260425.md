@@ -258,6 +258,52 @@ The next actions should separate system issues from algorithm issues.
 
 - the attempted `QK active16` launch cap did not help at either `512 DPU` or
   `1020 DPU`
+
+## Full-QK Follow-Up
+
+After the latest bring-up, the near-term priority should be refined further.
+
+What is now true:
+
+- full-QK offload is integrated behind `pim_qk_full_enabled`
+- the path runs end-to-end on the 3-machine cluster
+- a helper-side MRAM alignment bug has been fixed
+- realistic concurrent traces now complete
+
+What is still not true:
+
+- the full-QK path is not yet numerically clean under realistic batching
+- current trace evidence shows `qk_full_shadow_max_abs_diff = 16.8175`
+
+So the immediate next optimization order should now be:
+
+1. close the full-QK correctness gap
+2. only then move on to fused `softmax + AV`
+3. after that, optimize fused full-PIM runtime
+
+### Immediate debugging targets for full-QK
+
+The most likely remaining failure surfaces are:
+
+- grouped slot-query ordering mismatch between request-side head order and
+  helper return order
+- helper batch packing / unpacking bugs in `qk_slot_scores_batch`
+- DPU-side slot-QK semantics when the score window is longer than the earlier
+  mixed-QK validation window
+- dtype / accumulation behavior between host shadow path and helper return path
+
+### Why this matters
+
+If we start Phase 2 before Phase 1 is numerically closed, then:
+
+- fused `softmax + AV` debugging will become ambiguous
+- we will not know whether an output mismatch originates in QK or in the fused
+  softmax/AV logic
+
+So the cleanest next step is:
+
+- instrument and localize the current full-QK diff first
+- keep `qk_full_shadow_check` enabled while doing so
 - treat it as a negative result and do not keep iterating on that specific
   idea first
 
@@ -1294,3 +1340,114 @@ Why this is the right next step now:
 - the current barrier keeps latency lower, but still stalls at batch size `4`
 - the missing ingredient now appears to be cohort persistence through the
   per-layer decode pipeline, not another small tuning of window sizes
+
+### Decode-wave persistence follow-up
+
+We implemented the first decode-wave persistence variant:
+
+- decode-step sync emits a persistent cohort id
+- attention batching is keyed by `(decode_step, layer_idx, cohort_id)`
+- the barrier inherits the expected size from the decode-step cohort
+
+Result on the same `concurrency = 8`, `tok = 4` trace:
+
+- wavepersist + barrier `5 ms`:
+  - `avg_latency = 27.0421 s`
+  - attention / barrier max batch size only `3`
+  - `decode_batch_calls = 203`
+- wavepersist + barrier `10 ms`:
+  - `avg_latency = 23.2994 s`
+  - attention / barrier max batch size only `3`
+  - `decode_batch_calls = 168`
+
+Interpretation:
+
+- this particular scheduler direction is not paying off
+- the cohort id is causing more fragmentation than useful persistence
+- later layers are inheriting split cohorts instead of re-forming large waves
+- compared with the simpler baselines, this is a regression in both achieved
+  batching and helper round count
+
+Updated decision:
+
+- stop investing further in this scheduler-cohort variant for now
+- keep the simpler scheduler mechanisms as the baseline control surface:
+  - plain attention window
+  - optional layer barrier
+- shift optimization effort back to the compute / transport side, where there
+  is still much larger upside
+
+Recommended next implementation order after this checkpoint:
+
+1. reduce per-batch host/helper overhead further
+2. improve the AV/kernel-side work decomposition and transfer granularity
+3. scale experiments across larger DPU counts and larger decode workloads
+4. only revisit stronger scheduler designs if compute-side optimizations make
+   batching clearly valuable again
+
+### AV rank-subset batched round result
+
+We have now validated the first concrete helper-side fix on the real
+`256-DPU` path:
+
+- AV batched execution was previously disabled whenever `nr_dpus > 16`
+- we changed it to use the active rank subset, mirroring the QK batched path
+
+Measured impact on the `concurrency = 8`, `tok = 4` baseline:
+
+- pure wavefront `5 ms`:
+  - `23.2235 s -> 21.0997 s`
+  - about `9.1%` lower average latency
+- pure wavefront `10 ms`:
+  - `23.7549 s -> 20.1384 s`
+  - about `15.2%` lower average latency
+
+Important interpretation:
+
+- achieved batch size stayed essentially the same
+- the improvement therefore came from cheaper per-round AV execution, not from
+  better scheduler batching
+
+Updated priority after this result:
+
+1. continue helper / transport / kernel-side reductions first
+2. focus on places where a fixed batching structure already exists but each
+   round is still too expensive
+3. treat scheduler work as a secondary control knob, not the main optimization
+   lever
+
+### AV kernel repartition follow-up
+
+We also tested two direct AV-kernel repartition ideas after the helper-side
+rank-subset batching win:
+
+1. head-centric fp32 AV ownership
+2. fp32 AV ownership by `8-dim` output block
+
+Both were numerically correct but both regressed latency:
+
+- head-centric version:
+  - catastrophically slower, about `58.3 s` average latency on the `10 ms`
+    wavefront trace
+- `8-dim` block version:
+  - still slower than the stable AV-rank-batched baseline
+  - about `23.58 s` versus `20.14 s`
+
+What this tells us:
+
+- the current AV kernel is not bottlenecked only by duplicated weight-row
+  reads
+- coarse repartitioning can easily lose too much tasklet parallelism
+- for OPT-125m scale head counts, tasklet occupancy / balance matters more
+  than these simple ownership changes
+
+Refined next-step guidance:
+
+1. keep the current stable AV kernel mapping
+2. avoid coarse head-level repartition unless we also design explicit
+   within-head parallel reduction
+3. look next at optimizations that preserve the existing parallel structure:
+   - host-side transfer packing
+   - protocol/header reduction
+   - selective metadata elision
+   - QK-side helper/runtime reductions

@@ -330,6 +330,7 @@ static void run_qk_slot_kernel(void)
     if (num_heads > KVSLOT_MAX_HEADS) {
         num_heads = KVSLOT_MAX_HEADS;
     }
+    uint32_t score_stride = (window + 1u) & ~1u;
 
     for (uint32_t head_row = 0; head_row < num_heads; ++head_row) {
         uint32_t local_head_idx = qk_slot_head_indices[head_row];
@@ -353,39 +354,11 @@ static void run_qk_slot_kernel(void)
         barrier_wait(&kvslot_barrier);
         for (uint32_t token_offset = tasklet_id; token_offset < window; token_offset += NR_TASKLETS) {
             uint32_t token_idx = seq_len - window + token_offset;
-            uint32_t key_row_base = runtime_slot_args.elem_offset + (((token_idx * group_heads) + local_head_idx) * slot_head_dim);
+            uint32_t key_row_base = (((token_idx * group_heads) + local_head_idx) * slot_head_dim);
             float local_sum = 0.0f;
-            if (runtime_slot_args.dtype_code == KVSLOT_DTYPE_FP32 && (key_row_base % 2u) == 0) {
-                uint32_t dim_idx = 0;
-                float k_tile[8];
-                for (; dim_idx + 8u <= head_dim; dim_idx += 8u) {
-                    mram_read(&k_cache[key_row_base + dim_idx], k_tile, sizeof(k_tile));
-                    local_sum += qk_slot_query_row[dim_idx] * k_tile[0];
-                    local_sum += qk_slot_query_row[dim_idx + 1u] * k_tile[1];
-                    local_sum += qk_slot_query_row[dim_idx + 2u] * k_tile[2];
-                    local_sum += qk_slot_query_row[dim_idx + 3u] * k_tile[3];
-                    local_sum += qk_slot_query_row[dim_idx + 4u] * k_tile[4];
-                    local_sum += qk_slot_query_row[dim_idx + 5u] * k_tile[5];
-                    local_sum += qk_slot_query_row[dim_idx + 6u] * k_tile[6];
-                    local_sum += qk_slot_query_row[dim_idx + 7u] * k_tile[7];
-                }
-                if ((slot_head_dim % 2u) == 0) {
-                    for (; dim_idx + 2u <= head_dim; dim_idx += 2u) {
-                        uint64_t packed_k = 0;
-                        mram_read(&k_cache[key_row_base + dim_idx], &packed_k, sizeof(packed_k));
-                        local_sum += qk_slot_query_row[dim_idx] * u32_bits_to_float((uint32_t)(packed_k & 0xffffffffu));
-                        local_sum += qk_slot_query_row[dim_idx + 1u] * u32_bits_to_float((uint32_t)(packed_k >> 32));
-                    }
-                }
-                for (; dim_idx < head_dim; ++dim_idx) {
-                    float key_value = read_k_value(&runtime_slot_args, key_row_base - runtime_slot_args.elem_offset + dim_idx);
-                    local_sum += qk_slot_query_row[dim_idx] * key_value;
-                }
-            } else {
-                for (uint32_t dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
-                    float key_value = read_k_value(&runtime_slot_args, key_row_base - runtime_slot_args.elem_offset + dim_idx);
-                    local_sum += qk_slot_query_row[dim_idx] * key_value;
-                }
+            for (uint32_t dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
+                float key_value = read_k_value(&runtime_slot_args, key_row_base + dim_idx);
+                local_sum += qk_slot_query_row[dim_idx] * key_value;
             }
             qk_slot_score_local[(size_t)head_row * window + token_offset] = float_to_u32_bits(local_sum);
         }
@@ -401,7 +374,7 @@ static void run_qk_slot_kernel(void)
                 uint32_t low_bits = qk_slot_score_local[(size_t)head_row * window + out_idx0];
                 uint32_t high_bits = out_idx1 < window ? qk_slot_score_local[(size_t)head_row * window + out_idx1] : 0u;
                 uint64_t packed = ((uint64_t)high_bits << 32) | (uint64_t)low_bits;
-                mram_write(&packed, &qk_slot_scores_bits[(size_t)head_row * window + out_idx0], sizeof(packed));
+                mram_write(&packed, &qk_slot_scores_bits[(size_t)head_row * score_stride + out_idx0], sizeof(packed));
             }
         }
     }
