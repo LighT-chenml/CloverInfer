@@ -98,6 +98,12 @@ def build_trace_row(
         "qk_batch_calls": int(backend_debug.get("qk_batch_calls", 0)),
         "decode_batch_calls": int(backend_debug.get("decode_batch_calls", 0)),
         "decode_batch_items": int(backend_debug.get("decode_batch_items", 0)),
+        "backend_variant": backend_debug.get("backend_variant", "pim_naive"),
+        "clover_cpu_shadow_enabled": bool(backend_debug.get("clover_cpu_shadow_enabled", False)),
+        "clover_shadow_checks_enabled": bool(backend_debug.get("clover_shadow_checks_enabled", False)),
+        "clover_op_profiling_enabled": bool(backend_debug.get("clover_op_profiling_enabled", False)),
+        "clover_op_timing_totals_s": backend_debug.get("clover_op_timing_totals_s", {}),
+        "clover_op_timing_counts": backend_debug.get("clover_op_timing_counts", {}),
         "attention_decode_batching": decode_batching,
         "scheduler_decode_step_sync": metrics.get("scheduler_decode_step_sync", {}),
         "scheduler_attention_layer_barrier": metrics.get("scheduler_attention_layer_barrier", {}),
@@ -155,6 +161,13 @@ def main():
     parser.add_argument("--attention-actor-batch-window-s", type=float, default=0.001)
     parser.add_argument("--attention-actor-batch-max-size", type=int, default=8)
     parser.add_argument("--concurrency", type=int, default=1)
+    parser.add_argument("--attention-backend", default="pim_naive", choices=["pim_naive", "cloverinfer"])
+    parser.add_argument("--clover-cpu-shadow-enabled", action="store_true")
+    parser.add_argument("--no-clover-cpu-shadow-enabled", action="store_true")
+    parser.add_argument("--clover-shadow-checks-enabled", action="store_true")
+    parser.add_argument("--no-clover-shadow-checks-enabled", action="store_true")
+    parser.add_argument("--clover-op-profiling-enabled", action="store_true")
+    parser.add_argument("--no-clover-op-profiling-enabled", action="store_true")
     args = parser.parse_args()
 
     if args.pim_qk_mixed_enabled and args.no_pim_qk_mixed_enabled:
@@ -167,6 +180,12 @@ def main():
         raise ValueError("cannot set both --pim-softmax-av-fused-enabled and --no-pim-softmax-av-fused-enabled")
     if args.pim_softmax_av_shadow_check and args.no_pim_softmax_av_shadow_check:
         raise ValueError("cannot set both --pim-softmax-av-shadow-check and --no-pim-softmax-av-shadow-check")
+    if args.clover_cpu_shadow_enabled and args.no_clover_cpu_shadow_enabled:
+        raise ValueError("cannot set both --clover-cpu-shadow-enabled and --no-clover-cpu-shadow-enabled")
+    if args.clover_shadow_checks_enabled and args.no_clover_shadow_checks_enabled:
+        raise ValueError("cannot set both --clover-shadow-checks-enabled and --no-clover-shadow-checks-enabled")
+    if args.clover_op_profiling_enabled and args.no_clover_op_profiling_enabled:
+        raise ValueError("cannot set both --clover-op-profiling-enabled and --no-clover-op-profiling-enabled")
 
     pim_qk_mixed_enabled = True
     if args.no_pim_qk_mixed_enabled:
@@ -189,6 +208,15 @@ def main():
     pim_softmax_av_shadow_check = True
     if args.no_pim_softmax_av_shadow_check:
         pim_softmax_av_shadow_check = False
+    clover_cpu_shadow_enabled = True
+    if args.no_clover_cpu_shadow_enabled:
+        clover_cpu_shadow_enabled = False
+    clover_shadow_checks_enabled = True
+    if args.no_clover_shadow_checks_enabled:
+        clover_shadow_checks_enabled = False
+    clover_op_profiling_enabled = True
+    if args.no_clover_op_profiling_enabled:
+        clover_op_profiling_enabled = False
 
     prompts = load_prompts(args.data, args.limit)
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
@@ -208,7 +236,7 @@ def main():
         attention_resource="attention_pim",
         use_gpu_for_prefill=True,
         use_gpu_for_decode_dense=True,
-        attention_backend="pim_naive",
+        attention_backend=args.attention_backend,
         pim_num_dpus=args.pim_num_dpus,
         pim_resident_store_backend=args.pim_resident_store_backend,
         pim_max_resident_groups_per_layer=args.pim_max_resident_groups_per_layer,
@@ -232,6 +260,9 @@ def main():
         attention_rpc_batch_max_size=args.attention_rpc_batch_max_size,
         attention_actor_batch_window_s=args.attention_actor_batch_window_s,
         attention_actor_batch_max_size=args.attention_actor_batch_max_size,
+        clover_cpu_shadow_enabled=clover_cpu_shadow_enabled,
+        clover_shadow_checks_enabled=clover_shadow_checks_enabled,
+        clover_op_profiling_enabled=clover_op_profiling_enabled,
     )
     model = ModelConfig(
         model_name=args.model_name,

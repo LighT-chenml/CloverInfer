@@ -27,7 +27,7 @@ def main():
     )
     parser.add_argument("--model-name", type=str, default="custom")
     parser.add_argument("--address", type=str, default=None)
-    parser.add_argument("--attention-backend", choices=["cpu", "pim_naive"], default="cpu")
+    parser.add_argument("--attention-backend", choices=["cpu", "pim_naive", "cloverinfer"], default="cpu")
     parser.add_argument("--prefill-resource", type=str, default=None)
     parser.add_argument("--decode-dense-resource", type=str, default=None)
     parser.add_argument("--attention-resource", type=str, default=None)
@@ -43,6 +43,12 @@ def main():
     parser.add_argument("--no-pim-qk-mixed-enabled", action="store_true")
     parser.add_argument("--pim-qk-mixed-heads", type=int, default=2)
     parser.add_argument("--pim-qk-mixed-window", type=int, default=128)
+    parser.add_argument("--clover-cpu-shadow-enabled", action="store_true")
+    parser.add_argument("--no-clover-cpu-shadow-enabled", action="store_true")
+    parser.add_argument("--clover-shadow-checks-enabled", action="store_true")
+    parser.add_argument("--no-clover-shadow-checks-enabled", action="store_true")
+    parser.add_argument("--clover-op-profiling-enabled", action="store_true")
+    parser.add_argument("--no-clover-op-profiling-enabled", action="store_true")
     parser.add_argument("--sequential", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
@@ -53,6 +59,12 @@ def main():
         raise ValueError("cannot set both --use-gpu-for-decode-dense and --no-gpu-for-decode-dense")
     if args.pim_qk_mixed_enabled and args.no_pim_qk_mixed_enabled:
         raise ValueError("cannot set both --pim-qk-mixed-enabled and --no-pim-qk-mixed-enabled")
+    if args.clover_cpu_shadow_enabled and args.no_clover_cpu_shadow_enabled:
+        raise ValueError("cannot set both --clover-cpu-shadow-enabled and --no-clover-cpu-shadow-enabled")
+    if args.clover_shadow_checks_enabled and args.no_clover_shadow_checks_enabled:
+        raise ValueError("cannot set both --clover-shadow-checks-enabled and --no-clover-shadow-checks-enabled")
+    if args.clover_op_profiling_enabled and args.no_clover_op_profiling_enabled:
+        raise ValueError("cannot set both --clover-op-profiling-enabled and --no-clover-op-profiling-enabled")
 
     use_gpu_for_prefill = True
     if args.no_gpu_for_prefill:
@@ -71,6 +83,24 @@ def main():
         pim_qk_mixed_enabled = False
     elif args.pim_qk_mixed_enabled:
         pim_qk_mixed_enabled = True
+
+    clover_cpu_shadow_enabled = True
+    if args.no_clover_cpu_shadow_enabled:
+        clover_cpu_shadow_enabled = False
+    elif args.clover_cpu_shadow_enabled:
+        clover_cpu_shadow_enabled = True
+
+    clover_shadow_checks_enabled = True
+    if args.no_clover_shadow_checks_enabled:
+        clover_shadow_checks_enabled = False
+    elif args.clover_shadow_checks_enabled:
+        clover_shadow_checks_enabled = True
+
+    clover_op_profiling_enabled = True
+    if args.no_clover_op_profiling_enabled:
+        clover_op_profiling_enabled = False
+    elif args.clover_op_profiling_enabled:
+        clover_op_profiling_enabled = True
 
     # Init Ray
     if not ray.is_initialized():
@@ -103,6 +133,9 @@ def main():
         pim_qk_mixed_enabled=pim_qk_mixed_enabled,
         pim_qk_mixed_heads=args.pim_qk_mixed_heads,
         pim_qk_mixed_window=args.pim_qk_mixed_window,
+        clover_cpu_shadow_enabled=clover_cpu_shadow_enabled,
+        clover_shadow_checks_enabled=clover_shadow_checks_enabled,
+        clover_op_profiling_enabled=clover_op_profiling_enabled,
     )
     model_conf = ModelConfig(
         model_name=args.model_name,

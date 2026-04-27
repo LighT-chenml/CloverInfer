@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import socket
 import time
 from typing import Dict, List
@@ -88,6 +89,11 @@ class AttentionNode:
             self.backend = CpuAttentionBackend()
         elif backend == "pim_naive":
             self.backend = PimNaiveAttentionBackend(**backend_kwargs)
+        elif backend == "cloverinfer":
+            importlib.invalidate_caches()
+            from .clover_attention_backend import CloverInferAttentionBackend
+
+            self.backend = CloverInferAttentionBackend(**backend_kwargs)
         else:
             raise ValueError(f"Unsupported attention backend for now: {backend}")
         self.decode_batch_window_s = max(0.0, float(decode_batch_window_s))

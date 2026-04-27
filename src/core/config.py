@@ -35,6 +35,9 @@ class ClusterConfig(BaseModel):
     pim_head_grouping_policy: str = "balanced"
     pim_dpu_placement_policy: str = "rotated"
     pim_resident_kv_dtype: str = "fp32"
+    clover_cpu_shadow_enabled: bool = True
+    clover_shadow_checks_enabled: bool = True
+    clover_op_profiling_enabled: bool = True
     decode_step_sync_window_s: float = 0.0
     decode_step_sync_max_size: int = 8
     attention_decode_wave_persist_enabled: bool = False

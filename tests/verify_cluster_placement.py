@@ -20,7 +20,7 @@ def parse_args():
     parser.add_argument("--prompt", default="Hello CloverInfer")
     parser.add_argument("--max-new-tokens", type=int, default=2)
     parser.add_argument("--skip-generation", action="store_true")
-    parser.add_argument("--attention-backend", default="cpu", choices=["cpu", "pim_naive"])
+    parser.add_argument("--attention-backend", default="cpu", choices=["cpu", "pim_naive", "cloverinfer"])
     parser.add_argument("--pim-num-dpus", type=int, default=4)
     parser.add_argument("--pim-resident-store-backend", default="host", choices=["host", "upmem_kvslot"])
     parser.add_argument("--pim-qk-full-enabled", action="store_true")
@@ -36,6 +36,12 @@ def parse_args():
     parser.add_argument("--pim-qk-mixed-heads", type=int, default=2)
     parser.add_argument("--pim-qk-mixed-window", type=int, default=128)
     parser.add_argument("--pim-length", type=int, default=128)
+    parser.add_argument("--clover-cpu-shadow-enabled", action="store_true")
+    parser.add_argument("--no-clover-cpu-shadow-enabled", action="store_true")
+    parser.add_argument("--clover-shadow-checks-enabled", action="store_true")
+    parser.add_argument("--no-clover-shadow-checks-enabled", action="store_true")
+    parser.add_argument("--clover-op-profiling-enabled", action="store_true")
+    parser.add_argument("--no-clover-op-profiling-enabled", action="store_true")
     parser.add_argument("--decode-step-sync-window-s", type=float, default=0.0)
     parser.add_argument("--decode-step-sync-max-size", type=int, default=8)
     parser.add_argument("--attention-decode-wave-persist-enabled", action="store_true")
@@ -61,6 +67,12 @@ def main():
         raise ValueError("cannot set both --pim-softmax-av-fused-enabled and --no-pim-softmax-av-fused-enabled")
     if args.pim_softmax_av_shadow_check and args.no_pim_softmax_av_shadow_check:
         raise ValueError("cannot set both --pim-softmax-av-shadow-check and --no-pim-softmax-av-shadow-check")
+    if args.clover_cpu_shadow_enabled and args.no_clover_cpu_shadow_enabled:
+        raise ValueError("cannot set both --clover-cpu-shadow-enabled and --no-clover-cpu-shadow-enabled")
+    if args.clover_shadow_checks_enabled and args.no_clover_shadow_checks_enabled:
+        raise ValueError("cannot set both --clover-shadow-checks-enabled and --no-clover-shadow-checks-enabled")
+    if args.clover_op_profiling_enabled and args.no_clover_op_profiling_enabled:
+        raise ValueError("cannot set both --clover-op-profiling-enabled and --no-clover-op-profiling-enabled")
     pim_qk_mixed_enabled = True
     if args.pim_qk_mixed_enabled:
         pim_qk_mixed_enabled = True
@@ -82,6 +94,15 @@ def main():
     pim_softmax_av_shadow_check = True
     if args.no_pim_softmax_av_shadow_check:
         pim_softmax_av_shadow_check = False
+    clover_cpu_shadow_enabled = True
+    if args.no_clover_cpu_shadow_enabled:
+        clover_cpu_shadow_enabled = False
+    clover_shadow_checks_enabled = True
+    if args.no_clover_shadow_checks_enabled:
+        clover_shadow_checks_enabled = False
+    clover_op_profiling_enabled = True
+    if args.no_clover_op_profiling_enabled:
+        clover_op_profiling_enabled = False
 
     ray.init(
         address=args.address,
@@ -117,6 +138,9 @@ def main():
         attention_rpc_batch_max_size=args.attention_rpc_batch_max_size,
         attention_actor_batch_window_s=args.attention_actor_batch_window_s,
         attention_actor_batch_max_size=args.attention_actor_batch_max_size,
+        clover_cpu_shadow_enabled=clover_cpu_shadow_enabled,
+        clover_shadow_checks_enabled=clover_shadow_checks_enabled,
+        clover_op_profiling_enabled=clover_op_profiling_enabled,
     )
     model = ModelConfig(model_path=args.model, max_new_tokens=args.max_new_tokens)
 
@@ -131,7 +155,7 @@ def main():
     assert info["decode_dense"]["device"] == "cuda", info
     assert info["attention"]["device"] == "cpu", info
     assert info["attention"]["backend"] == args.attention_backend, info
-    if args.attention_backend == "pim_naive":
+    if args.attention_backend in {"pim_naive", "cloverinfer"}:
         debug = info["attention"]["backend_debug"]
         assert debug["num_dpus"] == args.pim_num_dpus, debug
         assert debug["length"] == args.pim_length, debug
@@ -145,6 +169,11 @@ def main():
         assert debug["qk_mixed_window"] == args.pim_qk_mixed_window, debug
         assert debug["resident_metadata_enabled"] is True, debug
         assert debug["resident_compute_enabled"] is True, debug
+        if args.attention_backend == "cloverinfer":
+            assert debug["backend_variant"] == "cloverinfer", debug
+            assert debug["clover_cpu_shadow_enabled"] == clover_cpu_shadow_enabled, debug
+            assert debug["clover_shadow_checks_enabled"] == clover_shadow_checks_enabled, debug
+            assert debug["clover_op_profiling_enabled"] == clover_op_profiling_enabled, debug
 
     if not args.skip_generation:
         output, metrics = ray.get(
@@ -162,18 +191,24 @@ def main():
         assert stage_timing["counts"]["decode_layers"] >= stage_timing["counts"]["decode_steps"]
         assert stage_timing["scheduler"]["total_rpc_s"] >= 0
         assert stage_timing["actors"]["total_compute_s"] >= 0
-        if args.attention_backend == "pim_naive":
+        if args.attention_backend in {"pim_naive", "cloverinfer"}:
             debug = metrics["attention_backend"]["backend_debug"]
             assert debug["resident_append_ops"] > 0, debug
+            if args.attention_backend == "cloverinfer":
+                assert "clover_op_timing_totals_s" in debug, debug
+                assert "prepare_decode_record_s" in debug["clover_op_timing_totals_s"], debug
             if pim_softmax_av_fused_enabled:
                 assert debug["softmax_av_fused_ops"] > 0, debug
-                assert debug["softmax_av_fused_shadow_max_abs_diff"] <= FLOAT_TOL, debug
+                if args.attention_backend == "pim_naive" or clover_shadow_checks_enabled:
+                    assert debug["softmax_av_fused_shadow_max_abs_diff"] <= FLOAT_TOL, debug
             elif debug.get("resident_av_enabled", False):
                 assert debug["resident_av_ops"] > 0, debug
-                assert debug["resident_av_shadow_max_abs_diff"] <= FLOAT_TOL, debug
+                if args.attention_backend == "pim_naive" or clover_shadow_checks_enabled:
+                    assert debug["resident_av_shadow_max_abs_diff"] <= FLOAT_TOL, debug
             else:
                 assert debug["resident_materialize_ops"] > 0, debug
-                assert debug["resident_shadow_max_abs_diff"] <= FLOAT_TOL, debug
+                if args.attention_backend == "pim_naive" or clover_shadow_checks_enabled:
+                    assert debug["resident_shadow_max_abs_diff"] <= FLOAT_TOL, debug
             assert debug["resident_last_freed_request_id"], debug
             assert debug["resident_request_count"] == 0, debug
             if args.pim_resident_store_backend == "upmem_kvslot":

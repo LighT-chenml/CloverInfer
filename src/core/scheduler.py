@@ -318,7 +318,7 @@ class GlobalScheduler:
         gpu_prefill = 1 if self.cluster_config.use_gpu_for_prefill else 0
         gpu_dense = 1 if self.cluster_config.use_gpu_for_decode_dense else 0
         attention_backend_kwargs = {}
-        if self.cluster_config.attention_backend == "pim_naive":
+        if self.cluster_config.attention_backend in {"pim_naive", "cloverinfer"}:
             attention_backend_kwargs = {
                 "num_dpus": int(self.cluster_config.pim_num_dpus),
                 "length": int(self.cluster_config.pim_length),
@@ -337,6 +337,14 @@ class GlobalScheduler:
                 "decode_batch_window_s": float(self.cluster_config.attention_actor_batch_window_s),
                 "decode_batch_max_size": int(self.cluster_config.attention_actor_batch_max_size),
             }
+            if self.cluster_config.attention_backend == "cloverinfer":
+                attention_backend_kwargs.update(
+                    {
+                        "cpu_shadow_enabled": bool(self.cluster_config.clover_cpu_shadow_enabled),
+                        "shadow_checks_enabled": bool(self.cluster_config.clover_shadow_checks_enabled),
+                        "op_profiling_enabled": bool(self.cluster_config.clover_op_profiling_enabled),
+                    }
+                )
 
         self.prefill_nodes = [
             PrefillNode.options(
