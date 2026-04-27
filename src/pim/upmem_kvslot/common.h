@@ -28,6 +28,7 @@
 
 #define KVSLOT_QK_SLOT_MODE_RAW_SCORES 0U
 #define KVSLOT_QK_SLOT_MODE_SOFTMAX_NORMALIZED 1U
+#define KVSLOT_QK_SLOT_MODE_CONTEXT_FUSED 2U
 
 typedef struct {
     uint32_t magic;

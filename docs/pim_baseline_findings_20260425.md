@@ -2900,3 +2900,241 @@ Interpretation:
   - normalized-weight host bounce
 - this is the strongest current functional full-PIM-style baseline in the
   codebase
+
+## 54. Softmax post-processing bottleneck and first parallel fix
+
+After removing the normalized-weight bounce, the next bottleneck became clear on
+the small shadow-on trace:
+
+- DPU-side softmax post-processing was still effectively serialized on
+  `tasklet 0`
+- the expensive part was:
+  - row-max reduction
+  - exponentiation
+  - row-sum accumulation
+  - normalization
+  - normalized-weight writeback
+
+### 54.1 Regression signal
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc4_tok2_dpu64_fp32_fullqk_qksavfused_nowt_bounce.jsonl`
+
+Observed:
+
+- `avg_latency ~= 7.1754 s`
+- `max_latency ~= 7.1832 s`
+- `ttft ~= 0.4337 s`
+- `tpot ~= 6.7418 s`
+
+Interpretation:
+
+- `ttft` stayed similar
+- the regression was mostly in decode-time attention work
+- this pointed to the DPU-side softmax/normalization stage rather than
+  prefill/init
+
+### 54.2 First parallelization pass
+
+Change:
+
+- parallelize softmax row post-processing across tasklets by head-row
+- keep the final packed normalized-weight MRAM writeback logic unchanged
+
+### 54.3 Post-fix trace
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc4_tok2_dpu64_fp32_fullqk_qksavfused_nowt_bounce_softmaxpar.jsonl`
+
+Observed:
+
+- `.7` local fused-store check:
+  - `max_diff = 1.1921e-07`
+- trace:
+  - `avg_latency ~= 4.8137 s`
+  - `max_latency ~= 4.8305 s`
+
+Interpretation:
+
+- the serialized softmax post-processing was indeed a major bottleneck
+- simple row-level tasklet parallelization recovers most of the regression:
+  - from `~7.18 s`
+  - down to `~4.81 s`
+- this is still slower than the earlier helper-softmax fused trace
+  (`~4.10 s`), so further optimization is still needed
+
+## 55. Parallel normalized-weight writeback
+
+The next remaining serialized step was the final compact packed writeback of
+normalized weights into `av_weights_bits`.
+
+Change:
+
+- parallelize packed normalized-weight MRAM writeback across tasklets by pair
+  index
+- keep the existing compact AV-consumed layout unchanged
+
+Validation:
+
+- `.7` local fused-store check:
+  - `max_diff = 1.1921e-07`
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc4_tok2_dpu64_fp32_fullqk_qksavfused_nowt_bounce_softmaxpar_writepar.jsonl`
+
+Observed:
+
+- `avg_latency ~= 4.6414 s`
+- `max_latency ~= 4.6546 s`
+
+Interpretation:
+
+- packed writeback was a real secondary bottleneck after row-level softmax
+  parallelization
+- parallelizing it gives another measurable gain:
+  - from `~4.81 s`
+  - down to `~4.64 s`
+- the DPU-side full path is still slower than the older helper-softmax fused
+  trace (`~4.10 s`), but the gap is now much smaller
+
+## 56. Direct-context fused prototype
+
+Date: 2026-04-27
+
+We then pushed the fused path one step further by introducing an experimental
+`CONTEXT_FUSED` mode in the kvslot QK kernel:
+
+- QK runs on DPU
+- softmax runs on DPU
+- AV accumulation runs on DPU
+- the helper reads back only final `context`
+
+This path is currently guarded by:
+
+- environment variable: `CLOVER_KVSLOT_CONTEXT_FUSED=1`
+
+The existing `SOFTMAX_NORMALIZED -> AV` path remains the default stable
+baseline.
+
+### 56.1 Minimal correctness
+
+Observed on `.7` local fused-store test:
+
+- `max_diff = 5.9605e-08`
+
+Interpretation:
+
+- the direct-context fused prototype is numerically correct on a minimal
+  standalone test
+
+### 56.2 Three-machine correctness
+
+Observed on the `.3/.4/.7` cluster with `OPT-125M`, `64 DPU`,
+`pim_qk_full_enabled`, and `pim_softmax_av_fused_enabled`:
+
+- placement verification passed
+- `qk_full_shadow_max_abs_diff = 0.0`
+- `softmax_av_fused_shadow_max_abs_diff = 4.7684e-07`
+
+Interpretation:
+
+- the direct-context fused path is correctly wired end-to-end through the
+  current PD+AF stack
+
+### 56.3 First trace and regression
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc4_tok2_dpu64_fp32_fullqk_qksav_contextfused.jsonl`
+
+Observed:
+
+- `avg_latency ~= 5.2116 s`
+
+Compared baseline:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc4_tok2_dpu64_fp32_fullqk_qksav_weightpath_refresh.jsonl`
+- `avg_latency ~= 4.8417 s`
+
+Interpretation:
+
+- the first direct-context fused version was functionally correct
+- but it regressed latency versus the current stable normalized-weight path
+
+### 56.4 Root-cause finding
+
+We then found an important helper-side inefficiency:
+
+- `CONTEXT_FUSED` was still treated as a generic "non-normalized" QK mode
+- after the QK round, the helper still pulled back:
+  - `qk_slot_scores_bits`
+  - `qk_slot_rowmax_bits`
+
+This readback was unnecessary because the path already produced final context
+on DPU and no host-side score consumer remained in the hot path.
+
+Interpretation:
+
+- the initial regression was not evidence against direct-context fusion itself
+- it was largely caused by leftover helper/runtime transport overhead
+
+### 56.5 Removing the unnecessary raw-score pullback
+
+Change:
+
+- only raw-score mode now reads back `qk_slot_scores_bits` and row maxima
+- `SOFTMAX_NORMALIZED` and `CONTEXT_FUSED` both skip that QK-result pullback
+
+Validation:
+
+- three-machine placement verify still passed
+- `qk_full_shadow_max_abs_diff = 0.0`
+- `softmax_av_fused_shadow_max_abs_diff = 4.7684e-07`
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc4_tok2_dpu64_fp32_fullqk_qksav_contextfused_norawpull.jsonl`
+
+Observed:
+
+- `avg_latency ~= 4.8053 s`
+
+Interpretation:
+
+- removing the unnecessary helper-side pullback recovers most of the
+  regression:
+  - from `~5.21 s`
+  - down to `~4.81 s`
+- after that fix, the direct-context path is slightly better than the
+  refreshed normalized-weight path (`~4.84 s`) on this small trace
+
+## 57. Current takeaway from direct-context fusion
+
+We now have a stronger full-PIM-style baseline:
+
+- full-QK on DPU
+- DPU-side softmax
+- DPU-side AV
+- context-only readback
+
+Current status:
+
+- local correctness: passed
+- three-machine correctness: passed
+- small-trace latency: competitive with, and slightly better than, the stable
+  normalized-weight fused baseline after removing redundant helper pullback
+
+Most important lesson:
+
+- structural fusion only helps if helper/runtime logic also stops moving
+  obsolete intermediates back to the host
+
+So the next likely win is no longer "add more fusion", but:
+
+1. reduce the remaining helper/runtime overhead around the direct-context path
+2. profile the DPU-side AV accumulation structure itself
+3. test whether the direct-context advantage becomes clearer under longer
+   decode windows and larger resident groups

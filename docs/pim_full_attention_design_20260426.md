@@ -871,3 +871,152 @@ Validation after the layout fix:
 
 This is the current tightest full-PIM-style attention datapath in the repo so
 far, while still preserving the host-side control plane.
+
+## 21. First DPU-softmax parallelization pass
+
+Once the normalized-weight host bounce was removed, a new bottleneck became
+visible:
+
+- the DPU-side softmax post-processing work was still concentrated in
+  `tasklet 0`
+- this included:
+  - row max scan
+  - exponentiation
+  - row-sum accumulation
+  - normalization
+
+On the small shadow-on trace this showed up as a large decode-time slowdown,
+even though correctness remained intact.
+
+The first fix was intentionally conservative:
+
+- parallelize row post-processing across tasklets by head-row
+- keep the final compact normalized-weight packing/writeback logic unchanged
+
+Observed effect:
+
+- before row-level parallelization:
+  - `avg_latency ~= 7.18 s`
+- after row-level parallelization:
+  - `avg_latency ~= 4.81 s`
+
+This tells us two important things:
+
+1. removing host bounce is not enough by itself if the replacement DPU-side
+   work is serialized
+2. even a simple tasklet-level split over rows already recovers most of the
+   regression
+
+What still remains:
+
+- the final normalized-weight packing/writeback is still centralized
+- row-level parallelism is limited by the number of heads
+- further gains likely need:
+  - finer-grained work partitioning inside a row
+  - cheaper normalization/writeback structure
+  - or a tighter fused `QK+softmax+AV` dataflow that reduces intermediate
+    materialization even on the DPU side
+
+## 22. Parallel packed writeback
+
+The next step was to remove another remaining centralized piece:
+
+- even after row-level softmax parallelization, the final compact packed
+  writeback of normalized weights into `av_weights_bits` was still handled by
+  `tasklet 0`
+
+We then parallelized that writeback across tasklets by packed-pair index while
+keeping the AV-consumed compact layout unchanged.
+
+Observed effect on the small shadow-on trace:
+
+- before parallel packed writeback:
+  - `avg_latency ~= 4.81 s`
+- after parallel packed writeback:
+  - `avg_latency ~= 4.64 s`
+
+Interpretation:
+
+- packed writeback is a real secondary bottleneck once row-level softmax work
+  is parallelized
+- the optimization helps, but it is now increasingly clear that the remaining
+  gap is structural rather than just "one more serial loop"
+
+At this point, future gains are more likely to come from:
+
+- reducing intermediate normalized-weight materialization altogether
+- fusing more of `softmax + AV` into a tighter DPU-side streaming path
+- or changing the work partitioning so AV accumulation can begin without
+  waiting on the full normalized-weight buffer
+
+## 23. Direct-context fused branch
+
+We now also have an experimental branch that pushes this idea one step
+further:
+
+- `KVSLOT_QK_SLOT_MODE_CONTEXT_FUSED`
+
+In this mode, the `QK-slot` kernel performs:
+
+- QK
+- softmax normalization
+- AV accumulation
+
+and writes final context directly into:
+
+- `av_context_bits`
+
+The helper then skips launching a separate AV kernel and only reads back final
+context.
+
+Current control point:
+
+- environment variable: `CLOVER_KVSLOT_CONTEXT_FUSED=1`
+
+This is intentionally kept as an experimental switch so the default stable path
+remains:
+
+- `SOFTMAX_NORMALIZED` in QK-slot
+- then normal AV launch using resident normalized weights
+
+### Why this branch matters
+
+This branch is closer to the intended full-PIM attention boundary:
+
+- host sends query and lightweight metadata
+- PIM consumes resident KV
+- PIM returns only final context
+
+That means it removes one more intermediate object from the host-visible data
+path:
+
+- normalized attention weights no longer need to exist as a host/runtime
+  interface artifact
+
+### First lesson from bring-up
+
+The first direct-context version was slower than the stable normalized-weight
+path, but the main reason was not the idea itself.
+
+Root cause:
+
+- helper/runtime logic still pulled `qk_slot_scores_bits` and `qk_slot_rowmax`
+  back to the host after the QK round
+- that readback was obsolete for `CONTEXT_FUSED`
+
+After removing that unnecessary pullback:
+
+- the direct-context path became competitive with, and slightly better than,
+  the stable normalized-weight path on the current small trace
+
+### Current interpretation
+
+The direct-context branch strengthens the design conclusion:
+
+- full-PIM-style attention is not just about moving math into DPU kernels
+- helper/runtime boundaries must also be restructured so obsolete
+  intermediates stop crossing the host boundary
+
+So for future optimization work, the direct-context branch is now the more
+interesting path for "true" full-PIM attention experiments, while the
+normalized-weight path remains the safer comparison baseline.
