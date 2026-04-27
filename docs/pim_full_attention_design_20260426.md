@@ -622,3 +622,252 @@ Concretely, future work should focus on:
   - avoid unnecessary helper-side copies
 - DPU-local KV and context accumulation pipeline:
   - keep the `context-only` return boundary stable
+
+## 16. Current deeper-fused boundary status
+
+We then pushed the normal path one step further inward again.
+
+Previous helper-boundary fused path:
+
+- Python/backend explicitly received full per-slot score matrices
+- helper only owned:
+  - `softmax + AV`
+
+Current deeper-fused path:
+
+- Python/backend sends slot-group queries
+- helper performs:
+  - resident-slot QK
+  - helper-side softmax
+  - resident AV
+- Python/backend receives only per-group `context`
+
+In other words, the normal decode path no longer needs to materialize
+attention score matrices in Python when:
+
+- `pim_qk_full_enabled = True`
+- `pim_softmax_av_fused_enabled = True`
+- resident AV is enabled
+
+The new key interfaces are:
+
+- `ResidentKVStore.qk_softmax_weighted_value_sum_batch(...)`
+- `_KVSlotHelperClient.qk_softmax_weighted_value_sum_batch(...)`
+- helper command:
+  - `KVSLOT_CMD_QK_SOFTMAX_AV_BATCH`
+
+Relevant implementation points:
+
+- [resident_kv_store.py](/home/cml/CloverInfer/src/core/resident_kv_store.py#L87)
+- [resident_kv_store.py](/home/cml/CloverInfer/src/core/resident_kv_store.py#L475)
+- [attention_backend.py](/home/cml/CloverInfer/src/core/attention_backend.py#L882)
+- [common.h](/home/cml/CloverInfer/src/pim/upmem_kvslot/common.h#L22)
+- [host_kvslot.c](/home/cml/CloverInfer/src/pim/upmem_kvslot/host_kvslot.c#L2324)
+
+## 17. Validation of the deeper-fused path
+
+### `.7` local store/helper check
+
+Direct UPMEM-store test:
+
+- `UpmemKVSlotStore.qk_softmax_weighted_value_sum_batch(...)`
+
+Observed:
+
+- `max_diff = 5.96e-08`
+
+Interpretation:
+
+- the new single-RPC helper path is numerically correct in direct store-level
+  testing
+
+### Three-machine cluster correctness
+
+Workload:
+
+- `.3` prefill GPU
+- `.4` dense GPU
+- `.7` attention CPU+UPMEM
+- `OPT-125M`
+- `64 DPU`
+- `max_new_tokens = 2`
+- `pim_qk_full_enabled = True`
+- `pim_softmax_av_fused_enabled = True`
+
+Observed:
+
+- placement verification passed
+- end-to-end generation succeeded
+- `qk_full_shadow_max_abs_diff = 0.0`
+- `softmax_av_fused_shadow_max_abs_diff = 4.768e-07`
+
+Interpretation:
+
+- the deeper-fused path is correct on the real three-machine decode path
+- normal-path Python score materialization is no longer required
+
+### Small concurrent trace
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc4_tok2_dpu64_fp32_fullqk_qksavfused.jsonl`
+
+Observed:
+
+- `avg_latency ~= 4.10 s`
+- `max_latency ~= 4.12 s`
+- `max qk_full_shadow_max_abs_diff = 5.722e-06`
+- `max softmax_av_fused_shadow_max_abs_diff = 6.104e-05`
+- no fallback allocations
+- no DPU allocation failures
+
+Important caveat:
+
+- this trace still keeps shadow checks enabled
+- so the backend still issues an extra QK shadow path for correctness
+- therefore this trace should be read primarily as a correctness/stability
+  checkpoint, not as a fair performance number for the new boundary
+
+## 18. What this step does and does not achieve
+
+What it achieves:
+
+- removes explicit Python-side score handling from the normal path
+- reduces the logical host/backend involvement in the attention datapath
+- gives us a cleaner baseline for the next full-PIM step
+
+What it does not yet achieve:
+
+- softmax is still helper-CPU-side
+- AV is still orchestrated by the helper around the DPU kernel
+- shadow mode still reintroduces extra QK work during validation runs
+
+So this is best described as:
+
+- single-helper-RPC `QK + softmax + AV -> context`
+- but not yet single-kernel full-PIM attention
+
+## 19. DPU-side softmax milestone
+
+We then pushed the fused boundary one step deeper:
+
+- previous fused path:
+  - DPU produced raw QK scores
+  - helper CPU performed `softmax`
+  - DPU performed AV
+- current fused path:
+  - DPU produces normalized attention weights directly in `QK-slot` fused mode
+  - helper only forwards those normalized weights into AV
+  - Python/backend still receives only `context`
+
+This means the current fused datapath is now:
+
+- resident KV: PIM
+- QK: PIM
+- softmax normalization: PIM
+- AV: PIM
+- control plane / request orchestration: host
+
+Implementation notes:
+
+- `kvslot_qk_slot_args_t` now carries:
+  - `mode`
+  - `score_scale`
+- `KVSLOT_QK_SLOT_MODE_SOFTMAX_NORMALIZED` switches the DPU `QK-slot`
+  kernel from raw-score emission to normalized-weight emission
+- the helper-side fused path no longer computes `exp/sum/normalize`
+
+Relevant implementation points:
+
+- [common.h](/home/cml/CloverInfer/src/pim/upmem_kvslot/common.h)
+- [dpu_kvslot.c](/home/cml/CloverInfer/src/pim/upmem_kvslot/dpu_kvslot.c)
+- [host_kvslot.c](/home/cml/CloverInfer/src/pim/upmem_kvslot/host_kvslot.c)
+
+Toolchain note:
+
+- UPMEM DPU build here cannot link a normal `expf` from `libm`
+- the DPU softmax path therefore uses an in-kernel exponential approximation
+- a lower-order approximation initially caused
+  `softmax_av_fused_shadow_max_abs_diff = 1.2207e-04`
+- moving to a higher-order approximation restored verify-level correctness
+
+Validation after the final approximation fix:
+
+- `.7` local store-level fused test:
+  - `max_diff = 1.1921e-07`
+- three-machine placement verify:
+  - passed
+  - `qk_full_shadow_max_abs_diff = 0.0`
+  - `softmax_av_fused_shadow_max_abs_diff = 4.7684e-07`
+
+What still remains outside the ideal end-state:
+
+- helper still copies the normalized weight matrix from DPU back into the AV
+  launch path
+- so the compute boundary is now deeper, but the intermediate weight traffic
+  is not yet eliminated
+- the next logical step toward a tighter full-PIM datapath is to avoid that
+  DPU->host->DPU weight bounce
+
+## 20. Removing the normalized-weight bounce
+
+We then tightened the fused datapath one step further.
+
+Previous DPU-softmax fused path:
+
+- DPU computed normalized weights
+- helper copied normalized weights back from DPU
+- helper copied the same weights into the AV launch path
+- DPU performed AV
+
+Current fused path:
+
+- DPU computes normalized weights
+- normalized weights are written directly into DPU-resident `av_weights_bits`
+- helper marks the AV stage as `weights_resident_on_dpu`
+- AV reuses the already-resident weights in place
+
+So the intermediate:
+
+- `DPU -> helper`
+- `helper -> DPU`
+
+weight bounce is now removed from the fused path.
+
+Implementation notes:
+
+- `av_item_t` now supports `weights_resident_on_dpu`
+- AV launch and batched-AV paths skip `av_weights_bits` upload when weights are
+  already resident
+- normalized `QK-slot` mode now writes directly into `av_weights_bits`
+- batched normalized QK rounds no longer read score/rowmax buffers back to the
+  host
+
+Relevant implementation points:
+
+- [host_kvslot.c](/home/cml/CloverInfer/src/pim/upmem_kvslot/host_kvslot.c)
+- [dpu_kvslot.c](/home/cml/CloverInfer/src/pim/upmem_kvslot/dpu_kvslot.c)
+
+Bring-up bug and fix:
+
+- the first version of direct-to-`av_weights_bits` emission was wrong for odd
+  `window` lengths
+- root cause:
+  - normalized weights must follow AV's globally compact
+    `num_heads * seq_len` packing
+  - writing them row-by-row introduced a layout mismatch at odd window sizes
+- fix:
+  - pack and write normalized weights using the same global compact layout that
+    AV reads
+
+Validation after the layout fix:
+
+- `.7` local fused-store test:
+  - `max_diff = 1.1921e-07`
+- three-machine placement verify:
+  - passed
+  - `qk_full_shadow_max_abs_diff = 0.0`
+  - `softmax_av_fused_shadow_max_abs_diff = 4.7684e-07`
+
+This is the current tightest full-PIM-style attention datapath in the repo so
+far, while still preserving the host-side control plane.

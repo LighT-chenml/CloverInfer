@@ -2689,3 +2689,214 @@ cleanly:
 - not host-side softmax structure
 - but the fact that softmax is still helper-CPU-side rather than truly inside
   the PIM-side kernel/data plane
+
+## Deeper Fused `QK+softmax+AV->context` Bring-Up
+
+Date: 2026-04-27
+
+We then removed one more host/backend-side boundary:
+
+- the earlier fused path still exposed full score matrices to Python
+- the new path sends slot-group queries directly to the kvslot helper
+- the helper runs:
+  - resident-slot QK
+  - helper-side softmax
+  - resident AV
+- the backend receives only `context`
+
+This is still not final full-PIM attention, but it is a more faithful
+`context-only` baseline than the earlier helper-boundary softmax+AV design.
+
+### 49. `.7` local single-RPC fused check
+
+Direct test:
+
+- `UpmemKVSlotStore.qk_softmax_weighted_value_sum_batch(...)`
+
+Observed:
+
+- `max_diff = 5.96e-08`
+
+Interpretation:
+
+- the new single-helper-RPC fused path is numerically correct at the store
+  boundary
+
+### 50. Three-machine correctness with deeper fused path
+
+Workload:
+
+- cluster: `.3` prefill GPU, `.4` dense GPU, `.7` attention CPU+UPMEM
+- model: `OPT-125M`
+- `64 DPU`
+- `max_new_tokens = 2`
+- `pim_qk_full_enabled = True`
+- `pim_qk_mixed_enabled = False`
+- `pim_softmax_av_fused_enabled = True`
+
+Observed:
+
+- placement verification passed
+- generation succeeded
+- `qk_full_shadow_max_abs_diff = 0.0`
+- `softmax_av_fused_shadow_max_abs_diff = 4.768e-07`
+
+Interpretation:
+
+- the deeper fused path is correctly wired end-to-end on the real cluster
+- Python/backend no longer needs the full score tensor in the normal path
+
+### 51. Small concurrent deeper-fused trace
+
+Artifact:
+
+- `artifacts/pim_allocator_trace_opt125m_humaneval4_conc4_tok2_dpu64_fp32_fullqk_qksavfused.jsonl`
+
+Observed:
+
+- `avg_latency ~= 4.10 s`
+- `max_latency ~= 4.12 s`
+- `max_usage_ratio = 0.2095`
+- `max_dpu_allocate_failures = 0`
+- `max_fallback_allocations = 0`
+- `max qk_full_shadow_max_abs_diff = 5.722e-06`
+- `max softmax_av_fused_shadow_max_abs_diff = 6.104e-05`
+
+Important reading:
+
+- this run still keeps correctness shadows enabled
+- so it is not a pure performance measurement of the new boundary
+- the extra shadow QK path still appears in the trace counters
+
+Interpretation:
+
+- this should be treated as a correctness/stability baseline
+- performance conclusions should wait until we can compare:
+  - shadow-on correctness mode
+  - shadow-off steady-state mode
+
+## Updated Baseline Ladder
+
+The current functional baselines are now:
+
+1. disaggregated CPU attention
+2. resident-KV + host-softmax + resident-AV
+3. resident-KV + full-QK + helper-boundary softmax+AV
+4. resident-KV + single-helper-RPC `QK+softmax+AV->context`
+
+The new fourth baseline is the right starting point for the next round of
+full-PIM-oriented optimization, because the remaining gap is now much more
+specific:
+
+- helper CPU still owns softmax
+- helper still orchestrates AV
+- shadow validation still costs extra work during correctness runs
+
+## 52. DPU-side softmax baseline
+
+We then advanced the fused path again so that softmax normalization now runs on
+the DPU side instead of the helper CPU side.
+
+Current fused boundary:
+
+1. resident KV stays on DPU
+2. DPU computes QK
+3. DPU computes normalized attention weights
+4. helper forwards those weights into AV
+5. DPU computes context
+
+### 52.1 `.7` local fused-store validation
+
+Observed:
+
+- `max_diff = 1.1921e-07`
+
+Interpretation:
+
+- DPU-side softmax is numerically consistent at the direct store boundary
+
+### 52.2 Three-machine correctness after DPU-side softmax
+
+Workload:
+
+- cluster: `.3` prefill GPU, `.4` dense GPU, `.7` attention CPU+UPMEM
+- model: `OPT-125M`
+- `64 DPU`
+- `max_new_tokens = 2`
+- `pim_qk_full_enabled = True`
+- `pim_qk_mixed_enabled = False`
+- `pim_softmax_av_fused_enabled = True`
+
+Observed:
+
+- placement verification passed
+- generation succeeded
+- `qk_full_shadow_max_abs_diff = 0.0`
+- `softmax_av_fused_shadow_max_abs_diff = 4.7684e-07`
+
+Intermediate finding during bring-up:
+
+- a lower-order DPU exponential approximation initially produced
+  `softmax_av_fused_shadow_max_abs_diff = 1.2207e-04`
+- after upgrading the approximation, verify-level correctness was restored
+
+Interpretation:
+
+- this gives us a stronger full-PIM-oriented baseline than the previous
+  helper-softmax variant
+- the main remaining inefficiency is now the intermediate normalized-weight
+  bounce:
+  - DPU -> helper
+  - helper -> DPU AV path
+
+## 53. Removing the normalized-weight bounce
+
+We then removed the intermediate normalized-weight bounce from the fused path.
+
+New fused dataflow:
+
+1. resident KV stays on DPU
+2. DPU computes QK
+3. DPU computes normalized weights
+4. DPU writes normalized weights directly into resident `av_weights_bits`
+5. AV reuses the already-resident weights in place
+6. helper returns only context
+
+### 53.1 Bring-up issue
+
+The first direct-write version was incorrect for odd window lengths.
+
+Observed on the `.7` local fused-store test:
+
+- `max_diff = 2.57`
+- then `max_diff = 0.70` after a partial fix
+
+Root cause:
+
+- AV reads weights using a globally compact `num_heads * seq_len` layout
+- writing normalized weights row-by-row caused a packing mismatch when
+  `window` was odd
+
+Final fix:
+
+- write normalized weights using the same globally compact packed layout that
+  AV consumes
+
+### 53.2 Final validation
+
+Observed:
+
+- `.7` local fused-store test:
+  - `max_diff = 1.1921e-07`
+- three-machine placement verify:
+  - passed
+  - `qk_full_shadow_max_abs_diff = 0.0`
+  - `softmax_av_fused_shadow_max_abs_diff = 4.7684e-07`
+
+Interpretation:
+
+- the fused path now removes both:
+  - Python-side score materialization
+  - normalized-weight host bounce
+- this is the strongest current functional full-PIM-style baseline in the
+  codebase

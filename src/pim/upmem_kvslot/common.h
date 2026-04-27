@@ -19,11 +19,15 @@
 #define KVSLOT_CMD_AV_BATCH 8U
 #define KVSLOT_CMD_QK_SLOT_BATCH 9U
 #define KVSLOT_CMD_SOFTMAX_AV_BATCH 10U
+#define KVSLOT_CMD_QK_SOFTMAX_AV_BATCH 11U
 
 #define KVSLOT_KERNEL_NONE 0U
 #define KVSLOT_KERNEL_QK 1U
 #define KVSLOT_KERNEL_AV 2U
 #define KVSLOT_KERNEL_QK_SLOT 3U
+
+#define KVSLOT_QK_SLOT_MODE_RAW_SCORES 0U
+#define KVSLOT_QK_SLOT_MODE_SOFTMAX_NORMALIZED 1U
 
 typedef struct {
     uint32_t magic;
@@ -72,7 +76,8 @@ typedef struct {
     uint32_t num_heads;
     uint32_t window;
     uint32_t head_dim;
-    uint32_t reserved;
+    uint32_t mode;
+    float score_scale;
 } kvslot_qk_slot_args_t;
 
 typedef struct {
@@ -81,6 +86,13 @@ typedef struct {
     uint32_t head_dim;
     uint32_t reserved;
 } kvslot_qk_slot_batch_item_args_t;
+
+typedef struct {
+    uint32_t num_heads;
+    uint32_t window;
+    uint32_t head_dim;
+    float score_scale;
+} kvslot_qk_softmax_av_batch_item_args_t;
 
 #define KVSLOT_DTYPE_FP32 0U
 #define KVSLOT_DTYPE_FP16 1U

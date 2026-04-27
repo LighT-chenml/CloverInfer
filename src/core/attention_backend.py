@@ -821,6 +821,14 @@ class PimNaiveAttentionBackend:
             self.cpu_backend.k_cache[record["request_id"]][record["layer_idx"]].float(),
         ) * float(record["score_scale"])
 
+    def _finalize_ready_context_records(self, records: List[Dict[str, object]]) -> List[torch.Tensor]:
+        outputs: List[torch.Tensor] = []
+        for record in records:
+            if record["layer_idx"] == len(self.cpu_backend.k_cache[record["request_id"]]) - 1:
+                self.cpu_backend.context_lens[record["request_id"]] += 1
+            outputs.append(record["context"].unsqueeze(0))
+        return outputs
+
     def _apply_qk_full_batch(self, records: List[Dict[str, object]]) -> None:
         if not self.qk_full_enabled:
             self.qk_full_shadow_last_max_abs_diff = 0.0
@@ -870,6 +878,77 @@ class PimNaiveAttentionBackend:
                 self.qk_full_shadow_checks += 1
                 self.qk_full_shadow_last_max_abs_diff = max(self.qk_full_shadow_last_max_abs_diff, diff)
                 self.qk_full_shadow_max_abs_diff = max(self.qk_full_shadow_max_abs_diff, diff)
+
+    def _apply_qk_context_fused_batch(self, records: List[Dict[str, object]]) -> None:
+        flat_slot_queries: list[tuple[str, str, list[int], int, torch.Tensor, float]] = []
+        slot_query_refs: list[tuple[Dict[str, object], int, int]] = []
+
+        for record in records:
+            layer_state = record["request_state"].layer_states[record["layer_idx"]]
+            record["fused_group_contexts"] = []
+            for group in layer_state.head_groups:
+                local_head_indices = list(range(group.group_heads))
+                flat_slot_queries.append(
+                    (
+                        group.k_slot,
+                        group.v_slot,
+                        local_head_indices,
+                        int(group.seq_len),
+                        record["q_fp32"][group.head_start:group.head_end].contiguous(),
+                        float(record["score_scale"]),
+                    )
+                )
+                slot_query_refs.append((record, int(group.head_start), int(group.head_end)))
+                self.qk_full_count += int(group.group_heads)
+
+        if flat_slot_queries:
+            group_contexts = self.resident_store.qk_softmax_weighted_value_sum_batch(flat_slot_queries)
+            self.qk_full_batch_calls += 1
+            self.softmax_av_fused_batch_calls += 1
+            for (record, head_start, head_end), context in zip(slot_query_refs, group_contexts):
+                record["fused_group_contexts"].append((head_start, head_end, context))
+
+        self.qk_full_shadow_last_max_abs_diff = 0.0
+        need_qk_shadow = bool(self.qk_full_shadow_check)
+        need_context_shadow = bool(self.softmax_av_shadow_check)
+
+        if need_qk_shadow and flat_slot_queries:
+            shadow_slot_queries = [
+                (k_slot, v_slot, local_head_indices, window, queries)
+                for k_slot, v_slot, local_head_indices, window, queries, _ in flat_slot_queries
+            ]
+            slot_score_mats = self.resident_store.qk_slot_scores_batch(shadow_slot_queries)
+            self.qk_batch_calls += 1
+            for (record, head_start, head_end), score_mat in zip(slot_query_refs, slot_score_mats):
+                record.setdefault("shadow_group_scores", []).append((head_start, head_end, score_mat))
+
+        for record in records:
+            group_contexts = sorted(record.pop("fused_group_contexts", []), key=lambda item: item[0])
+            if not group_contexts:
+                record["context"] = torch.empty_like(record["q_fp32"])
+                continue
+            record["context"] = torch.cat([ctx for _, _, ctx in group_contexts], dim=0).to(record["query_dtype"])
+            self.softmax_av_fused_ops += 1
+
+            host_scores = None
+            if need_qk_shadow or need_context_shadow:
+                host_scores = self._compute_host_scores(record)
+
+            if need_qk_shadow:
+                group_scores = sorted(record.pop("shadow_group_scores", []), key=lambda item: item[0])
+                if group_scores:
+                    scores = torch.cat([score_mat for _, _, score_mat in group_scores], dim=0).to(torch.float32)
+                    scores = scores * float(record["score_scale"])
+                    diff = float(torch.max(torch.abs(scores - host_scores)).item()) if scores.numel() > 0 else 0.0
+                    self.qk_full_shadow_checks += 1
+                    self.qk_full_shadow_last_max_abs_diff = max(self.qk_full_shadow_last_max_abs_diff, diff)
+                    self.qk_full_shadow_max_abs_diff = max(self.qk_full_shadow_max_abs_diff, diff)
+
+            if need_context_shadow:
+                weights = torch.softmax(host_scores, dim=-1)
+                cpu_context = torch.einsum("hl,lhd->hd", weights, record["values"].float()).to(record["query_dtype"])
+                av_diff = float(torch.max(torch.abs(record["context"].float() - cpu_context.float())).item())
+                self.softmax_av_fused_shadow_max_abs_diff = max(self.softmax_av_fused_shadow_max_abs_diff, av_diff)
 
     def _apply_qk_mixed_batch(self, records: List[Dict[str, object]]) -> None:
         if not self.qk_mixed_enabled:
@@ -1061,6 +1140,19 @@ class PimNaiveAttentionBackend:
         self.decode_batch_calls += 1
         self.decode_batch_items += len(items)
         records = [self._prepare_decode_record(item) for item in items]
+        use_qk_context_fused = (
+            self.qk_full_enabled
+            and self.resident_compute_enabled
+            and self.resident_av_enabled
+            and self.softmax_av_fused_enabled
+        )
+        if use_qk_context_fused:
+            self.qk_mixed_last_head_diffs = []
+            self.qk_mixed_last_max_abs_diff = 0.0
+            self.qk_mixed_last_diag = {}
+            self.qk_mixed_last_diag_path = ""
+            self._apply_qk_context_fused_batch(records)
+            return self._finalize_ready_context_records(records)
         if self.qk_full_enabled and self.resident_compute_enabled:
             self.qk_mixed_last_head_diffs = []
             self.qk_mixed_last_max_abs_diff = 0.0

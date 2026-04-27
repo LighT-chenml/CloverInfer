@@ -17,6 +17,7 @@ __host kvslot_qk_dpu_args_t qk_args;
 __host kvslot_runtime_slot_args_t runtime_slot_args;
 __host kvslot_qk_slot_args_t qk_slot_args;
 __host uint32_t qk_slot_head_indices[KVSLOT_MAX_HEADS];
+__host uint32_t qk_slot_rowmax_bits[KVSLOT_MAX_HEADS];
 __host kvslot_meta_t kvslot_meta;
 __host uint32_t kvslot_kernel_command;
 
@@ -52,6 +53,54 @@ static uint32_t float_to_u32_bits(float value)
         float f;
     } bits = {.f = value};
     return bits.u;
+}
+
+static float fast_exp_approx(float x)
+{
+    const float ln2 = 0.69314718056f;
+    const float inv_ln2 = 1.44269504089f;
+    float scaled_kf;
+    int k;
+    float r;
+    float r2;
+    float r3;
+    float r4;
+    float r5;
+    float r6;
+    float poly;
+    union {
+        uint32_t u;
+        float f;
+    } scale;
+
+    if (x <= -80.0f) {
+        return 0.0f;
+    }
+    if (x >= 0.0f) {
+        return 1.0f;
+    }
+
+    scaled_kf = x * inv_ln2;
+    k = (int)(scaled_kf + (scaled_kf >= 0.0f ? 0.5f : -0.5f));
+    r = x - ((float)k * ln2);
+    r2 = r * r;
+    r3 = r2 * r;
+    r4 = r2 * r2;
+    r5 = r4 * r;
+    r6 = r3 * r3;
+    poly = 1.0f
+        + r
+        + (0.5f * r2)
+        + ((1.0f / 6.0f) * r3)
+        + ((1.0f / 24.0f) * r4)
+        + ((1.0f / 120.0f) * r5)
+        + ((1.0f / 720.0f) * r6);
+
+    if (k < -126) {
+        return 0.0f;
+    }
+    scale.u = (uint32_t)(k + 127) << 23;
+    return poly * scale.f;
 }
 
 static float fp16_bits_to_float(uint16_t bits)
@@ -305,6 +354,8 @@ static void run_qk_slot_kernel(void)
     uint32_t num_heads = qk_slot_args.num_heads;
     uint32_t window = qk_slot_args.window;
     uint32_t head_dim = qk_slot_args.head_dim;
+    uint32_t mode = qk_slot_args.mode;
+    float score_scale = qk_slot_args.score_scale;
 
     if (seq_len > KVSLOT_MAX_CAPACITY) {
         seq_len = KVSLOT_MAX_CAPACITY;
@@ -329,6 +380,9 @@ static void run_qk_slot_kernel(void)
     }
     if (num_heads > KVSLOT_MAX_HEADS) {
         num_heads = KVSLOT_MAX_HEADS;
+    }
+    if (mode != KVSLOT_QK_SLOT_MODE_SOFTMAX_NORMALIZED) {
+        mode = KVSLOT_QK_SLOT_MODE_RAW_SCORES;
     }
     uint32_t score_stride = (window + 1u) & ~1u;
 
@@ -367,15 +421,61 @@ static void run_qk_slot_kernel(void)
 
     if (tasklet_id == 0) {
         for (uint32_t head_row = 0; head_row < num_heads; ++head_row) {
+            float row_max = 0.0f;
+            float scaled_row_max = 0.0f;
+            float row_sum = 0.0f;
             uint32_t total_pairs = (window + 1u) / 2u;
-            for (uint32_t pair_idx = 0; pair_idx < total_pairs; ++pair_idx) {
-                uint32_t out_idx0 = pair_idx * 2u;
-                uint32_t out_idx1 = out_idx0 + 1u;
-                uint32_t low_bits = qk_slot_score_local[(size_t)head_row * window + out_idx0];
-                uint32_t high_bits = out_idx1 < window ? qk_slot_score_local[(size_t)head_row * window + out_idx1] : 0u;
-                uint64_t packed = ((uint64_t)high_bits << 32) | (uint64_t)low_bits;
-                mram_write(&packed, &qk_slot_scores_bits[(size_t)head_row * score_stride + out_idx0], sizeof(packed));
+            if (window > 0) {
+                row_max = u32_bits_to_float(qk_slot_score_local[(size_t)head_row * window]);
+                for (uint32_t pos = 1; pos < window; ++pos) {
+                    float value = u32_bits_to_float(qk_slot_score_local[(size_t)head_row * window + pos]);
+                    if (value > row_max) {
+                        row_max = value;
+                    }
+                }
             }
+            qk_slot_rowmax_bits[head_row] = float_to_u32_bits(row_max);
+            if (mode == KVSLOT_QK_SLOT_MODE_SOFTMAX_NORMALIZED && window > 0) {
+                scaled_row_max = row_max * score_scale;
+                row_sum = 0.0f;
+                for (uint32_t pos = 0; pos < window; ++pos) {
+                    float value = u32_bits_to_float(qk_slot_score_local[(size_t)head_row * window + pos]);
+                    float exp_value = fast_exp_approx((value * score_scale) - scaled_row_max);
+                    qk_slot_score_local[(size_t)head_row * window + pos] = float_to_u32_bits(exp_value);
+                    row_sum += exp_value;
+                }
+                if (row_sum > 0.0f) {
+                    for (uint32_t pos = 0; pos < window; ++pos) {
+                        float value = u32_bits_to_float(qk_slot_score_local[(size_t)head_row * window + pos]) / row_sum;
+                        qk_slot_score_local[(size_t)head_row * window + pos] = float_to_u32_bits(value);
+                    }
+                }
+            }
+            if (mode != KVSLOT_QK_SLOT_MODE_SOFTMAX_NORMALIZED) {
+                for (uint32_t pair_idx = 0; pair_idx < total_pairs; ++pair_idx) {
+                    uint32_t out_idx0 = pair_idx * 2u;
+                    uint32_t out_idx1 = out_idx0 + 1u;
+                    uint32_t low_bits = qk_slot_score_local[(size_t)head_row * window + out_idx0];
+                    uint32_t high_bits = out_idx1 < window ? qk_slot_score_local[(size_t)head_row * window + out_idx1] : 0u;
+                    uint64_t packed = ((uint64_t)high_bits << 32) | (uint64_t)low_bits;
+                    mram_write(&packed, &qk_slot_scores_bits[(size_t)head_row * score_stride + out_idx0], sizeof(packed));
+                }
+            }
+        }
+        if (mode == KVSLOT_QK_SLOT_MODE_SOFTMAX_NORMALIZED && window > 0) {
+            uint32_t total_weights = num_heads * window;
+            uint32_t total_pairs = (total_weights + 1u) / 2u;
+            for (uint32_t pair_idx = 0; pair_idx < total_pairs; ++pair_idx) {
+                uint32_t idx0 = pair_idx * 2u;
+                uint32_t idx1 = idx0 + 1u;
+                uint32_t low_bits = qk_slot_score_local[idx0];
+                uint32_t high_bits = idx1 < total_weights ? qk_slot_score_local[idx1] : 0u;
+                uint64_t packed = ((uint64_t)high_bits << 32) | (uint64_t)low_bits;
+                mram_write(&packed, &av_weights_bits[idx0], sizeof(packed));
+            }
+        }
+        for (uint32_t head_row = num_heads; head_row < KVSLOT_MAX_HEADS; ++head_row) {
+            qk_slot_rowmax_bits[head_row] = 0u;
         }
     }
     barrier_wait(&kvslot_barrier);
