@@ -49,6 +49,10 @@ def main():
     parser.add_argument("--no-clover-shadow-checks-enabled", action="store_true")
     parser.add_argument("--clover-op-profiling-enabled", action="store_true")
     parser.add_argument("--no-clover-op-profiling-enabled", action="store_true")
+    parser.add_argument("--clover-shadow-check-token-interval", type=int, default=4)
+    parser.add_argument("--clover-shadow-check-layer-interval", type=int, default=4)
+    parser.add_argument("--clover-host-qk-mixed-enabled", action="store_true")
+    parser.add_argument("--no-clover-host-qk-mixed-enabled", action="store_true")
     parser.add_argument("--sequential", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
@@ -65,6 +69,8 @@ def main():
         raise ValueError("cannot set both --clover-shadow-checks-enabled and --no-clover-shadow-checks-enabled")
     if args.clover_op_profiling_enabled and args.no_clover_op_profiling_enabled:
         raise ValueError("cannot set both --clover-op-profiling-enabled and --no-clover-op-profiling-enabled")
+    if args.clover_host_qk_mixed_enabled and args.no_clover_host_qk_mixed_enabled:
+        raise ValueError("cannot set both --clover-host-qk-mixed-enabled and --no-clover-host-qk-mixed-enabled")
 
     use_gpu_for_prefill = True
     if args.no_gpu_for_prefill:
@@ -102,6 +108,12 @@ def main():
     elif args.clover_op_profiling_enabled:
         clover_op_profiling_enabled = True
 
+    clover_host_qk_mixed_enabled = False
+    if args.clover_host_qk_mixed_enabled:
+        clover_host_qk_mixed_enabled = True
+    elif args.no_clover_host_qk_mixed_enabled:
+        clover_host_qk_mixed_enabled = False
+
     # Init Ray
     if not ray.is_initialized():
         runtime_env = {
@@ -136,6 +148,9 @@ def main():
         clover_cpu_shadow_enabled=clover_cpu_shadow_enabled,
         clover_shadow_checks_enabled=clover_shadow_checks_enabled,
         clover_op_profiling_enabled=clover_op_profiling_enabled,
+        clover_shadow_check_token_interval=args.clover_shadow_check_token_interval,
+        clover_shadow_check_layer_interval=args.clover_shadow_check_layer_interval,
+        clover_host_qk_mixed_enabled=clover_host_qk_mixed_enabled,
     )
     model_conf = ModelConfig(
         model_name=args.model_name,

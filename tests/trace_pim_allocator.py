@@ -102,6 +102,11 @@ def build_trace_row(
         "clover_cpu_shadow_enabled": bool(backend_debug.get("clover_cpu_shadow_enabled", False)),
         "clover_shadow_checks_enabled": bool(backend_debug.get("clover_shadow_checks_enabled", False)),
         "clover_op_profiling_enabled": bool(backend_debug.get("clover_op_profiling_enabled", False)),
+        "clover_shadow_check_token_interval": int(backend_debug.get("clover_shadow_check_token_interval", 0)),
+        "clover_shadow_check_layer_interval": int(backend_debug.get("clover_shadow_check_layer_interval", 0)),
+        "clover_host_qk_mixed_enabled": bool(backend_debug.get("clover_host_qk_mixed_enabled", False)),
+        "clover_shadow_check_invocations": int(backend_debug.get("clover_shadow_check_invocations", 0)),
+        "clover_shadow_check_skips": int(backend_debug.get("clover_shadow_check_skips", 0)),
         "clover_op_timing_totals_s": backend_debug.get("clover_op_timing_totals_s", {}),
         "clover_op_timing_counts": backend_debug.get("clover_op_timing_counts", {}),
         "attention_decode_batching": decode_batching,
@@ -168,6 +173,10 @@ def main():
     parser.add_argument("--no-clover-shadow-checks-enabled", action="store_true")
     parser.add_argument("--clover-op-profiling-enabled", action="store_true")
     parser.add_argument("--no-clover-op-profiling-enabled", action="store_true")
+    parser.add_argument("--clover-shadow-check-token-interval", type=int, default=4)
+    parser.add_argument("--clover-shadow-check-layer-interval", type=int, default=4)
+    parser.add_argument("--clover-host-qk-mixed-enabled", action="store_true")
+    parser.add_argument("--no-clover-host-qk-mixed-enabled", action="store_true")
     args = parser.parse_args()
 
     if args.pim_qk_mixed_enabled and args.no_pim_qk_mixed_enabled:
@@ -186,6 +195,8 @@ def main():
         raise ValueError("cannot set both --clover-shadow-checks-enabled and --no-clover-shadow-checks-enabled")
     if args.clover_op_profiling_enabled and args.no_clover_op_profiling_enabled:
         raise ValueError("cannot set both --clover-op-profiling-enabled and --no-clover-op-profiling-enabled")
+    if args.clover_host_qk_mixed_enabled and args.no_clover_host_qk_mixed_enabled:
+        raise ValueError("cannot set both --clover-host-qk-mixed-enabled and --no-clover-host-qk-mixed-enabled")
 
     pim_qk_mixed_enabled = True
     if args.no_pim_qk_mixed_enabled:
@@ -217,6 +228,11 @@ def main():
     clover_op_profiling_enabled = True
     if args.no_clover_op_profiling_enabled:
         clover_op_profiling_enabled = False
+    clover_host_qk_mixed_enabled = False
+    if args.clover_host_qk_mixed_enabled:
+        clover_host_qk_mixed_enabled = True
+    if args.no_clover_host_qk_mixed_enabled:
+        clover_host_qk_mixed_enabled = False
 
     prompts = load_prompts(args.data, args.limit)
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
@@ -263,6 +279,9 @@ def main():
         clover_cpu_shadow_enabled=clover_cpu_shadow_enabled,
         clover_shadow_checks_enabled=clover_shadow_checks_enabled,
         clover_op_profiling_enabled=clover_op_profiling_enabled,
+        clover_shadow_check_token_interval=args.clover_shadow_check_token_interval,
+        clover_shadow_check_layer_interval=args.clover_shadow_check_layer_interval,
+        clover_host_qk_mixed_enabled=clover_host_qk_mixed_enabled,
     )
     model = ModelConfig(
         model_name=args.model_name,

@@ -42,6 +42,10 @@ def parse_args():
     parser.add_argument("--no-clover-shadow-checks-enabled", action="store_true")
     parser.add_argument("--clover-op-profiling-enabled", action="store_true")
     parser.add_argument("--no-clover-op-profiling-enabled", action="store_true")
+    parser.add_argument("--clover-shadow-check-token-interval", type=int, default=4)
+    parser.add_argument("--clover-shadow-check-layer-interval", type=int, default=4)
+    parser.add_argument("--clover-host-qk-mixed-enabled", action="store_true")
+    parser.add_argument("--no-clover-host-qk-mixed-enabled", action="store_true")
     parser.add_argument("--decode-step-sync-window-s", type=float, default=0.0)
     parser.add_argument("--decode-step-sync-max-size", type=int, default=8)
     parser.add_argument("--attention-decode-wave-persist-enabled", action="store_true")
@@ -73,6 +77,8 @@ def main():
         raise ValueError("cannot set both --clover-shadow-checks-enabled and --no-clover-shadow-checks-enabled")
     if args.clover_op_profiling_enabled and args.no_clover_op_profiling_enabled:
         raise ValueError("cannot set both --clover-op-profiling-enabled and --no-clover-op-profiling-enabled")
+    if args.clover_host_qk_mixed_enabled and args.no_clover_host_qk_mixed_enabled:
+        raise ValueError("cannot set both --clover-host-qk-mixed-enabled and --no-clover-host-qk-mixed-enabled")
     pim_qk_mixed_enabled = True
     if args.pim_qk_mixed_enabled:
         pim_qk_mixed_enabled = True
@@ -103,6 +109,11 @@ def main():
     clover_op_profiling_enabled = True
     if args.no_clover_op_profiling_enabled:
         clover_op_profiling_enabled = False
+    clover_host_qk_mixed_enabled = False
+    if args.clover_host_qk_mixed_enabled:
+        clover_host_qk_mixed_enabled = True
+    if args.no_clover_host_qk_mixed_enabled:
+        clover_host_qk_mixed_enabled = False
 
     ray.init(
         address=args.address,
@@ -141,6 +152,9 @@ def main():
         clover_cpu_shadow_enabled=clover_cpu_shadow_enabled,
         clover_shadow_checks_enabled=clover_shadow_checks_enabled,
         clover_op_profiling_enabled=clover_op_profiling_enabled,
+        clover_shadow_check_token_interval=args.clover_shadow_check_token_interval,
+        clover_shadow_check_layer_interval=args.clover_shadow_check_layer_interval,
+        clover_host_qk_mixed_enabled=clover_host_qk_mixed_enabled,
     )
     model = ModelConfig(model_path=args.model, max_new_tokens=args.max_new_tokens)
 
@@ -174,6 +188,9 @@ def main():
             assert debug["clover_cpu_shadow_enabled"] == clover_cpu_shadow_enabled, debug
             assert debug["clover_shadow_checks_enabled"] == clover_shadow_checks_enabled, debug
             assert debug["clover_op_profiling_enabled"] == clover_op_profiling_enabled, debug
+            assert debug["clover_shadow_check_token_interval"] == args.clover_shadow_check_token_interval, debug
+            assert debug["clover_shadow_check_layer_interval"] == args.clover_shadow_check_layer_interval, debug
+            assert debug["clover_host_qk_mixed_enabled"] == clover_host_qk_mixed_enabled, debug
 
     if not args.skip_generation:
         output, metrics = ray.get(
