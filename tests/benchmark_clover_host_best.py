@@ -43,6 +43,27 @@ def build_prompt_for_target_tokens(tokenizer, target_tokens: int) -> tuple[str, 
 
 
 def make_scheduler(args):
+    mode = str(args.mode)
+    clover_pim_context_fused_experimental_enabled = False
+    if mode == "host_best":
+        pim_resident_store_backend = "host"
+        pim_qk_full_enabled = False
+        pim_softmax_av_fused_enabled = False
+        clover_cpu_shadow_enabled = True
+        clover_shadow_checks_enabled = True
+        clover_host_qk_mixed_enabled = False
+        clover_pim_attention_enabled = False
+    elif mode == "pim_full":
+        pim_resident_store_backend = "upmem_kvslot"
+        pim_qk_full_enabled = True
+        pim_softmax_av_fused_enabled = True
+        clover_cpu_shadow_enabled = True
+        clover_shadow_checks_enabled = True
+        clover_host_qk_mixed_enabled = False
+        clover_pim_attention_enabled = True
+    else:
+        raise ValueError(f"Unsupported mode: {mode}")
+
     cluster = ClusterConfig(
         num_prefill_workers=1,
         num_attention_nodes=1,
@@ -54,17 +75,21 @@ def make_scheduler(args):
         use_gpu_for_decode_dense=True,
         attention_backend="cloverinfer",
         pim_num_dpus=args.pim_num_dpus,
-        pim_resident_store_backend="host",
+        pim_resident_store_backend=pim_resident_store_backend,
+        pim_qk_full_enabled=pim_qk_full_enabled,
+        pim_softmax_av_fused_enabled=pim_softmax_av_fused_enabled,
         pim_qk_mixed_enabled=True,
         pim_qk_mixed_heads=args.pim_qk_mixed_heads,
         pim_qk_mixed_window=args.pim_qk_mixed_window,
         pim_length=args.pim_length,
-        clover_cpu_shadow_enabled=True,
-        clover_shadow_checks_enabled=True,
+        clover_cpu_shadow_enabled=clover_cpu_shadow_enabled,
+        clover_shadow_checks_enabled=clover_shadow_checks_enabled,
         clover_op_profiling_enabled=True,
         clover_shadow_check_token_interval=4,
         clover_shadow_check_layer_interval=4,
-        clover_host_qk_mixed_enabled=False,
+        clover_host_qk_mixed_enabled=clover_host_qk_mixed_enabled,
+        clover_pim_attention_enabled=clover_pim_attention_enabled,
+        clover_pim_context_fused_experimental_enabled=clover_pim_context_fused_experimental_enabled,
     )
     model = ModelConfig(
         model_name=args.model_name,
@@ -239,6 +264,7 @@ def main():
     parser.add_argument("--model", default="/home/cml/CloverInfer/model/opt-125m")
     parser.add_argument("--model-name", default="opt-125m")
     parser.add_argument("--dtype", default="float16")
+    parser.add_argument("--mode", default="host_best", choices=["host_best", "pim_full"])
     parser.add_argument("--prompt", default="Hello CloverInfer")
     parser.add_argument("--prompt-token-length", type=int, default=256)
     parser.add_argument("--max-new-tokens", type=int, default=8)
@@ -281,6 +307,7 @@ def main():
                     "type": "meta",
                     "config": {
                         "prompt_token_length": int(prompt_token_length),
+                        "mode": str(args.mode),
                         "max_new_tokens": int(args.max_new_tokens),
                         "warmup_runs": int(args.warmup_runs),
                         "repeats": int(args.repeats),
@@ -292,6 +319,8 @@ def main():
                         "clover_shadow_check_token_interval": 4,
                         "clover_shadow_check_layer_interval": 4,
                         "clover_host_qk_mixed_enabled": False,
+                        "clover_pim_attention_enabled": bool(args.mode == "pim_full"),
+                        "clover_pim_context_fused_experimental_enabled": False,
                     },
                     "placement": placement,
                 }

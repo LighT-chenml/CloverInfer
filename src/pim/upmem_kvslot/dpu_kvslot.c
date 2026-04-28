@@ -544,7 +544,11 @@ static void run_qk_slot_kernel(void)
     if (tasklet_id == 0) {
         for (uint32_t head_row = num_heads; head_row < KVSLOT_MAX_HEADS; ++head_row) {
             qk_slot_rowmax_bits[head_row] = 0u;
+            qk_slot_head_indices[head_row] = 0u;
             qk_slot_row_sums[head_row] = 0.0f;
+        }
+        for (uint32_t head_row = 0; head_row < num_heads; ++head_row) {
+            qk_slot_head_indices[head_row] = float_to_u32_bits(qk_slot_row_sums[head_row]);
         }
     }
     barrier_wait(&kvslot_barrier);

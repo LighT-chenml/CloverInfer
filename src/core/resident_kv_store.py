@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import os
 import numpy as np
 import struct
 import subprocess
+import time
 from typing import Dict
 
 import torch
@@ -104,7 +106,9 @@ class _KVSlotHelperClient:
     CMD_QK_SLOT_BATCH = 9
     CMD_SOFTMAX_AV_BATCH = 10
     CMD_QK_SOFTMAX_AV_BATCH = 11
+    CMD_QK_SOFTMAX_AV_PARTIAL_BATCH = 12
     MAX_SLOTS_PER_DPU = 64
+    MAX_BATCH_ITEMS = 32
 
     def __init__(self, binary_path: str, num_dpus: int, cwd: str, kv_dtype: str = "fp32"):
         self.binary_path = binary_path
@@ -306,6 +310,11 @@ class _KVSlotHelperClient:
     def qk_slot_scores_batch(self, slot_queries: list[tuple[int, list[int], int, torch.Tensor]]) -> list[torch.Tensor]:
         if not slot_queries:
             return []
+        if len(slot_queries) > self.MAX_BATCH_ITEMS:
+            outputs: list[torch.Tensor] = []
+            for offset in range(0, len(slot_queries), self.MAX_BATCH_ITEMS):
+                outputs.extend(self.qk_slot_scores_batch(slot_queries[offset : offset + self.MAX_BATCH_ITEMS]))
+            return outputs
 
         payload_parts: list[bytes | memoryview] = [
             struct.pack("<IIII", self.MAGIC, self.CMD_QK_SLOT_BATCH, 0, 0),
@@ -388,6 +397,11 @@ class _KVSlotHelperClient:
     def weighted_value_sum_batch(self, slot_weights: list[tuple[int, torch.Tensor]]) -> list[torch.Tensor]:
         if not slot_weights:
             return []
+        if len(slot_weights) > self.MAX_BATCH_ITEMS:
+            outputs: list[torch.Tensor] = []
+            for offset in range(0, len(slot_weights), self.MAX_BATCH_ITEMS):
+                outputs.extend(self.weighted_value_sum_batch(slot_weights[offset : offset + self.MAX_BATCH_ITEMS]))
+            return outputs
 
         payload_parts: list[bytes | memoryview] = [
             struct.pack("<IIII", self.MAGIC, self.CMD_AV_BATCH, 0, 0),
@@ -429,6 +443,13 @@ class _KVSlotHelperClient:
     def softmax_weighted_value_sum_batch(self, slot_scores: list[tuple[int, torch.Tensor]]) -> list[torch.Tensor]:
         if not slot_scores:
             return []
+        if len(slot_scores) > self.MAX_BATCH_ITEMS:
+            outputs: list[torch.Tensor] = []
+            for offset in range(0, len(slot_scores), self.MAX_BATCH_ITEMS):
+                outputs.extend(
+                    self.softmax_weighted_value_sum_batch(slot_scores[offset : offset + self.MAX_BATCH_ITEMS])
+                )
+            return outputs
 
         payload_parts: list[bytes | memoryview] = [
             struct.pack("<IIII", self.MAGIC, self.CMD_SOFTMAX_AV_BATCH, 0, 0),
@@ -478,6 +499,15 @@ class _KVSlotHelperClient:
     ) -> list[torch.Tensor]:
         if not slot_queries:
             return []
+        if len(slot_queries) > self.MAX_BATCH_ITEMS:
+            outputs: list[torch.Tensor] = []
+            for offset in range(0, len(slot_queries), self.MAX_BATCH_ITEMS):
+                outputs.extend(
+                    self.qk_softmax_weighted_value_sum_batch(
+                        slot_queries[offset : offset + self.MAX_BATCH_ITEMS]
+                    )
+                )
+            return outputs
 
         payload_parts: list[bytes | memoryview] = [
             struct.pack("<IIII", self.MAGIC, self.CMD_QK_SOFTMAX_AV_BATCH, 0, 0),
@@ -529,6 +559,76 @@ class _KVSlotHelperClient:
             contexts.append(context)
         return contexts
 
+    def qk_softmax_weighted_value_sum_partial_batch(
+        self,
+        slot_queries: list[tuple[int, list[int], int, torch.Tensor, float]],
+    ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if not slot_queries:
+            return []
+        if len(slot_queries) > self.MAX_BATCH_ITEMS:
+            outputs: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+            for offset in range(0, len(slot_queries), self.MAX_BATCH_ITEMS):
+                outputs.extend(
+                    self.qk_softmax_weighted_value_sum_partial_batch(
+                        slot_queries[offset : offset + self.MAX_BATCH_ITEMS]
+                    )
+                )
+            return outputs
+
+        payload_parts: list[bytes | memoryview] = [
+            struct.pack("<IIII", self.MAGIC, self.CMD_QK_SOFTMAX_AV_PARTIAL_BATCH, 0, 0),
+            struct.pack("<IIII", int(len(slot_queries)), 0, 0, 0),
+        ]
+        expected_meta = []
+
+        for slot_id, local_head_indices, window, queries, score_scale in slot_queries:
+            q = (
+                queries
+                if queries.device.type == "cpu" and queries.dtype == torch.float32 and queries.is_contiguous()
+                else queries.detach().cpu().to(torch.float32).contiguous()
+            )
+            if q.dim() != 2:
+                raise ValueError(f"slot queries must be 2D, got shape {tuple(q.shape)}")
+            num_heads = int(q.shape[0])
+            head_dim = int(q.shape[1])
+            if num_heads != len(local_head_indices):
+                raise ValueError(
+                    f"slot query head count mismatch: queries={num_heads} local_head_indices={len(local_head_indices)}"
+                )
+            payload_parts.append(struct.pack("<I", int(slot_id)))
+            payload_parts.append(struct.pack("<IIIf", num_heads, int(window), head_dim, float(score_scale)))
+            payload_parts.append(struct.pack(f"<{num_heads}I", *[int(idx) for idx in local_head_indices]))
+            payload_parts.append(memoryview(q.numpy()).cast("B"))
+            expected_meta.append((num_heads, head_dim))
+
+        self._write_parts(payload_parts)
+
+        out_args = struct.unpack("<IIII", self._read_exact(16))
+        out_num_items = int(out_args[0])
+        if out_num_items != len(slot_queries):
+            raise RuntimeError(
+                "kvslot helper returned invalid qk-softmax-av-partial batch header: "
+                f"expected={len(slot_queries)} actual={out_num_items}"
+            )
+
+        outputs: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        for idx, (expected_heads, expected_head_dim) in enumerate(expected_meta):
+            out = struct.unpack("<IIIII", self._read_exact(20))
+            _, _, group_heads, head_dim, _ = (int(item) for item in out)
+            if group_heads != expected_heads or head_dim != expected_head_dim:
+                raise RuntimeError(
+                    "kvslot helper returned invalid qk-softmax-av-partial batch item header: "
+                    f"index={idx} expected=({expected_heads}, {expected_head_dim}) actual=({group_heads}, {head_dim})"
+                )
+            raw_context = self._read_exact(group_heads * head_dim * 4)
+            raw_row_max = self._read_exact(group_heads * 4)
+            raw_row_sum = self._read_exact(group_heads * 4)
+            context = torch.from_numpy(np.frombuffer(raw_context, dtype="<f4").copy()).view(group_heads, head_dim)
+            row_max = torch.from_numpy(np.frombuffer(raw_row_max, dtype="<f4").copy())
+            row_sum = torch.from_numpy(np.frombuffer(raw_row_sum, dtype="<f4").copy())
+            outputs.append((context, row_max, row_sum))
+        return outputs
+
 
 class HostResidentKVStore(ResidentKVStore):
     backend_name = "host_slot_store"
@@ -542,6 +642,29 @@ class HostResidentKVStore(ResidentKVStore):
         self.materialize_ops = 0
         self.current_allocated_bytes = 0
         self.peak_allocated_bytes = 0
+        self.op_timing_totals_s: Dict[str, float] = {
+            "allocate_group": 0.0,
+            "append_group": 0.0,
+            "materialize_group": 0.0,
+            "free_group": 0.0,
+            "qk_slot_scores_batch": 0.0,
+            "weighted_value_sum_batch": 0.0,
+            "softmax_weighted_value_sum_batch": 0.0,
+            "qk_softmax_weighted_value_sum_batch": 0.0,
+        }
+        self.op_timing_counts: Dict[str, int] = {key: 0 for key in self.op_timing_totals_s}
+        self.batch_item_totals: Dict[str, int] = {
+            "qk_slot_scores_batch": 0,
+            "weighted_value_sum_batch": 0,
+            "softmax_weighted_value_sum_batch": 0,
+            "qk_softmax_weighted_value_sum_batch": 0,
+        }
+
+    def _record_timing(self, name: str, started_at: float, batch_items: int | None = None) -> None:
+        self.op_timing_totals_s[name] += float(time.perf_counter() - started_at)
+        self.op_timing_counts[name] += 1
+        if batch_items is not None and name in self.batch_item_totals:
+            self.batch_item_totals[name] += int(batch_items)
 
     def _slot_key(self, k_slot: str, v_slot: str) -> tuple[str, str]:
         return (k_slot, v_slot)
@@ -563,6 +686,7 @@ class HostResidentKVStore(ResidentKVStore):
         preferred_dpu: int | None = None,
         force_host_fallback: bool = False,
     ) -> None:
+        started_at = time.perf_counter()
         key = self._slot_key(k_slot, v_slot)
         if key in self.groups:
             raise ValueError(f"KV slot already exists: {key}")
@@ -590,6 +714,7 @@ class HostResidentKVStore(ResidentKVStore):
         self.total_allocations += 1
         self.live_slots += 1
         self._adjust_allocated_bytes(0, self._slot_bytes(slot))
+        self._record_timing("allocate_group", started_at)
 
     def _grow_slot(self, slot: _HostKVSlot, target_seq_len: int) -> None:
         old_bytes = self._slot_bytes(slot)
@@ -612,6 +737,7 @@ class HostResidentKVStore(ResidentKVStore):
         k_new: torch.Tensor,
         v_new: torch.Tensor,
     ) -> Dict[str, int]:
+        started_at = time.perf_counter()
         key = self._slot_key(k_slot, v_slot)
         if key not in self.groups:
             raise KeyError(f"Unknown KV slot: {key}")
@@ -635,21 +761,26 @@ class HostResidentKVStore(ResidentKVStore):
         slot.v_cache[slot.seq_len : expected_seq_len] = v_new.contiguous()
         slot.seq_len = expected_seq_len
         self.append_ops += 1
-        return {
+        result = {
             "seq_len": slot.seq_len,
             "capacity": slot.capacity,
         }
+        self._record_timing("append_group", started_at)
+        return result
 
     def materialize_group(self, k_slot: str, v_slot: str) -> tuple[torch.Tensor, torch.Tensor]:
+        started_at = time.perf_counter()
         key = self._slot_key(k_slot, v_slot)
         if key not in self.groups:
             raise KeyError(f"Unknown KV slot: {key}")
         slot = self.groups[key]
         self.materialize_ops += 1
-        return (
+        result = (
             slot.k_cache[: slot.seq_len].contiguous(),
             slot.v_cache[: slot.seq_len].contiguous(),
         )
+        self._record_timing("materialize_group", started_at)
+        return result
 
     def slot_debug(self, k_slot: str, v_slot: str) -> Dict[str, object]:
         key = self._slot_key(k_slot, v_slot)
@@ -666,12 +797,14 @@ class HostResidentKVStore(ResidentKVStore):
         }
 
     def free_group(self, k_slot: str, v_slot: str) -> None:
+        started_at = time.perf_counter()
         key = self._slot_key(k_slot, v_slot)
         slot = self.groups.pop(key, None)
         if slot is None:
             return
         self.live_slots -= 1
         self._adjust_allocated_bytes(self._slot_bytes(slot), 0)
+        self._record_timing("free_group", started_at)
 
     def get_debug_info(self) -> Dict[str, object]:
         return {
@@ -683,6 +816,9 @@ class HostResidentKVStore(ResidentKVStore):
             "materialize_ops": self.materialize_ops,
             "current_allocated_bytes": self.current_allocated_bytes,
             "peak_allocated_bytes": self.peak_allocated_bytes,
+            "op_timing_totals_s": dict(self.op_timing_totals_s),
+            "op_timing_counts": dict(self.op_timing_counts),
+            "batch_item_totals": dict(self.batch_item_totals),
         }
 
     def qk_scores_batch(self, queries: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
@@ -694,6 +830,7 @@ class HostResidentKVStore(ResidentKVStore):
         self,
         slot_queries: list[tuple[str, str, list[int], int, torch.Tensor]],
     ) -> list[torch.Tensor]:
+        started_at = time.perf_counter()
         outputs: list[torch.Tensor] = []
         for k_slot, v_slot, local_head_indices, window, queries in slot_queries:
             key = self._slot_key(k_slot, v_slot)
@@ -718,6 +855,7 @@ class HostResidentKVStore(ResidentKVStore):
                 keys = slot.k_cache[slot.seq_len - actual_window : slot.seq_len, local_head_idx, :head_dim].float().contiguous()
                 score_rows.append(torch.einsum("ld,d->l", keys, query_vec).contiguous())
             outputs.append(torch.stack(score_rows, dim=0))
+        self._record_timing("qk_slot_scores_batch", started_at, batch_items=len(slot_queries))
         return outputs
 
     def weighted_value_sum(self, k_slot: str, v_slot: str, weights: torch.Tensor) -> torch.Tensor:
@@ -735,12 +873,16 @@ class HostResidentKVStore(ResidentKVStore):
         return torch.einsum("hl,lhd->hd", w, values).contiguous()
 
     def weighted_value_sum_batch(self, slot_weights: list[tuple[str, str, torch.Tensor]]) -> list[torch.Tensor]:
-        return [self.weighted_value_sum(k_slot, v_slot, weights) for k_slot, v_slot, weights in slot_weights]
+        started_at = time.perf_counter()
+        outputs = [self.weighted_value_sum(k_slot, v_slot, weights) for k_slot, v_slot, weights in slot_weights]
+        self._record_timing("weighted_value_sum_batch", started_at, batch_items=len(slot_weights))
+        return outputs
 
     def softmax_weighted_value_sum_batch(
         self,
         slot_scores: list[tuple[str, str, torch.Tensor]],
     ) -> list[torch.Tensor]:
+        started_at = time.perf_counter()
         contexts: list[torch.Tensor] = []
         for k_slot, v_slot, scores in slot_scores:
             key = self._slot_key(k_slot, v_slot)
@@ -756,12 +898,14 @@ class HostResidentKVStore(ResidentKVStore):
             values = slot.v_cache[: slot.seq_len].float()
             weights = torch.softmax(s, dim=-1)
             contexts.append(torch.einsum("hl,lhd->hd", weights, values).contiguous())
+        self._record_timing("softmax_weighted_value_sum_batch", started_at, batch_items=len(slot_scores))
         return contexts
 
     def qk_softmax_weighted_value_sum_batch(
         self,
         slot_queries: list[tuple[str, str, list[int], int, torch.Tensor, float]],
     ) -> list[torch.Tensor]:
+        started_at = time.perf_counter()
         contexts: list[torch.Tensor] = []
         for k_slot, v_slot, local_head_indices, window, queries, score_scale in slot_queries:
             key = self._slot_key(k_slot, v_slot)
@@ -789,6 +933,7 @@ class HostResidentKVStore(ResidentKVStore):
                 weights = torch.softmax(scores, dim=-1)
                 row_contexts.append(torch.einsum("l,ld->d", weights, values[:, local_head_idx, :]).contiguous())
             contexts.append(torch.stack(row_contexts, dim=0))
+        self._record_timing("qk_softmax_weighted_value_sum_batch", started_at, batch_items=len(slot_queries))
         return contexts
 
 
@@ -821,9 +966,53 @@ class UpmemKVSlotStore(ResidentKVStore):
         self.dpu_live_slots = 0
         self.dpu_capacity_fallbacks = 0
         self.dpu_live_elems_by_dpu = [0 for _ in range(num_dpus)]
+        self.op_timing_totals_s: Dict[str, float] = {
+            "allocate_group": 0.0,
+            "append_group": 0.0,
+            "materialize_group": 0.0,
+            "free_group": 0.0,
+            "qk_slot_scores_batch_total": 0.0,
+            "qk_slot_scores_batch_dpu": 0.0,
+            "qk_slot_scores_batch_host_fallback": 0.0,
+            "weighted_value_sum_batch_total": 0.0,
+            "weighted_value_sum_batch_dpu": 0.0,
+            "weighted_value_sum_batch_host_fallback": 0.0,
+            "softmax_weighted_value_sum_batch_total": 0.0,
+            "softmax_weighted_value_sum_batch_dpu": 0.0,
+            "softmax_weighted_value_sum_batch_host_fallback": 0.0,
+            "qk_softmax_weighted_value_sum_batch_total": 0.0,
+            "qk_softmax_weighted_value_sum_batch_dpu": 0.0,
+            "qk_softmax_weighted_value_sum_batch_host_fallback": 0.0,
+        }
+        self.op_timing_counts: Dict[str, int] = {key: 0 for key in self.op_timing_totals_s}
+        self.batch_item_totals: Dict[str, int] = {
+            "qk_slot_scores_batch_total": 0,
+            "qk_slot_scores_batch_segmented_logical_items": 0,
+            "qk_slot_scores_batch_dpu_items": 0,
+            "qk_slot_scores_batch_host_fallback_items": 0,
+            "weighted_value_sum_batch_total": 0,
+            "weighted_value_sum_batch_segmented_logical_items": 0,
+            "weighted_value_sum_batch_dpu_items": 0,
+            "weighted_value_sum_batch_host_fallback_items": 0,
+            "softmax_weighted_value_sum_batch_total": 0,
+            "softmax_weighted_value_sum_batch_segmented_logical_items": 0,
+            "softmax_weighted_value_sum_batch_dpu_items": 0,
+            "softmax_weighted_value_sum_batch_host_fallback_items": 0,
+            "qk_softmax_weighted_value_sum_batch_total": 0,
+            "qk_softmax_weighted_value_sum_batch_segmented_logical_items": 0,
+            "qk_softmax_weighted_value_sum_batch_dpu_items": 0,
+            "qk_softmax_weighted_value_sum_batch_host_fallback_items": 0,
+        }
+
+    def _record_timing(self, name: str, started_at: float) -> None:
+        self.op_timing_totals_s[name] += float(time.perf_counter() - started_at)
+        self.op_timing_counts[name] += 1
 
     def _slot_key(self, k_slot: str, v_slot: str) -> tuple[str, str]:
         return (k_slot, v_slot)
+
+    def _segment_slot_key(self, key: tuple[str, str], segment_idx: int) -> tuple[str, str]:
+        return (f"{key[0]}#seg{segment_idx}", f"{key[1]}#seg{segment_idx}")
 
     def _normalize_preferred_dpu(self, preferred_dpu: int | None) -> int:
         if self.num_dpus <= 0:
@@ -870,6 +1059,65 @@ class UpmemKVSlotStore(ResidentKVStore):
             return max(1, (elem_count + 1) // 2)
         return elem_count
 
+    def _build_segment_layout(self, capacity: int, seq_len: int) -> list[tuple[int, int]]:
+        remaining_capacity = int(capacity)
+        remaining_seq_len = int(seq_len)
+        layout: list[tuple[int, int]] = []
+        while remaining_capacity > 0:
+            segment_capacity = min(256, remaining_capacity)
+            segment_seq_len = min(segment_capacity, remaining_seq_len)
+            layout.append((segment_capacity, segment_seq_len))
+            remaining_capacity -= segment_capacity
+            remaining_seq_len -= segment_seq_len
+        return layout
+
+    def _supports_dpu_shape(self, group_heads: int, head_dim: int) -> bool:
+        return int(group_heads) <= 32 and int(head_dim) <= 128
+
+    def _free_segment_infos(self, segments: list[Dict[str, object]]) -> None:
+        for segment in reversed(segments):
+            slot_id = int(segment["slot_id"])
+            physical_dpu = int(segment["physical_dpu"]) % max(self.num_dpus, 1)
+            try:
+                self.helper.free_group(slot_id)
+            except Exception:
+                pass
+            self.dpu_free_ops += 1
+            self.dpu_live_slots = max(0, self.dpu_live_slots - 1)
+            elem_count = int(segment.get("elem_count", 0))
+            self.dpu_live_elems_by_dpu[physical_dpu] = max(
+                0, self.dpu_live_elems_by_dpu[physical_dpu] - elem_count
+            )
+            segment_key = tuple(segment["segment_key"])
+            self._slot_id_map.pop(segment_key, None)
+            self._free_slot_ids_by_dpu[physical_dpu].append(slot_id)
+        self.helper.persistent_state_active = self.dpu_live_slots > 0
+        if self.dpu_live_slots == 0:
+            self.helper.close()
+
+    def _active_segment_plan(
+        self,
+        slot_info: Dict[str, object],
+        window: int | None = None,
+    ) -> list[tuple[Dict[str, object], int]]:
+        segments = slot_info.get("segments", [])
+        if not segments:
+            return []
+        if window is None:
+            return [(segment, int(segment["seq_len"])) for segment in segments if int(segment["seq_len"]) > 0]
+        remaining = min(int(window), int(slot_info["seq_len"]))
+        plan_reversed: list[tuple[Dict[str, object], int]] = []
+        for segment in reversed(segments):
+            if remaining <= 0:
+                break
+            segment_seq_len = int(segment["seq_len"])
+            if segment_seq_len <= 0:
+                continue
+            take_len = min(segment_seq_len, remaining)
+            plan_reversed.append((segment, take_len))
+            remaining -= take_len
+        return list(reversed(plan_reversed))
+
     def allocate_group(
         self,
         k_slot: str,
@@ -880,11 +1128,78 @@ class UpmemKVSlotStore(ResidentKVStore):
         preferred_dpu: int | None = None,
         force_host_fallback: bool = False,
     ) -> None:
+        started_at = time.perf_counter()
         key = self._slot_key(k_slot, v_slot)
-        slot_id = self._assign_slot_id(key, preferred_dpu=preferred_dpu)
         seq_len, group_heads, head_dim = (int(dim) for dim in initial_k.shape)
         physical_dpu = self._normalize_preferred_dpu(preferred_dpu) if self.num_dpus > 0 else 0
         elem_count = self._slot_elem_count(capacity, group_heads, head_dim)
+        if not force_host_fallback and self._supports_dpu_shape(group_heads, head_dim):
+            if capacity > 256 or seq_len > 256:
+                segment_layout = self._build_segment_layout(capacity, seq_len)
+                allocated_segments: list[Dict[str, object]] = []
+                seq_offset = 0
+                allocation_failed = False
+                for segment_idx, (segment_capacity, segment_seq_len) in enumerate(segment_layout):
+                    segment_key = self._segment_slot_key(key, segment_idx)
+                    segment_physical_dpu = (
+                        (physical_dpu + segment_idx) % max(self.num_dpus, 1) if self.num_dpus > 0 else 0
+                    )
+                    segment_slot_id = self._assign_slot_id(segment_key, preferred_dpu=segment_physical_dpu)
+                    segment_initial_k = initial_k[seq_offset : seq_offset + segment_seq_len].contiguous()
+                    segment_initial_v = initial_v[seq_offset : seq_offset + segment_seq_len].contiguous()
+                    segment_elem_count = self._slot_elem_count(segment_capacity, group_heads, head_dim)
+                    if not self._supports_dpu_slot(segment_initial_k, segment_capacity, segment_slot_id):
+                        allocation_failed = True
+                        break
+                    if self.dpu_live_elems_by_dpu[segment_physical_dpu] + segment_elem_count > self.POOL_CAPACITY_ELEMS:
+                        self.dpu_capacity_fallbacks += 1
+                        allocation_failed = True
+                        break
+                    try:
+                        info = self.helper.allocate_group(
+                            segment_slot_id,
+                            segment_capacity,
+                            self._encode_tensor(segment_initial_k),
+                            self._encode_tensor(segment_initial_v),
+                        )
+                    except Exception:
+                        self.dpu_allocate_failures += 1
+                        allocation_failed = True
+                        break
+                    allocated_segments.append(
+                        {
+                            "segment_key": list(segment_key),
+                            "slot_id": int(segment_slot_id),
+                            "physical_dpu": int(segment_physical_dpu),
+                            "elem_count": int(segment_elem_count),
+                            "seq_len": int(info["seq_len"]),
+                            "capacity": int(info["capacity"]),
+                            "group_heads": int(info["group_heads"]),
+                            "head_dim": int(info["head_dim"]),
+                        }
+                    )
+                    self.dpu_allocations += 1
+                    self.dpu_live_slots += 1
+                    self.dpu_live_elems_by_dpu[segment_physical_dpu] += segment_elem_count
+                    self.helper.persistent_state_active = True
+                    seq_offset += segment_seq_len
+                if not allocation_failed and allocated_segments:
+                    self.slot_mapping[key] = {
+                        "backend": "dpu_segmented",
+                        "segments": allocated_segments,
+                        "seq_len": int(seq_len),
+                        "capacity": int(capacity),
+                        "group_heads": int(group_heads),
+                        "head_dim": int(head_dim),
+                    }
+                    self._record_timing("allocate_group", started_at)
+                    return
+                if allocated_segments:
+                    self._free_segment_infos(allocated_segments)
+            slot_id = self._assign_slot_id(key, preferred_dpu=preferred_dpu)
+        else:
+            slot_id = self._assign_slot_id(key, preferred_dpu=preferred_dpu)
+
         if not force_host_fallback and self._supports_dpu_slot(initial_k, capacity, slot_id):
             if self.dpu_live_elems_by_dpu[physical_dpu] + elem_count > self.POOL_CAPACITY_ELEMS:
                 self.dpu_capacity_fallbacks += 1
@@ -916,6 +1231,7 @@ class UpmemKVSlotStore(ResidentKVStore):
                     self.dpu_live_slots += 1
                     self.dpu_live_elems_by_dpu[physical_dpu] += elem_count
                     self.helper.persistent_state_active = True
+                    self._record_timing("allocate_group", started_at)
                     return
 
         self.host_fallback.allocate_group(
@@ -933,6 +1249,7 @@ class UpmemKVSlotStore(ResidentKVStore):
             "elem_count": elem_count,
         }
         self.fallback_allocations += 1
+        self._record_timing("allocate_group", started_at)
 
     def append_group(
         self,
@@ -941,8 +1258,36 @@ class UpmemKVSlotStore(ResidentKVStore):
         k_new: torch.Tensor,
         v_new: torch.Tensor,
     ) -> Dict[str, int]:
+        started_at = time.perf_counter()
         key = self._slot_key(k_slot, v_slot)
         slot_info = self.slot_mapping[key]
+        if slot_info["backend"] == "dpu_segmented":
+            append_offset = 0
+            append_total = int(k_new.shape[0])
+            for segment in slot_info["segments"]:
+                if append_offset >= append_total:
+                    break
+                available = int(segment["capacity"]) - int(segment["seq_len"])
+                if available <= 0:
+                    continue
+                take_len = min(available, append_total - append_offset)
+                result = self.helper.append_group(
+                    int(segment["slot_id"]),
+                    self._encode_tensor(k_new[append_offset : append_offset + take_len].contiguous()),
+                    self._encode_tensor(v_new[append_offset : append_offset + take_len].contiguous()),
+                )
+                segment["seq_len"] = int(result["seq_len"])
+                segment["capacity"] = int(result["capacity"])
+                append_offset += take_len
+            if append_offset != append_total:
+                raise RuntimeError(f"Segmented DPU slot capacity exceeded for {key}")
+            slot_info["seq_len"] = int(slot_info["seq_len"]) + append_total
+            out = {
+                "seq_len": int(slot_info["seq_len"]),
+                "capacity": int(slot_info["capacity"]),
+            }
+            self._record_timing("append_group", started_at)
+            return out
         if slot_info["backend"] == "dpu":
             result = self.helper.append_group(
                 int(slot_info["slot_id"]),
@@ -951,25 +1296,68 @@ class UpmemKVSlotStore(ResidentKVStore):
             )
             slot_info["seq_len"] = int(result["seq_len"])
             slot_info["capacity"] = int(result["capacity"])
-            return {
+            out = {
                 "seq_len": int(result["seq_len"]),
                 "capacity": int(result["capacity"]),
             }
-        return self.host_fallback.append_group(k_slot, v_slot, k_new, v_new)
+            self._record_timing("append_group", started_at)
+            return out
+        out = self.host_fallback.append_group(k_slot, v_slot, k_new, v_new)
+        self._record_timing("append_group", started_at)
+        return out
 
     def materialize_group(self, k_slot: str, v_slot: str) -> tuple[torch.Tensor, torch.Tensor]:
+        started_at = time.perf_counter()
         key = self._slot_key(k_slot, v_slot)
         slot_info = self.slot_mapping[key]
+        if slot_info["backend"] == "dpu_segmented":
+            materialized_segments = []
+            for segment in slot_info["segments"]:
+                if int(segment["seq_len"]) <= 0:
+                    continue
+                k, v, info = self.helper.materialize_group(int(segment["slot_id"]))
+                segment["seq_len"] = int(info["seq_len"])
+                segment["capacity"] = int(info["capacity"])
+                materialized_segments.append((self._decode_tensor(k), self._decode_tensor(v)))
+            out = (
+                torch.cat([item[0] for item in materialized_segments], dim=0).contiguous(),
+                torch.cat([item[1] for item in materialized_segments], dim=0).contiguous(),
+            )
+            self._record_timing("materialize_group", started_at)
+            return out
         if slot_info["backend"] == "dpu":
             k, v, info = self.helper.materialize_group(int(slot_info["slot_id"]))
             slot_info["seq_len"] = int(info["seq_len"])
             slot_info["capacity"] = int(info["capacity"])
-            return self._decode_tensor(k), self._decode_tensor(v)
-        return self.host_fallback.materialize_group(k_slot, v_slot)
+            out = self._decode_tensor(k), self._decode_tensor(v)
+            self._record_timing("materialize_group", started_at)
+            return out
+        out = self.host_fallback.materialize_group(k_slot, v_slot)
+        self._record_timing("materialize_group", started_at)
+        return out
 
     def slot_debug(self, k_slot: str, v_slot: str) -> Dict[str, object]:
         key = self._slot_key(k_slot, v_slot)
         slot_info = self.slot_mapping[key]
+        if slot_info["backend"] == "dpu_segmented":
+            return {
+                "backend": self.backend_name,
+                "storage": "dpu_segmented",
+                "seq_len": int(slot_info["seq_len"]),
+                "capacity": int(slot_info["capacity"]),
+                "group_heads": int(slot_info["group_heads"]),
+                "head_dim": int(slot_info["head_dim"]),
+                "segment_count": len(slot_info["segments"]),
+                "segments": [
+                    {
+                        "slot_id": int(segment["slot_id"]),
+                        "physical_dpu": int(segment["physical_dpu"]),
+                        "seq_len": int(segment["seq_len"]),
+                        "capacity": int(segment["capacity"]),
+                    }
+                    for segment in slot_info["segments"]
+                ],
+            }
         if slot_info["backend"] == "dpu":
             return {
                 "backend": self.backend_name,
@@ -986,9 +1374,14 @@ class UpmemKVSlotStore(ResidentKVStore):
         return debug
 
     def free_group(self, k_slot: str, v_slot: str) -> None:
+        started_at = time.perf_counter()
         key = self._slot_key(k_slot, v_slot)
         slot_info = self.slot_mapping.pop(key, None)
         if slot_info is None:
+            return
+        if slot_info["backend"] == "dpu_segmented":
+            self._free_segment_infos(slot_info["segments"])
+            self._record_timing("free_group", started_at)
             return
         slot_id = self._slot_id_map.pop(key, None)
         if slot_info["backend"] == "dpu":
@@ -1008,6 +1401,7 @@ class UpmemKVSlotStore(ResidentKVStore):
         if slot_id is not None:
             physical_dpu = int(slot_info.get("physical_dpu", 0)) % max(self.num_dpus, 1)
             self._free_slot_ids_by_dpu[physical_dpu].append(int(slot_id))
+        self._record_timing("free_group", started_at)
 
     def get_debug_info(self) -> Dict[str, object]:
         allocator_stats = []
@@ -1047,6 +1441,9 @@ class UpmemKVSlotStore(ResidentKVStore):
             ),
             "allocator_stats": allocator_stats,
             "host_fallback": self.host_fallback.get_debug_info(),
+            "op_timing_totals_s": dict(self.op_timing_totals_s),
+            "op_timing_counts": dict(self.op_timing_counts),
+            "batch_item_totals": dict(self.batch_item_totals),
         }
 
     def qk_scores_batch(self, queries: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
@@ -1058,28 +1455,61 @@ class UpmemKVSlotStore(ResidentKVStore):
     ) -> list[torch.Tensor]:
         if not slot_queries:
             return []
+        total_started_at = time.perf_counter()
 
         outputs: list[torch.Tensor | None] = [None for _ in slot_queries]
         dpu_items: list[tuple[int, list[int], int, torch.Tensor]] = []
-        dpu_indices: list[int] = []
+        dpu_refs: list[tuple[str, int]] = []
+        host_fallback_queries: list[tuple[int, tuple[str, str, list[int], int, torch.Tensor]]] = []
+        segmented_outputs: Dict[int, list[torch.Tensor]] = {}
 
         for idx, (k_slot, v_slot, local_head_indices, window, queries) in enumerate(slot_queries):
             key = self._slot_key(k_slot, v_slot)
             slot_info = self.slot_mapping[key]
-            if slot_info["backend"] == "dpu":
+            if slot_info["backend"] == "dpu_segmented":
+                self.batch_item_totals["qk_slot_scores_batch_segmented_logical_items"] += 1
+                actual_window = min(int(window), int(slot_info["seq_len"]))
+                if actual_window <= 0:
+                    outputs[idx] = torch.empty((len(local_head_indices), 0), dtype=torch.float32)
+                    continue
+                for segment, take_len in self._active_segment_plan(slot_info, actual_window):
+                    dpu_items.append(
+                        (int(segment["slot_id"]), [int(v) for v in local_head_indices], int(take_len), queries)
+                    )
+                    dpu_refs.append(("segmented", idx))
+            elif slot_info["backend"] == "dpu":
                 actual_window = min(int(window), int(slot_info["seq_len"]))
                 dpu_items.append((int(slot_info["slot_id"]), [int(v) for v in local_head_indices], actual_window, queries))
-                dpu_indices.append(idx)
+                dpu_refs.append(("regular", idx))
             else:
-                outputs[idx] = self.host_fallback.qk_slot_scores_batch(
-                    [(k_slot, v_slot, [int(v) for v in local_head_indices], window, queries)]
-                )[0]
+                host_fallback_queries.append(
+                    (idx, (k_slot, v_slot, [int(v) for v in local_head_indices], window, queries))
+                )
+
+        if host_fallback_queries:
+            host_started_at = time.perf_counter()
+            host_outputs = self.host_fallback.qk_slot_scores_batch([item for _, item in host_fallback_queries])
+            self._record_timing("qk_slot_scores_batch_host_fallback", host_started_at)
+            self.batch_item_totals["qk_slot_scores_batch_host_fallback_items"] += len(host_fallback_queries)
+            for (idx, _), output in zip(host_fallback_queries, host_outputs):
+                outputs[idx] = output
 
         if dpu_items:
+            dpu_started_at = time.perf_counter()
             dpu_outputs = self.helper.qk_slot_scores_batch(dpu_items)
-            for idx, scores in zip(dpu_indices, dpu_outputs):
-                outputs[idx] = scores
+            self._record_timing("qk_slot_scores_batch_dpu", dpu_started_at)
+            self.batch_item_totals["qk_slot_scores_batch_dpu_items"] += len(dpu_items)
+            for (ref_kind, logical_idx), scores in zip(dpu_refs, dpu_outputs):
+                if ref_kind == "regular":
+                    outputs[logical_idx] = scores
+                else:
+                    segmented_outputs.setdefault(logical_idx, []).append(scores)
 
+        for logical_idx, score_parts in segmented_outputs.items():
+            outputs[logical_idx] = torch.cat(score_parts, dim=1).contiguous()
+
+        self._record_timing("qk_slot_scores_batch_total", total_started_at)
+        self.batch_item_totals["qk_slot_scores_batch_total"] += len(slot_queries)
         return [output for output in outputs if output is not None]
 
     def weighted_value_sum(self, k_slot: str, v_slot: str, weights: torch.Tensor) -> torch.Tensor:
@@ -1092,25 +1522,58 @@ class UpmemKVSlotStore(ResidentKVStore):
     def weighted_value_sum_batch(self, slot_weights: list[tuple[str, str, torch.Tensor]]) -> list[torch.Tensor]:
         if not slot_weights:
             return []
+        total_started_at = time.perf_counter()
 
         contexts: list[torch.Tensor | None] = [None for _ in slot_weights]
         dpu_batch: list[tuple[int, torch.Tensor]] = []
-        dpu_indices: list[int] = []
+        dpu_refs: list[tuple[str, int]] = []
+        host_fallback_weights: list[tuple[int, tuple[str, str, torch.Tensor]]] = []
+        segmented_contexts: Dict[int, torch.Tensor] = {}
 
         for idx, (k_slot, v_slot, weights) in enumerate(slot_weights):
             key = self._slot_key(k_slot, v_slot)
             slot_info = self.slot_mapping[key]
-            if slot_info["backend"] == "dpu":
+            if slot_info["backend"] == "dpu_segmented":
+                self.batch_item_totals["weighted_value_sum_batch_segmented_logical_items"] += 1
+                weight_offset = 0
+                for segment, seg_len in self._active_segment_plan(slot_info):
+                    segment_weights = weights[:, weight_offset : weight_offset + int(seg_len)].contiguous()
+                    weight_offset += int(seg_len)
+                    dpu_batch.append((int(segment["slot_id"]), segment_weights))
+                    dpu_refs.append(("segmented", idx))
+            elif slot_info["backend"] == "dpu":
                 dpu_batch.append((int(slot_info["slot_id"]), weights))
-                dpu_indices.append(idx)
+                dpu_refs.append(("regular", idx))
             else:
-                contexts[idx] = self.host_fallback.weighted_value_sum(k_slot, v_slot, weights)
+                host_fallback_weights.append((idx, (k_slot, v_slot, weights)))
 
-        if dpu_batch:
-            dpu_contexts = self.helper.weighted_value_sum_batch(dpu_batch)
-            for idx, context in zip(dpu_indices, dpu_contexts):
+        if host_fallback_weights:
+            host_started_at = time.perf_counter()
+            host_contexts = self.host_fallback.weighted_value_sum_batch([item for _, item in host_fallback_weights])
+            self._record_timing("weighted_value_sum_batch_host_fallback", host_started_at)
+            self.batch_item_totals["weighted_value_sum_batch_host_fallback_items"] += len(host_fallback_weights)
+            for (idx, _), context in zip(host_fallback_weights, host_contexts):
                 contexts[idx] = context
 
+        if dpu_batch:
+            dpu_started_at = time.perf_counter()
+            dpu_contexts = self.helper.weighted_value_sum_batch(dpu_batch)
+            self._record_timing("weighted_value_sum_batch_dpu", dpu_started_at)
+            self.batch_item_totals["weighted_value_sum_batch_dpu_items"] += len(dpu_batch)
+            for (ref_kind, idx), context in zip(dpu_refs, dpu_contexts):
+                if ref_kind == "regular":
+                    contexts[idx] = context
+                else:
+                    if idx not in segmented_contexts:
+                        segmented_contexts[idx] = context
+                    else:
+                        segmented_contexts[idx] = segmented_contexts[idx] + context
+
+        for idx, context in segmented_contexts.items():
+            contexts[idx] = context
+
+        self._record_timing("weighted_value_sum_batch_total", total_started_at)
+        self.batch_item_totals["weighted_value_sum_batch_total"] += len(slot_weights)
         return [context for context in contexts if context is not None]
 
     def softmax_weighted_value_sum_batch(
@@ -1119,25 +1582,59 @@ class UpmemKVSlotStore(ResidentKVStore):
     ) -> list[torch.Tensor]:
         if not slot_scores:
             return []
+        total_started_at = time.perf_counter()
 
         contexts: list[torch.Tensor | None] = [None for _ in slot_scores]
         dpu_batch: list[tuple[int, torch.Tensor]] = []
         dpu_indices: list[int] = []
+        segmented_scores: list[tuple[int, tuple[str, str, torch.Tensor]]] = []
+        host_fallback_scores: list[tuple[int, tuple[str, str, torch.Tensor]]] = []
 
         for idx, (k_slot, v_slot, scores) in enumerate(slot_scores):
             key = self._slot_key(k_slot, v_slot)
             slot_info = self.slot_mapping[key]
-            if slot_info["backend"] == "dpu":
+            if slot_info["backend"] == "dpu_segmented":
+                self.batch_item_totals["softmax_weighted_value_sum_batch_segmented_logical_items"] += 1
+                segmented_scores.append((idx, (k_slot, v_slot, scores)))
+            elif slot_info["backend"] == "dpu":
                 dpu_batch.append((int(slot_info["slot_id"]), scores))
                 dpu_indices.append(idx)
             else:
-                contexts[idx] = self.host_fallback.softmax_weighted_value_sum_batch([(k_slot, v_slot, scores)])[0]
+                host_fallback_scores.append((idx, (k_slot, v_slot, scores)))
+
+        if host_fallback_scores:
+            host_started_at = time.perf_counter()
+            host_contexts = self.host_fallback.softmax_weighted_value_sum_batch(
+                [item for _, item in host_fallback_scores]
+            )
+            self._record_timing("softmax_weighted_value_sum_batch_host_fallback", host_started_at)
+            self.batch_item_totals["softmax_weighted_value_sum_batch_host_fallback_items"] += len(
+                host_fallback_scores
+            )
+            for (idx, _), context in zip(host_fallback_scores, host_contexts):
+                contexts[idx] = context
 
         if dpu_batch:
+            dpu_started_at = time.perf_counter()
             dpu_contexts = self.helper.softmax_weighted_value_sum_batch(dpu_batch)
+            self._record_timing("softmax_weighted_value_sum_batch_dpu", dpu_started_at)
+            self.batch_item_totals["softmax_weighted_value_sum_batch_dpu_items"] += len(dpu_batch)
             for idx, context in zip(dpu_indices, dpu_contexts):
                 contexts[idx] = context
 
+        if segmented_scores:
+            segmented_weights = []
+            for _, (k_slot, v_slot, scores) in segmented_scores:
+                normalized_scores = scores.detach().cpu().to(torch.float32).contiguous()
+                segmented_weights.append(
+                    (k_slot, v_slot, torch.softmax(normalized_scores, dim=-1))
+                )
+            segmented_contexts = self.weighted_value_sum_batch(segmented_weights)
+            for (idx, _), context in zip(segmented_scores, segmented_contexts):
+                contexts[idx] = context
+
+        self._record_timing("softmax_weighted_value_sum_batch_total", total_started_at)
+        self.batch_item_totals["softmax_weighted_value_sum_batch_total"] += len(slot_scores)
         return [context for context in contexts if context is not None]
 
     def qk_softmax_weighted_value_sum_batch(
@@ -1146,15 +1643,30 @@ class UpmemKVSlotStore(ResidentKVStore):
     ) -> list[torch.Tensor]:
         if not slot_queries:
             return []
+        total_started_at = time.perf_counter()
 
         contexts: list[torch.Tensor | None] = [None for _ in slot_queries]
         dpu_batch: list[tuple[int, list[int], int, torch.Tensor, float]] = []
         dpu_indices: list[int] = []
+        segmented_queries: list[
+            tuple[int, tuple[str, str, list[int], int, torch.Tensor, float]]
+        ] = []
+        host_fallback_queries: list[
+            tuple[int, tuple[str, str, list[int], int, torch.Tensor, float]]
+        ] = []
 
         for idx, (k_slot, v_slot, local_head_indices, window, queries, score_scale) in enumerate(slot_queries):
             key = self._slot_key(k_slot, v_slot)
             slot_info = self.slot_mapping[key]
-            if slot_info["backend"] == "dpu":
+            if slot_info["backend"] == "dpu_segmented":
+                self.batch_item_totals["qk_softmax_weighted_value_sum_batch_segmented_logical_items"] += 1
+                segmented_queries.append(
+                    (
+                        idx,
+                        (k_slot, v_slot, [int(v) for v in local_head_indices], window, queries, float(score_scale)),
+                    )
+                )
+            elif slot_info["backend"] == "dpu":
                 actual_window = min(int(window), int(slot_info["seq_len"]))
                 dpu_batch.append(
                     (
@@ -1167,13 +1679,93 @@ class UpmemKVSlotStore(ResidentKVStore):
                 )
                 dpu_indices.append(idx)
             else:
-                contexts[idx] = self.host_fallback.qk_softmax_weighted_value_sum_batch(
-                    [(k_slot, v_slot, [int(v) for v in local_head_indices], window, queries, float(score_scale))]
-                )[0]
+                host_fallback_queries.append(
+                    (
+                        idx,
+                        (k_slot, v_slot, [int(v) for v in local_head_indices], window, queries, float(score_scale)),
+                    )
+                )
+
+        if host_fallback_queries:
+            host_started_at = time.perf_counter()
+            host_contexts = self.host_fallback.qk_softmax_weighted_value_sum_batch(
+                [item for _, item in host_fallback_queries]
+            )
+            self._record_timing("qk_softmax_weighted_value_sum_batch_host_fallback", host_started_at)
+            self.batch_item_totals["qk_softmax_weighted_value_sum_batch_host_fallback_items"] += len(
+                host_fallback_queries
+            )
+            for (idx, _), context in zip(host_fallback_queries, host_contexts):
+                contexts[idx] = context
 
         if dpu_batch:
+            dpu_started_at = time.perf_counter()
             dpu_contexts = self.helper.qk_softmax_weighted_value_sum_batch(dpu_batch)
+            self._record_timing("qk_softmax_weighted_value_sum_batch_dpu", dpu_started_at)
+            self.batch_item_totals["qk_softmax_weighted_value_sum_batch_dpu_items"] += len(dpu_batch)
             for idx, context in zip(dpu_indices, dpu_contexts):
                 contexts[idx] = context
 
+        if segmented_queries:
+            partial_batch: list[tuple[int, list[int], int, torch.Tensor, float]] = []
+            partial_refs: list[tuple[int, int]] = []
+            merged_contexts: Dict[int, torch.Tensor] = {}
+            merged_row_max: Dict[int, torch.Tensor] = {}
+            merged_row_sum: Dict[int, torch.Tensor] = {}
+
+            for logical_idx, (k_slot, v_slot, local_head_indices, window, queries, score_scale) in segmented_queries:
+                key = self._slot_key(k_slot, v_slot)
+                slot_info = self.slot_mapping[key]
+                actual_window = min(int(window), int(slot_info["seq_len"]))
+                if actual_window <= 0:
+                    contexts[logical_idx] = torch.empty((len(local_head_indices), int(slot_info["head_dim"])), dtype=torch.float32)
+                    continue
+                self.batch_item_totals["qk_softmax_weighted_value_sum_batch_segmented_logical_items"] += 1
+                for segment, take_len in self._active_segment_plan(slot_info, actual_window):
+                    partial_batch.append(
+                        (
+                            int(segment["slot_id"]),
+                            [int(v) for v in local_head_indices],
+                            int(take_len),
+                            queries,
+                            float(score_scale),
+                        )
+                    )
+                    partial_refs.append((logical_idx, len(local_head_indices)))
+
+            if partial_batch:
+                dpu_started_at = time.perf_counter()
+                partial_outputs = self.helper.qk_softmax_weighted_value_sum_partial_batch(partial_batch)
+                self._record_timing("qk_softmax_weighted_value_sum_batch_dpu", dpu_started_at)
+                self.batch_item_totals["qk_softmax_weighted_value_sum_batch_dpu_items"] += len(partial_batch)
+
+                for (logical_idx, _), (segment_context, segment_row_max, segment_row_sum) in zip(partial_refs, partial_outputs):
+                    segment_context = segment_context.to(torch.float32)
+                    segment_row_max = segment_row_max.to(torch.float32)
+                    segment_row_sum = segment_row_sum.to(torch.float32)
+                    if logical_idx not in merged_contexts:
+                        merged_contexts[logical_idx] = segment_context
+                        merged_row_max[logical_idx] = segment_row_max
+                        merged_row_sum[logical_idx] = segment_row_sum
+                        continue
+
+                    prev_row_max = merged_row_max[logical_idx]
+                    prev_row_sum = merged_row_sum[logical_idx]
+                    prev_context = merged_contexts[logical_idx]
+                    combined_row_max = torch.maximum(prev_row_max, segment_row_max)
+                    prev_scale = torch.exp(prev_row_max - combined_row_max)
+                    seg_scale = torch.exp(segment_row_max - combined_row_max)
+                    combined_row_sum = prev_row_sum * prev_scale + segment_row_sum * seg_scale
+                    safe_sum = torch.clamp(combined_row_sum, min=1e-12)
+                    prev_weight = (prev_row_sum * prev_scale / safe_sum).unsqueeze(1)
+                    seg_weight = (segment_row_sum * seg_scale / safe_sum).unsqueeze(1)
+                    merged_contexts[logical_idx] = (prev_context * prev_weight) + (segment_context * seg_weight)
+                    merged_row_max[logical_idx] = combined_row_max
+                    merged_row_sum[logical_idx] = combined_row_sum
+
+            for logical_idx, context in merged_contexts.items():
+                contexts[logical_idx] = context
+
+        self._record_timing("qk_softmax_weighted_value_sum_batch_total", total_started_at)
+        self.batch_item_totals["qk_softmax_weighted_value_sum_batch_total"] += len(slot_queries)
         return [context for context in contexts if context is not None]

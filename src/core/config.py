@@ -41,6 +41,8 @@ class ClusterConfig(BaseModel):
     clover_shadow_check_token_interval: int = 4
     clover_shadow_check_layer_interval: int = 4
     clover_host_qk_mixed_enabled: bool = False
+    clover_pim_attention_enabled: bool = False
+    clover_pim_context_fused_experimental_enabled: bool = False
     decode_step_sync_window_s: float = 0.0
     decode_step_sync_max_size: int = 8
     attention_decode_wave_persist_enabled: bool = False

@@ -346,6 +346,10 @@ class GlobalScheduler:
                         "shadow_check_token_interval": int(self.cluster_config.clover_shadow_check_token_interval),
                         "shadow_check_layer_interval": int(self.cluster_config.clover_shadow_check_layer_interval),
                         "host_qk_mixed_enabled": bool(self.cluster_config.clover_host_qk_mixed_enabled),
+                        "pim_attention_enabled": bool(self.cluster_config.clover_pim_attention_enabled),
+                        "pim_context_fused_experimental_enabled": bool(
+                            self.cluster_config.clover_pim_context_fused_experimental_enabled
+                        ),
                     }
                 )
 
