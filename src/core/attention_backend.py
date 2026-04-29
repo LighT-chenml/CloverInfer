@@ -185,7 +185,7 @@ class PimNaiveAttentionBackend:
         self.resident_kv_dtype = str(resident_kv_dtype)
         self.qk_check_interval = qk_check_interval
         self.qk_check_limit = qk_check_limit
-        if self.head_grouping_policy not in {"legacy", "balanced"}:
+        if self.head_grouping_policy not in {"legacy", "balanced", "coarse", "segment_aware"}:
             raise ValueError(f"Unsupported head_grouping_policy: {self.head_grouping_policy}")
         if self.dpu_placement_policy not in {"identity", "rotated"}:
             raise ValueError(f"Unsupported dpu_placement_policy: {self.dpu_placement_policy}")
@@ -299,6 +299,23 @@ class PimNaiveAttentionBackend:
         max_groups = max(1, min(self.num_dpus, num_heads))
         if max_groups <= 1:
             return 1
+
+        if self.head_grouping_policy == "coarse":
+            # Coarse grouping is an opt-in policy for CloverInfer experiments:
+            # keep each layer in as few groups as possible while respecting the
+            # current UPMEM per-group head limit.
+            max_heads_per_group = 32
+            min_groups_by_shape = max(1, math.ceil(int(num_heads) / max_heads_per_group))
+            return max(1, min(max_groups, min_groups_by_shape))
+
+        if self.head_grouping_policy == "segment_aware":
+            # For segmented logical slots, "balanced" often creates too many
+            # tiny per-segment helper items, while "coarse" can make each item
+            # too wide. This policy tries an intermediate grouping that keeps
+            # roughly 4 heads together for longer-context decode.
+            target_heads_per_group = 4 if int(seq_len) >= 192 else 2
+            min_groups_by_shape = max(1, math.ceil(int(num_heads) / target_heads_per_group))
+            return max(1, min(max_groups, min_groups_by_shape))
 
         # Small decode workloads regress when we spread a layer across too many
         # tiny resident groups. Keep more heads together until each group has a

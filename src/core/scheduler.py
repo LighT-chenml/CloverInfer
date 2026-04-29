@@ -86,9 +86,18 @@ class GlobalScheduler:
         self._attention_layer_barrier_tasks: dict[tuple[int, int], asyncio.Task] = {}
         self.attention_batch_window_s = max(0.0, float(cluster_config.attention_rpc_batch_window_s))
         self.attention_batch_max_size = max(1, int(cluster_config.attention_rpc_batch_max_size))
+        self.attention_rpc_cross_key_batch_enabled = bool(
+            getattr(cluster_config, "attention_rpc_cross_key_batch_enabled", False)
+        )
+        self.attention_actor_side_batching_enabled = bool(
+            getattr(cluster_config, "attention_actor_side_batching_enabled", False)
+        )
         self.attention_batch_flushes = 0
         self.attention_batch_total_items = 0
         self.attention_batch_max_observed = 0
+        self.attention_batch_multi_key_flushes = 0
+        self.attention_batch_total_keys = 0
+        self.attention_batch_max_keys_observed = 0
         self._attention_wavefront_batches: dict[tuple[int, int], list[tuple[dict, asyncio.Future, object]]] = {}
         self._attention_wavefront_tasks: dict[tuple[int, int], asyncio.Task] = {}
         self._attention_wavefront_expected_sizes: dict[tuple[int, int], int] = {}
@@ -238,18 +247,53 @@ class GlobalScheduler:
         except asyncio.CancelledError:
             return
 
+    def _pop_attention_wavefront_bundle(
+        self, seed_key: tuple[int, int] | tuple[int, int, str]
+    ) -> list[tuple[tuple[int, int] | tuple[int, int, str], list[tuple[dict, asyncio.Future, object]]]]:
+        seed_batch = self._attention_wavefront_batches.pop(seed_key, [])
+        self._attention_wavefront_tasks.pop(seed_key, None)
+        self._attention_wavefront_expected_sizes.pop(seed_key, None)
+        if not seed_batch:
+            return []
+
+        bundle = [(seed_key, seed_batch)]
+        if not self.attention_rpc_cross_key_batch_enabled:
+            return bundle
+
+        attention = seed_batch[0][2]
+        merge_keys = []
+        for key, batch in self._attention_wavefront_batches.items():
+            if batch and batch[0][2] is attention:
+                merge_keys.append(key)
+
+        for key in merge_keys:
+            batch = self._attention_wavefront_batches.pop(key, [])
+            self._attention_wavefront_tasks.pop(key, None)
+            self._attention_wavefront_expected_sizes.pop(key, None)
+            if batch:
+                bundle.append((key, batch))
+        return bundle
+
     async def _execute_attention_wavefront_key(self, key: tuple[int, int]):
-        batch = self._attention_wavefront_batches.pop(key, [])
-        self._attention_wavefront_tasks.pop(key, None)
-        self._attention_wavefront_expected_sizes.pop(key, None)
-        if not batch:
+        bundle = self._pop_attention_wavefront_bundle(key)
+        if not bundle:
             return
-        payloads = [item[0] for item in batch]
-        futures = [item[1] for item in batch]
-        attention = batch[0][2]
+        payloads = []
+        futures = []
+        attention = bundle[0][1][0][2]
+        for _, batch in bundle:
+            payloads.extend(item[0] for item in batch)
+            futures.extend(item[1] for item in batch)
         self.attention_batch_flushes += 1
         self.attention_batch_total_items += len(payloads)
         self.attention_batch_max_observed = max(self.attention_batch_max_observed, len(payloads))
+        self.attention_batch_total_keys += len(bundle)
+        self.attention_batch_max_keys_observed = max(
+            self.attention_batch_max_keys_observed,
+            len(bundle),
+        )
+        if len(bundle) > 1:
+            self.attention_batch_multi_key_flushes += 1
         try:
             results = await attention.decode_layer_batch.remote(payloads)
             for future, result in zip(futures, results):
@@ -280,6 +324,16 @@ class GlobalScheduler:
         decode_step: int,
         decode_wave: dict[str, object] | None = None,
     ):
+        if self.attention_actor_side_batching_enabled:
+            key: tuple[int, int] | tuple[int, int, str]
+            if self.attention_decode_wave_persist_enabled and decode_wave is not None:
+                cohort_id = str(decode_wave.get("cohort_id", "default"))
+                key = (int(decode_step), int(prepared["layer_idx"]), cohort_id)
+            else:
+                key = (int(decode_step), int(prepared["layer_idx"]))
+            await self._synchronize_attention_layer(key)
+            return await attention.decode_layer.remote(prepared)
+
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         key: tuple[int, int] | tuple[int, int, str]
@@ -527,9 +581,14 @@ class GlobalScheduler:
             metrics["scheduler_attention_batching"] = {
                 "window_s": float(self.attention_batch_window_s),
                 "max_size": int(self.attention_batch_max_size),
+                "cross_key_batch_enabled": bool(self.attention_rpc_cross_key_batch_enabled),
+                "actor_side_batching_enabled": bool(self.attention_actor_side_batching_enabled),
                 "flushes": int(self.attention_batch_flushes),
                 "total_items": int(self.attention_batch_total_items),
                 "max_observed_size": int(self.attention_batch_max_observed),
+                "multi_key_flushes": int(self.attention_batch_multi_key_flushes),
+                "total_keys": int(self.attention_batch_total_keys),
+                "max_keys_observed": int(self.attention_batch_max_keys_observed),
                 "pending": sum(len(batch) for batch in self._attention_wavefront_batches.values()),
             }
             metrics["scheduler_decode_step_sync"] = {

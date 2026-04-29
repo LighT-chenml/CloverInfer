@@ -50,6 +50,8 @@ class ClusterConfig(BaseModel):
     attention_layer_barrier_max_size: int = 8
     attention_rpc_batch_window_s: float = 0.001
     attention_rpc_batch_max_size: int = 8
+    attention_rpc_cross_key_batch_enabled: bool = False
+    attention_actor_side_batching_enabled: bool = False
     attention_actor_batch_window_s: float = 0.001
     attention_actor_batch_max_size: int = 8
 

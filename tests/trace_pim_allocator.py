@@ -140,7 +140,11 @@ def main():
     parser.add_argument("--pim-num-dpus", type=int, default=4)
     parser.add_argument("--pim-length", type=int, default=8)
     parser.add_argument("--pim-max-resident-groups-per-layer", type=int, default=0)
-    parser.add_argument("--pim-head-grouping-policy", default="balanced", choices=["legacy", "balanced"])
+    parser.add_argument(
+        "--pim-head-grouping-policy",
+        default="balanced",
+        choices=["legacy", "balanced", "coarse", "segment_aware"],
+    )
     parser.add_argument("--pim-dpu-placement-policy", default="rotated", choices=["identity", "rotated"])
     parser.add_argument("--pim-resident-kv-dtype", default="fp32", choices=["fp32", "fp16"])
     parser.add_argument("--pim-resident-store-backend", default="upmem_kvslot", choices=["host", "upmem_kvslot"])
@@ -177,6 +181,10 @@ def main():
     parser.add_argument("--clover-shadow-check-layer-interval", type=int, default=4)
     parser.add_argument("--clover-host-qk-mixed-enabled", action="store_true")
     parser.add_argument("--no-clover-host-qk-mixed-enabled", action="store_true")
+    parser.add_argument("--clover-pim-attention-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-attention-enabled", action="store_true")
+    parser.add_argument("--clover-pim-context-fused-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-context-fused-experimental-enabled", action="store_true")
     args = parser.parse_args()
 
     if args.pim_qk_mixed_enabled and args.no_pim_qk_mixed_enabled:
@@ -197,6 +205,16 @@ def main():
         raise ValueError("cannot set both --clover-op-profiling-enabled and --no-clover-op-profiling-enabled")
     if args.clover_host_qk_mixed_enabled and args.no_clover_host_qk_mixed_enabled:
         raise ValueError("cannot set both --clover-host-qk-mixed-enabled and --no-clover-host-qk-mixed-enabled")
+    if args.clover_pim_attention_enabled and args.no_clover_pim_attention_enabled:
+        raise ValueError("cannot set both --clover-pim-attention-enabled and --no-clover-pim-attention-enabled")
+    if (
+        args.clover_pim_context_fused_experimental_enabled
+        and args.no_clover_pim_context_fused_experimental_enabled
+    ):
+        raise ValueError(
+            "cannot set both --clover-pim-context-fused-experimental-enabled and "
+            "--no-clover-pim-context-fused-experimental-enabled"
+        )
 
     pim_qk_mixed_enabled = True
     if args.no_pim_qk_mixed_enabled:
@@ -233,6 +251,14 @@ def main():
         clover_host_qk_mixed_enabled = True
     if args.no_clover_host_qk_mixed_enabled:
         clover_host_qk_mixed_enabled = False
+    clover_pim_attention_enabled = args.attention_backend == "cloverinfer"
+    if args.no_clover_pim_attention_enabled:
+        clover_pim_attention_enabled = False
+    elif args.clover_pim_attention_enabled:
+        clover_pim_attention_enabled = True
+    clover_pim_context_fused_experimental_enabled = bool(args.clover_pim_context_fused_experimental_enabled)
+    if args.no_clover_pim_context_fused_experimental_enabled:
+        clover_pim_context_fused_experimental_enabled = False
 
     prompts = load_prompts(args.data, args.limit)
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
@@ -274,6 +300,8 @@ def main():
         attention_layer_barrier_max_size=args.attention_layer_barrier_max_size,
         attention_rpc_batch_window_s=args.attention_rpc_batch_window_s,
         attention_rpc_batch_max_size=args.attention_rpc_batch_max_size,
+        attention_rpc_cross_key_batch_enabled=(args.attention_backend == "cloverinfer"),
+        attention_actor_side_batching_enabled=False,
         attention_actor_batch_window_s=args.attention_actor_batch_window_s,
         attention_actor_batch_max_size=args.attention_actor_batch_max_size,
         clover_cpu_shadow_enabled=clover_cpu_shadow_enabled,
@@ -282,6 +310,8 @@ def main():
         clover_shadow_check_token_interval=args.clover_shadow_check_token_interval,
         clover_shadow_check_layer_interval=args.clover_shadow_check_layer_interval,
         clover_host_qk_mixed_enabled=clover_host_qk_mixed_enabled,
+        clover_pim_attention_enabled=clover_pim_attention_enabled,
+        clover_pim_context_fused_experimental_enabled=clover_pim_context_fused_experimental_enabled,
     )
     model = ModelConfig(
         model_name=args.model_name,

@@ -82,6 +82,7 @@ def make_scheduler(args):
         pim_qk_mixed_heads=args.pim_qk_mixed_heads,
         pim_qk_mixed_window=args.pim_qk_mixed_window,
         pim_length=args.pim_length,
+        pim_head_grouping_policy=args.pim_head_grouping_policy,
         clover_cpu_shadow_enabled=clover_cpu_shadow_enabled,
         clover_shadow_checks_enabled=clover_shadow_checks_enabled,
         clover_op_profiling_enabled=True,
@@ -90,6 +91,8 @@ def make_scheduler(args):
         clover_host_qk_mixed_enabled=clover_host_qk_mixed_enabled,
         clover_pim_attention_enabled=clover_pim_attention_enabled,
         clover_pim_context_fused_experimental_enabled=clover_pim_context_fused_experimental_enabled,
+        attention_rpc_cross_key_batch_enabled=True,
+        attention_actor_side_batching_enabled=False,
     )
     model = ModelConfig(
         model_name=args.model_name,
@@ -273,6 +276,11 @@ def main():
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--pim-num-dpus", type=int, default=4)
     parser.add_argument("--pim-length", type=int, default=128)
+    parser.add_argument(
+        "--pim-head-grouping-policy",
+        default="balanced",
+        choices=["legacy", "balanced", "coarse", "segment_aware"],
+    )
     parser.add_argument("--pim-qk-mixed-heads", type=int, default=2)
     parser.add_argument("--pim-qk-mixed-window", type=int, default=128)
     parser.add_argument(
@@ -314,6 +322,7 @@ def main():
                         "concurrency": concurrency,
                         "pim_num_dpus": int(args.pim_num_dpus),
                         "pim_length": int(args.pim_length),
+                        "pim_head_grouping_policy": str(args.pim_head_grouping_policy),
                         "pim_qk_mixed_heads": int(args.pim_qk_mixed_heads),
                         "pim_qk_mixed_window": int(args.pim_qk_mixed_window),
                         "clover_shadow_check_token_interval": 4,

@@ -441,7 +441,72 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
 
     def _apply_qk_full_batch(self, records: List[Dict[str, object]]) -> None:
         with self._timed("qk_full_batch_s"):
-            return super()._apply_qk_full_batch(records)
+            if not self.qk_full_enabled:
+                self.qk_full_shadow_last_max_abs_diff = 0.0
+                return
+
+            flat_slot_queries: list[tuple[str, str, list[int], int, torch.Tensor]] = []
+            slot_query_refs: list[tuple[Dict[str, object], str, str]] = []
+
+            for record in records:
+                layer_state = record["request_state"].layer_states[record["layer_idx"]]
+                record["resident_slot_scores"] = []
+                for group in layer_state.head_groups:
+                    flat_slot_queries.append(
+                        (
+                            group.k_slot,
+                            group.v_slot,
+                            list(range(group.group_heads)),
+                            int(group.seq_len),
+                            record["q_fp32"][group.head_start:group.head_end].contiguous(),
+                        )
+                    )
+                    slot_query_refs.append((record, group.k_slot, group.v_slot))
+
+            if flat_slot_queries:
+                with self._timed("resident_qk_batch_s"):
+                    slot_score_mats = self.resident_store.qk_slot_scores_batch(flat_slot_queries)
+                self.qk_batch_calls += 1
+                self.qk_full_batch_calls += 1
+                for (record, k_slot, v_slot), score_mat in zip(slot_query_refs, slot_score_mats):
+                    scaled_scores = score_mat.to(torch.float32) * float(record["score_scale"])
+                    record["resident_slot_scores"].append((k_slot, v_slot, scaled_scores))
+
+            self.qk_full_shadow_last_max_abs_diff = 0.0
+            for record in records:
+                slot_scores = record.get("resident_slot_scores", [])
+                if not slot_scores:
+                    if record["scores"] is None:
+                        record["scores"] = self._compute_host_scores(record)
+                    continue
+
+                self.qk_full_count += sum(int(score_mat.shape[0]) for _, _, score_mat in slot_scores)
+                needs_full_scores = (
+                    not bool(record["use_resident_av"] and self.softmax_av_fused_enabled)
+                    or bool(record.get("should_shadow_check", False))
+                )
+
+                if needs_full_scores:
+                    scores = torch.cat([score_mat for _, _, score_mat in slot_scores], dim=0).to(torch.float32)
+                    record["scores"] = scores
+                else:
+                    record["scores"] = None
+
+                if self.qk_full_shadow_check and record.get("should_shadow_check", False):
+                    host_scores = self._compute_host_scores(record)
+                    compare_scores = record["scores"]
+                    if compare_scores is None:
+                        compare_scores = torch.cat([score_mat for _, _, score_mat in slot_scores], dim=0).to(
+                            torch.float32
+                        )
+                    diff = (
+                        float(torch.max(torch.abs(compare_scores - host_scores)).item())
+                        if compare_scores.numel() > 0
+                        else 0.0
+                    )
+                    self.qk_full_shadow_checks += 1
+                    self.qk_full_shadow_last_max_abs_diff = max(self.qk_full_shadow_last_max_abs_diff, diff)
+                    self.qk_full_shadow_max_abs_diff = max(self.qk_full_shadow_max_abs_diff, diff)
 
     def _apply_qk_mixed_batch(self, records: List[Dict[str, object]]) -> None:
         with self._timed("qk_mixed_batch_s"):
@@ -584,18 +649,18 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
             for record_idx, record in enumerate(records):
                 use_fused_softmax_av = bool(record["use_resident_av"] and self.softmax_av_fused_enabled)
                 if use_fused_softmax_av:
-                    layer_state = record["request_state"].layer_states[record["layer_idx"]]
                     slot_scores = [
-                        (
-                            group.k_slot,
-                            group.v_slot,
-                    record["scores"][group.head_start:group.head_end, :].contiguous(),
-                        )
-                        for group in layer_state.head_groups
+                        (k_slot, v_slot, score_mat.contiguous())
+                        for k_slot, v_slot, score_mat in record.get("resident_slot_scores", [])
                     ]
                     flat_slot_scores.extend(slot_scores)
                     slot_score_refs.append((record_idx, len(slot_scores)))
                     if record.get("should_shadow_check", False) and record["values"] is not None:
+                        if record["scores"] is None:
+                            record["scores"] = torch.cat(
+                                [score_mat for _, _, score_mat in record.get("resident_slot_scores", [])],
+                                dim=0,
+                            ).to(torch.float32)
                         with self._timed("softmax_av_s"):
                             record["weights"] = torch.softmax(record["scores"], dim=-1)
                 else:
@@ -642,6 +707,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                         )
                     self.softmax_av_fused_ops += 1
                     record["context"] = context
+                    record.pop("resident_slot_scores", None)
 
             if flat_slot_weights:
                 with self._timed("resident_av_s"):
@@ -661,8 +727,10 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                         self.resident_av_shadow_max_abs_diff = max(self.resident_av_shadow_max_abs_diff, av_diff)
                     self.resident_av_ops += 1
                     record["context"] = context
+                    record.pop("resident_slot_scores", None)
 
             for record in records:
+                record.pop("resident_slot_scores", None)
                 if self.cpu_shadow_enabled:
                     if record["layer_idx"] == record["request_state"].num_layers - 1:
                         self.cpu_backend.context_lens[record["request_id"]] += 1
