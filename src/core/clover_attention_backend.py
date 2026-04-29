@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import math
 import time
 from typing import Dict, List
 
 import torch
 
 from .attention_backend import PimNaiveAttentionBackend
-from .resident_kv_store import UpmemKVSlotStore
 
 
 class CloverInferAttentionBackend(PimNaiveAttentionBackend):
@@ -33,9 +31,6 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         host_qk_mixed_enabled: bool = False,
         pim_attention_enabled: bool = False,
         pim_context_fused_experimental_enabled: bool = False,
-        pim_rank_spread_alloc_experimental_enabled: bool = False,
-        fine_head_grouping_experimental_enabled: bool = False,
-        target_heads_per_group_experimental: int = 0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -47,9 +42,6 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         self.host_qk_mixed_enabled = bool(host_qk_mixed_enabled)
         self.pim_attention_enabled = bool(pim_attention_enabled)
         self.pim_context_fused_experimental_enabled = bool(pim_context_fused_experimental_enabled)
-        self.pim_rank_spread_alloc_experimental_enabled = bool(pim_rank_spread_alloc_experimental_enabled)
-        self.fine_head_grouping_experimental_enabled = bool(fine_head_grouping_experimental_enabled)
-        self.target_heads_per_group_experimental = max(0, int(target_heads_per_group_experimental))
         self.backend_variant = "cloverinfer"
         self.shadow_k_buffers: Dict[str, List[torch.Tensor]] = {}
         self.shadow_v_buffers: Dict[str, List[torch.Tensor]] = {}
@@ -69,11 +61,6 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
             "resident_qk_batch_s": 0.0,
             "qk_mixed_apply_scores_s": 0.0,
             "finalize_decode_records_s": 0.0,
-            "finalize_build_work_s": 0.0,
-            "finalize_slot_score_shadow_prep_s": 0.0,
-            "finalize_slot_weight_build_s": 0.0,
-            "finalize_slot_score_build_s": 0.0,
-            "finalize_outputs_s": 0.0,
             "softmax_av_s": 0.0,
             "host_context_compute_s": 0.0,
             "resident_av_s": 0.0,
@@ -82,12 +69,6 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         self.op_timing_counts: Dict[str, int] = {key: 0 for key in self.op_timing_totals}
         self.shadow_check_invocations = 0
         self.shadow_check_skips = 0
-        if isinstance(self.resident_store, UpmemKVSlotStore):
-            self.resident_store.set_experimental_flags(
-                context_fused_enabled=self.pim_context_fused_experimental_enabled,
-                shape_rounds_enabled=True,
-                rank_spread_alloc_enabled=self.pim_rank_spread_alloc_experimental_enabled,
-            )
         if self.pim_attention_enabled:
             self.qk_full_enabled = True
             self.softmax_av_fused_enabled = True
@@ -96,25 +77,6 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                     "CloverInfer PIM attention requires a resident store with PIM AV support; "
                     "use pim_resident_store_backend='upmem_kvslot'"
                 )
-
-    def _effective_head_group_count(self, seq_len: int, num_heads: int, head_dim: int) -> int:
-        base_groups = super()._effective_head_group_count(seq_len, num_heads, head_dim)
-        if not self.fine_head_grouping_experimental_enabled:
-            return base_groups
-        if self.num_dpus <= 1 or int(num_heads) <= 1:
-            return base_groups
-
-        # Clover-only latency experiment: for longer decode contexts, prefer
-        # smaller head groups so one decode round can occupy more ranks.
-        if int(seq_len) < 192:
-            return base_groups
-
-        target_heads_per_group = self.target_heads_per_group_experimental
-        if target_heads_per_group <= 0:
-            target_heads_per_group = 1
-        fine_groups = math.ceil(int(num_heads) / max(1, target_heads_per_group))
-        fine_groups = max(1, min(self.num_dpus, int(num_heads), fine_groups))
-        return max(base_groups, fine_groups)
 
     def _timed(self, name: str):
         class _Timer:
@@ -684,50 +646,46 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
             flat_slot_scores: list[tuple[str, str, torch.Tensor]] = []
             slot_score_refs: list[tuple[int, int]] = []
 
-            with self._timed("finalize_build_work_s"):
-                for record_idx, record in enumerate(records):
-                    use_fused_softmax_av = bool(record["use_resident_av"] and self.softmax_av_fused_enabled)
-                    if use_fused_softmax_av:
-                        with self._timed("finalize_slot_score_build_s"):
-                            slot_scores = [
-                                (k_slot, v_slot, score_mat.contiguous())
-                                for k_slot, v_slot, score_mat in record.get("resident_slot_scores", [])
-                            ]
-                            flat_slot_scores.extend(slot_scores)
-                            slot_score_refs.append((record_idx, len(slot_scores)))
-                        if record.get("should_shadow_check", False) and record["values"] is not None:
-                            with self._timed("finalize_slot_score_shadow_prep_s"):
-                                if record["scores"] is None:
-                                    record["scores"] = torch.cat(
-                                        [score_mat for _, _, score_mat in record.get("resident_slot_scores", [])],
-                                        dim=0,
-                                    ).to(torch.float32)
-                            with self._timed("softmax_av_s"):
-                                record["weights"] = torch.softmax(record["scores"], dim=-1)
-                    else:
+            for record_idx, record in enumerate(records):
+                use_fused_softmax_av = bool(record["use_resident_av"] and self.softmax_av_fused_enabled)
+                if use_fused_softmax_av:
+                    slot_scores = [
+                        (k_slot, v_slot, score_mat.contiguous())
+                        for k_slot, v_slot, score_mat in record.get("resident_slot_scores", [])
+                    ]
+                    flat_slot_scores.extend(slot_scores)
+                    slot_score_refs.append((record_idx, len(slot_scores)))
+                    if record.get("should_shadow_check", False) and record["values"] is not None:
+                        if record["scores"] is None:
+                            record["scores"] = torch.cat(
+                                [score_mat for _, _, score_mat in record.get("resident_slot_scores", [])],
+                                dim=0,
+                            ).to(torch.float32)
                         with self._timed("softmax_av_s"):
-                            weights = torch.softmax(record["scores"], dim=-1)
-                        if record["use_resident_av"]:
-                            record["weights"] = weights
-                            layer_state = record["request_state"].layer_states[record["layer_idx"]]
-                            with self._timed("finalize_slot_weight_build_s"):
-                                slot_weights = [
-                                    (
-                                        group.k_slot,
-                                        group.v_slot,
-                                        weights[group.head_start:group.head_end, :].contiguous(),
-                                    )
-                                    for group in layer_state.head_groups
-                                ]
-                                flat_slot_weights.extend(slot_weights)
-                                slot_weight_refs.append((record_idx, len(slot_weights)))
-                        else:
-                            if record["values"] is None:
-                                raise RuntimeError("CloverInfer host AV fallback requires materialized values")
-                            with self._timed("host_context_compute_s"):
-                                record["context"] = torch.einsum(
-                                    "hl,lhd->hd", weights, record["values"].float()
-                                ).to(record["query_dtype"])
+                            record["weights"] = torch.softmax(record["scores"], dim=-1)
+                else:
+                    with self._timed("softmax_av_s"):
+                        weights = torch.softmax(record["scores"], dim=-1)
+                    if record["use_resident_av"]:
+                        record["weights"] = weights
+                        layer_state = record["request_state"].layer_states[record["layer_idx"]]
+                        slot_weights = [
+                            (
+                                group.k_slot,
+                                group.v_slot,
+                                weights[group.head_start:group.head_end, :].contiguous(),
+                            )
+                            for group in layer_state.head_groups
+                        ]
+                        flat_slot_weights.extend(slot_weights)
+                        slot_weight_refs.append((record_idx, len(slot_weights)))
+                    else:
+                        if record["values"] is None:
+                            raise RuntimeError("CloverInfer host AV fallback requires materialized values")
+                        with self._timed("host_context_compute_s"):
+                            record["context"] = torch.einsum(
+                                "hl,lhd->hd", weights, record["values"].float()
+                            ).to(record["query_dtype"])
 
             if flat_slot_scores:
                 with self._timed("resident_av_s"):
@@ -771,15 +729,14 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                     record["context"] = context
                     record.pop("resident_slot_scores", None)
 
-            with self._timed("finalize_outputs_s"):
-                for record in records:
-                    record.pop("resident_slot_scores", None)
-                    if self.cpu_shadow_enabled:
-                        if record["layer_idx"] == record["request_state"].num_layers - 1:
-                            self.cpu_backend.context_lens[record["request_id"]] += 1
-                    elif record["layer_idx"] == record["request_state"].num_layers - 1:
-                        record["request_state"].context_len = int(record["request_state"].context_len)
-                    outputs.append(record["context"].unsqueeze(0))
+            for record in records:
+                record.pop("resident_slot_scores", None)
+                if self.cpu_shadow_enabled:
+                    if record["layer_idx"] == record["request_state"].num_layers - 1:
+                        self.cpu_backend.context_lens[record["request_id"]] += 1
+                elif record["layer_idx"] == record["request_state"].num_layers - 1:
+                    record["request_state"].context_len = int(record["request_state"].context_len)
+                outputs.append(record["context"].unsqueeze(0))
             return outputs
 
     def init_request(
@@ -838,11 +795,6 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         debug["clover_host_qk_mixed_enabled"] = self.host_qk_mixed_enabled
         debug["clover_pim_attention_enabled"] = self.pim_attention_enabled
         debug["clover_pim_context_fused_experimental_enabled"] = self.pim_context_fused_experimental_enabled
-        debug["clover_pim_rank_spread_alloc_experimental_enabled"] = (
-            self.pim_rank_spread_alloc_experimental_enabled
-        )
-        debug["clover_fine_head_grouping_experimental_enabled"] = self.fine_head_grouping_experimental_enabled
-        debug["clover_target_heads_per_group_experimental"] = self.target_heads_per_group_experimental
         debug["clover_shadow_check_invocations"] = self.shadow_check_invocations
         debug["clover_shadow_check_skips"] = self.shadow_check_skips
         debug["clover_op_timing_totals_s"] = dict(self.op_timing_totals)

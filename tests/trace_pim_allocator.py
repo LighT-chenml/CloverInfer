@@ -139,6 +139,7 @@ def main():
     parser.add_argument("--dtype", default="float16")
     parser.add_argument("--pim-num-dpus", type=int, default=4)
     parser.add_argument("--pim-length", type=int, default=8)
+    parser.add_argument("--pim-block-tokens", type=int, default=256)
     parser.add_argument("--pim-max-resident-groups-per-layer", type=int, default=0)
     parser.add_argument(
         "--pim-head-grouping-policy",
@@ -293,6 +294,7 @@ def main():
         pim_qk_mixed_heads=args.pim_qk_mixed_heads,
         pim_qk_mixed_window=args.pim_qk_mixed_window,
         pim_length=args.pim_length,
+        pim_block_tokens=args.pim_block_tokens,
         decode_step_sync_window_s=args.decode_step_sync_window_s,
         decode_step_sync_max_size=args.decode_step_sync_max_size,
         attention_decode_wave_persist_enabled=args.attention_decode_wave_persist_enabled,

@@ -1268,6 +1268,7 @@ class PimNaiveAttentionBackend:
             "smoke_test_ok": self.smoke_test_ok,
             "num_dpus": self.num_dpus,
             "length": self.length,
+            "block_tokens": self.block_tokens,
             "smoke_test_output": self.smoke_test_output,
             "qk_check_interval": self.qk_check_interval,
             "qk_check_limit": self.qk_check_limit,

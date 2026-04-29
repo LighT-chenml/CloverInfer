@@ -94,6 +94,7 @@ def make_cluster_config(args, attention_backend: str) -> ClusterConfig:
         pim_softmax_av_fused_enabled=softmax_av_fused_enabled,
         pim_softmax_av_shadow_check=args.pim_softmax_av_shadow_check,
         pim_length=args.pim_length,
+        pim_block_tokens=args.pim_block_tokens,
         pim_max_resident_groups_per_layer=args.pim_max_resident_groups_per_layer,
         pim_head_grouping_policy=args.pim_head_grouping_policy,
         pim_dpu_placement_policy=args.pim_dpu_placement_policy,
@@ -262,6 +263,7 @@ def main():
         choices=["auto", "host", "upmem_kvslot"],
     )
     parser.add_argument("--pim-length", type=int, default=128)
+    parser.add_argument("--pim-block-tokens", type=int, default=256)
     parser.add_argument("--pim-max-resident-groups-per-layer", type=int, default=0)
     parser.add_argument(
         "--pim-head-grouping-policy",

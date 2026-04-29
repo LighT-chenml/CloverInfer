@@ -1186,6 +1186,50 @@ class UpmemKVSlotStore(ResidentKVStore):
     def _supports_dpu_shape(self, group_heads: int, head_dim: int) -> bool:
         return int(group_heads) <= 32 and int(head_dim) <= 128
 
+    def _release_slot_reservation(
+        self,
+        key: tuple[str, str],
+        slot_id: int,
+        physical_dpu: int,
+    ) -> None:
+        mapped_slot_id = self._slot_id_map.get(key)
+        if mapped_slot_id == int(slot_id):
+            self._slot_id_map.pop(key, None)
+        normalized_dpu = int(physical_dpu) % max(self.num_dpus, 1)
+        free_ids = self._free_slot_ids_by_dpu[normalized_dpu]
+        if int(slot_id) not in free_ids:
+            free_ids.append(int(slot_id))
+
+    def _rollback_block_allocation(
+        self,
+        *,
+        block_key: tuple[str, str],
+        slot_id: int,
+        physical_dpu: int,
+        elem_count: int,
+        helper_allocated: bool,
+        counters_applied: bool,
+    ) -> None:
+        normalized_dpu = int(physical_dpu) % max(self.num_dpus, 1)
+        freed_helper_state = False
+        if helper_allocated:
+            try:
+                self.helper.free_group(int(slot_id))
+                self.dpu_free_ops += 1
+                freed_helper_state = True
+            except Exception:
+                pass
+        if counters_applied:
+            self.dpu_allocations = max(0, self.dpu_allocations - 1)
+            self.dpu_live_slots = max(0, self.dpu_live_slots - 1)
+            self.dpu_live_elems_by_dpu[normalized_dpu] = max(
+                0, self.dpu_live_elems_by_dpu[normalized_dpu] - int(elem_count)
+            )
+        self._release_slot_reservation(block_key, int(slot_id), normalized_dpu)
+        self.helper.persistent_state_active = self.dpu_live_slots > 0
+        if self.dpu_live_slots == 0 and freed_helper_state:
+            self.helper.close()
+
     def _free_block_infos(self, blocks: list[Dict[str, object]]) -> None:
         for block in reversed(blocks):
             slot_id = int(block["slot_id"])
@@ -1230,6 +1274,126 @@ class UpmemKVSlotStore(ResidentKVStore):
             remaining -= take_len
         return list(reversed(plan_reversed))
 
+    def _blocked_slot_blocks(self, slot_info: Dict[str, object]) -> list[Dict[str, object]]:
+        return list(slot_info.get("blocks", slot_info.get("segments", [])))
+
+    def _allocate_block_append_only(
+        self,
+        *,
+        key: tuple[str, str],
+        slot_info: Dict[str, object],
+        group_heads: int,
+        head_dim: int,
+        block_k: torch.Tensor,
+        block_v: torch.Tensor,
+    ) -> Dict[str, object]:
+        blocks = self._blocked_slot_blocks(slot_info)
+        block_idx = len(blocks)
+        base_physical_dpu = int(slot_info.get("base_physical_dpu", slot_info.get("physical_dpu", 0)))
+        block_physical_dpu = (
+            (base_physical_dpu + block_idx) % max(self.num_dpus, 1) if self.num_dpus > 0 else 0
+        )
+        block_capacity = max(int(block_k.shape[0]), self.block_tokens)
+        block_key = self._block_slot_key(key, block_idx)
+        block_slot_id = self._assign_slot_id(block_key, preferred_dpu=block_physical_dpu)
+        block_elem_count = self._slot_elem_count(block_capacity, group_heads, head_dim)
+        helper_allocated = False
+        counters_applied = False
+        try:
+            if not self._supports_dpu_slot(block_k, block_capacity, block_slot_id):
+                raise RuntimeError(
+                    f"Blocked DPU slot shape unsupported for {key}: "
+                    f"shape={tuple(block_k.shape)} capacity={block_capacity} slot_id={block_slot_id}"
+                )
+            if self.dpu_live_elems_by_dpu[block_physical_dpu] + block_elem_count > self.POOL_CAPACITY_ELEMS:
+                self.dpu_capacity_fallbacks += 1
+                raise RuntimeError(
+                    f"Blocked DPU pool capacity exceeded for {key} on physical_dpu={block_physical_dpu}"
+                )
+
+            info = self.helper.allocate_group(
+                block_slot_id,
+                block_capacity,
+                self._encode_tensor(block_k),
+                self._encode_tensor(block_v),
+            )
+            helper_allocated = True
+            block = {
+                "block_key": list(block_key),
+                "slot_id": int(block_slot_id),
+                "physical_dpu": int(block_physical_dpu),
+                "block_index": int(block_idx),
+                "elem_count": int(block_elem_count),
+                "seq_len": int(info["seq_len"]),
+                "capacity": int(info["capacity"]),
+                "group_heads": int(info["group_heads"]),
+                "head_dim": int(info["head_dim"]),
+            }
+            self.dpu_allocations += 1
+            self.dpu_live_slots += 1
+            self.dpu_live_elems_by_dpu[block_physical_dpu] += block_elem_count
+            self.helper.persistent_state_active = True
+            counters_applied = True
+            return block
+        except Exception:
+            self._rollback_block_allocation(
+                block_key=block_key,
+                slot_id=block_slot_id,
+                physical_dpu=block_physical_dpu,
+                elem_count=block_elem_count,
+                helper_allocated=helper_allocated,
+                counters_applied=counters_applied,
+            )
+            raise
+
+    def _allocate_blocked_group(
+        self,
+        *,
+        key: tuple[str, str],
+        initial_k: torch.Tensor,
+        initial_v: torch.Tensor,
+        capacity: int,
+        physical_dpu: int,
+        group_heads: int,
+        head_dim: int,
+    ) -> Dict[str, object]:
+        allocated_blocks: list[Dict[str, object]] = []
+        seq_len = int(initial_k.shape[0])
+        seq_offset = 0
+        slot_info = {
+            "backend": "dpu_blocked",
+            "blocks": allocated_blocks,
+            "segments": allocated_blocks,
+            "seq_len": 0,
+            "capacity": int(capacity),
+            "group_heads": int(group_heads),
+            "head_dim": int(head_dim),
+            "block_tokens": int(self.block_tokens),
+            "base_physical_dpu": int(physical_dpu),
+        }
+        try:
+            while seq_offset < seq_len:
+                block_seq_len = min(self.block_tokens, seq_len - seq_offset)
+                block_initial_k = initial_k[seq_offset : seq_offset + block_seq_len].contiguous()
+                block_initial_v = initial_v[seq_offset : seq_offset + block_seq_len].contiguous()
+                block = self._allocate_block_append_only(
+                    key=key,
+                    slot_info=slot_info,
+                    group_heads=group_heads,
+                    head_dim=head_dim,
+                    block_k=block_initial_k,
+                    block_v=block_initial_v,
+                )
+                allocated_blocks.append(block)
+                seq_offset += block_seq_len
+            slot_info["seq_len"] = int(seq_len)
+            slot_info["capacity"] = max(int(capacity), sum(int(block["capacity"]) for block in allocated_blocks))
+            return slot_info
+        except Exception:
+            if allocated_blocks:
+                self._free_block_infos(allocated_blocks)
+            raise
+
     def allocate_group(
         self,
         k_slot: str,
@@ -1246,71 +1410,23 @@ class UpmemKVSlotStore(ResidentKVStore):
         physical_dpu = self._normalize_preferred_dpu(preferred_dpu) if self.num_dpus > 0 else 0
         elem_count = self._slot_elem_count(capacity, group_heads, head_dim)
         if not force_host_fallback and self._supports_dpu_shape(group_heads, head_dim):
-            if capacity > self.block_tokens or seq_len > self.block_tokens:
-                block_layout = self._build_block_layout(capacity, seq_len)
-                allocated_blocks: list[Dict[str, object]] = []
-                seq_offset = 0
-                allocation_failed = False
-                for block_idx, (block_capacity, block_seq_len) in enumerate(block_layout):
-                    block_key = self._block_slot_key(key, block_idx)
-                    block_physical_dpu = (
-                        (physical_dpu + block_idx) % max(self.num_dpus, 1) if self.num_dpus > 0 else 0
-                    )
-                    block_slot_id = self._assign_slot_id(block_key, preferred_dpu=block_physical_dpu)
-                    block_initial_k = initial_k[seq_offset : seq_offset + block_seq_len].contiguous()
-                    block_initial_v = initial_v[seq_offset : seq_offset + block_seq_len].contiguous()
-                    block_elem_count = self._slot_elem_count(block_capacity, group_heads, head_dim)
-                    if not self._supports_dpu_slot(block_initial_k, block_capacity, block_slot_id):
-                        allocation_failed = True
-                        break
-                    if self.dpu_live_elems_by_dpu[block_physical_dpu] + block_elem_count > self.POOL_CAPACITY_ELEMS:
-                        self.dpu_capacity_fallbacks += 1
-                        allocation_failed = True
-                        break
-                    try:
-                        info = self.helper.allocate_group(
-                            block_slot_id,
-                            block_capacity,
-                            self._encode_tensor(block_initial_k),
-                            self._encode_tensor(block_initial_v),
-                        )
-                    except Exception:
-                        self.dpu_allocate_failures += 1
-                        allocation_failed = True
-                        break
-                    allocated_blocks.append(
-                        {
-                            "block_key": list(block_key),
-                            "slot_id": int(block_slot_id),
-                            "physical_dpu": int(block_physical_dpu),
-                            "block_index": int(block_idx),
-                            "elem_count": int(block_elem_count),
-                            "seq_len": int(info["seq_len"]),
-                            "capacity": int(info["capacity"]),
-                            "group_heads": int(info["group_heads"]),
-                            "head_dim": int(info["head_dim"]),
-                        }
-                    )
-                    self.dpu_allocations += 1
-                    self.dpu_live_slots += 1
-                    self.dpu_live_elems_by_dpu[block_physical_dpu] += block_elem_count
-                    self.helper.persistent_state_active = True
-                    seq_offset += block_seq_len
-                if not allocation_failed and allocated_blocks:
-                    self.slot_mapping[key] = {
-                        "backend": "dpu_blocked",
-                        "blocks": allocated_blocks,
-                        "segments": allocated_blocks,
-                        "seq_len": int(seq_len),
-                        "capacity": int(capacity),
-                        "group_heads": int(group_heads),
-                        "head_dim": int(head_dim),
-                        "block_tokens": int(self.block_tokens),
-                    }
-                    self._record_timing("allocate_group", started_at)
-                    return
-                if allocated_blocks:
-                    self._free_block_infos(allocated_blocks)
+            try:
+                blocked_slot_info = self._allocate_blocked_group(
+                    key=key,
+                    initial_k=initial_k,
+                    initial_v=initial_v,
+                    capacity=capacity,
+                    physical_dpu=physical_dpu,
+                    group_heads=group_heads,
+                    head_dim=head_dim,
+                )
+            except Exception:
+                self.dpu_allocate_failures += 1
+                blocked_slot_info = None
+            if blocked_slot_info is not None:
+                self.slot_mapping[key] = blocked_slot_info
+                self._record_timing("allocate_group", started_at)
+                return
             slot_id = self._assign_slot_id(key, preferred_dpu=preferred_dpu)
         else:
             slot_id = self._assign_slot_id(key, preferred_dpu=preferred_dpu)
@@ -1377,26 +1493,64 @@ class UpmemKVSlotStore(ResidentKVStore):
         key = self._slot_key(k_slot, v_slot)
         slot_info = self.slot_mapping[key]
         if slot_info["backend"] in {"dpu_segmented", "dpu_blocked"}:
-            append_offset = 0
             append_total = int(k_new.shape[0])
-            for block in slot_info.get("blocks", slot_info.get("segments", [])):
-                if append_offset >= append_total:
-                    break
-                available = int(block["capacity"]) - int(block["seq_len"])
-                if available <= 0:
-                    continue
-                take_len = min(available, append_total - append_offset)
-                result = self.helper.append_group(
-                    int(block["slot_id"]),
-                    self._encode_tensor(k_new[append_offset : append_offset + take_len].contiguous()),
-                    self._encode_tensor(v_new[append_offset : append_offset + take_len].contiguous()),
-                )
-                block["seq_len"] = int(result["seq_len"])
-                block["capacity"] = int(result["capacity"])
-                append_offset += take_len
-            if append_offset != append_total:
-                raise RuntimeError(f"Blocked DPU slot capacity exceeded for {key}")
+            blocks = slot_info.get("blocks", slot_info.get("segments", []))
+            group_heads = int(slot_info["group_heads"])
+            head_dim = int(slot_info["head_dim"])
+            if append_total <= 0:
+                out = {
+                    "seq_len": int(slot_info["seq_len"]),
+                    "capacity": int(slot_info["capacity"]),
+                }
+                self._record_timing("append_group", started_at)
+                return out
+
+            tail_block = blocks[-1] if blocks else None
+            tail_available = 0 if tail_block is None else max(0, int(tail_block["capacity"]) - int(tail_block["seq_len"]))
+            tail_take_len = min(tail_available, append_total)
+            new_blocks: list[Dict[str, object]] = []
+            append_offset = tail_take_len
+            try:
+                staged_blocks = list(blocks)
+                while append_offset < append_total:
+                    take_len = min(self.block_tokens, append_total - append_offset)
+                    block_k = k_new[append_offset : append_offset + take_len].contiguous()
+                    block_v = v_new[append_offset : append_offset + take_len].contiguous()
+                    staged_slot_info = dict(slot_info)
+                    staged_slot_info["blocks"] = staged_blocks
+                    staged_slot_info["segments"] = staged_blocks
+                    new_block = self._allocate_block_append_only(
+                        key=key,
+                        slot_info=staged_slot_info,
+                        group_heads=group_heads,
+                        head_dim=head_dim,
+                        block_k=block_k,
+                        block_v=block_v,
+                    )
+                    staged_blocks.append(new_block)
+                    new_blocks.append(new_block)
+                    append_offset += take_len
+
+                if tail_take_len > 0 and tail_block is not None:
+                    result = self.helper.append_group(
+                        int(tail_block["slot_id"]),
+                        self._encode_tensor(k_new[:tail_take_len].contiguous()),
+                        self._encode_tensor(v_new[:tail_take_len].contiguous()),
+                    )
+                    tail_block["seq_len"] = int(result["seq_len"])
+                    tail_block["capacity"] = int(result["capacity"])
+            except Exception:
+                if new_blocks:
+                    self._free_block_infos(new_blocks)
+                raise
+
+            if new_blocks:
+                blocks.extend(new_blocks)
             slot_info["seq_len"] = int(slot_info["seq_len"]) + append_total
+            logical_capacity = 0
+            for block in blocks:
+                logical_capacity += int(block["capacity"])
+            slot_info["capacity"] = max(int(slot_info.get("capacity", 0)), int(logical_capacity))
             out = {
                 "seq_len": int(slot_info["seq_len"]),
                 "capacity": int(slot_info["capacity"]),
