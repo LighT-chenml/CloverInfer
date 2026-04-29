@@ -21,6 +21,8 @@
 #define KVSLOT_CMD_SOFTMAX_AV_BATCH 10U
 #define KVSLOT_CMD_QK_SOFTMAX_AV_BATCH 11U
 #define KVSLOT_CMD_QK_SOFTMAX_AV_PARTIAL_BATCH 12U
+#define KVSLOT_CMD_GET_PROFILE 13U
+#define KVSLOT_CMD_GET_TOPOLOGY 14U
 
 #define KVSLOT_KERNEL_NONE 0U
 #define KVSLOT_KERNEL_QK 1U
@@ -111,5 +113,53 @@ typedef struct {
     uint32_t live_slot_count;
     uint32_t live_elems_total;
 } kvslot_allocator_stats_t;
+
+typedef struct {
+    uint64_t qk_rounds_total;
+    uint64_t qk_batched_rounds;
+    uint64_t qk_fallback_rounds;
+    uint64_t qk_round_items_total;
+    uint64_t qk_batched_items_total;
+    uint64_t qk_active_ranks_total;
+    uint64_t qk_max_round_size;
+    uint64_t qk_max_active_ranks;
+    uint64_t av_rounds_total;
+    uint64_t av_batched_rounds;
+    uint64_t av_fallback_rounds;
+    uint64_t av_round_items_total;
+    uint64_t av_batched_items_total;
+    uint64_t av_active_ranks_total;
+    uint64_t av_max_round_size;
+    uint64_t av_max_active_ranks;
+    uint64_t qk_batched_round_total_ns;
+    uint64_t qk_batched_xfer_to_ns;
+    uint64_t qk_batched_launch_ns;
+    uint64_t qk_batched_xfer_from_ns;
+    uint64_t qk_fallback_round_total_ns;
+    uint64_t qk_fallback_launch_ns;
+    uint64_t qk_fallback_sync_ns;
+    uint64_t qk_fallback_xfer_from_ns;
+    uint64_t av_batched_round_total_ns;
+    uint64_t av_batched_xfer_to_ns;
+    uint64_t av_batched_launch_ns;
+    uint64_t av_batched_xfer_from_ns;
+    uint64_t av_fallback_round_total_ns;
+    uint64_t av_fallback_launch_ns;
+    uint64_t av_fallback_sync_ns;
+    uint64_t av_fallback_xfer_from_ns;
+} kvslot_profile_stats_t;
+
+typedef struct {
+    uint32_t nr_dpus;
+    uint32_t nr_ranks;
+    uint32_t reserved[2];
+} kvslot_topology_header_t;
+
+typedef struct {
+    uint32_t logical_dpu_id;
+    uint32_t rank_index;
+    uint32_t rank_id;
+    uint32_t reserved;
+} kvslot_topology_item_t;
 
 #endif

@@ -43,6 +43,9 @@ class ClusterConfig(BaseModel):
     clover_host_qk_mixed_enabled: bool = False
     clover_pim_attention_enabled: bool = False
     clover_pim_context_fused_experimental_enabled: bool = False
+    clover_pim_rank_spread_alloc_experimental_enabled: bool = False
+    clover_fine_head_grouping_experimental_enabled: bool = False
+    clover_target_heads_per_group_experimental: int = 0
     decode_step_sync_window_s: float = 0.0
     decode_step_sync_max_size: int = 8
     attention_decode_wave_persist_enabled: bool = False

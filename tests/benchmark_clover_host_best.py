@@ -45,6 +45,9 @@ def build_prompt_for_target_tokens(tokenizer, target_tokens: int) -> tuple[str, 
 def make_scheduler(args):
     mode = str(args.mode)
     clover_pim_context_fused_experimental_enabled = False
+    clover_pim_rank_spread_alloc_experimental_enabled = False
+    clover_fine_head_grouping_experimental_enabled = False
+    clover_target_heads_per_group_experimental = 0
     if mode == "host_best":
         pim_resident_store_backend = "host"
         pim_qk_full_enabled = False
@@ -61,8 +64,26 @@ def make_scheduler(args):
         clover_shadow_checks_enabled = True
         clover_host_qk_mixed_enabled = False
         clover_pim_attention_enabled = True
+        clover_pim_rank_spread_alloc_experimental_enabled = True
+        pim_dpu_placement_policy = "rotated"
     else:
         raise ValueError(f"Unsupported mode: {mode}")
+
+    if getattr(args, "pim_dpu_placement_policy", None):
+        pim_dpu_placement_policy = str(args.pim_dpu_placement_policy)
+    elif mode != "pim_full":
+        pim_dpu_placement_policy = "rotated"
+    if hasattr(args, "clover_pim_rank_spread_alloc_experimental_enabled"):
+        clover_pim_rank_spread_alloc_experimental_enabled = bool(
+            clover_pim_rank_spread_alloc_experimental_enabled
+            or args.clover_pim_rank_spread_alloc_experimental_enabled
+        )
+    if hasattr(args, "clover_fine_head_grouping_experimental_enabled"):
+        clover_fine_head_grouping_experimental_enabled = bool(
+            args.clover_fine_head_grouping_experimental_enabled
+        )
+    if hasattr(args, "clover_target_heads_per_group_experimental"):
+        clover_target_heads_per_group_experimental = int(args.clover_target_heads_per_group_experimental)
 
     cluster = ClusterConfig(
         num_prefill_workers=1,
@@ -83,6 +104,7 @@ def make_scheduler(args):
         pim_qk_mixed_window=args.pim_qk_mixed_window,
         pim_length=args.pim_length,
         pim_head_grouping_policy=args.pim_head_grouping_policy,
+        pim_dpu_placement_policy=pim_dpu_placement_policy,
         clover_cpu_shadow_enabled=clover_cpu_shadow_enabled,
         clover_shadow_checks_enabled=clover_shadow_checks_enabled,
         clover_op_profiling_enabled=True,
@@ -91,6 +113,9 @@ def make_scheduler(args):
         clover_host_qk_mixed_enabled=clover_host_qk_mixed_enabled,
         clover_pim_attention_enabled=clover_pim_attention_enabled,
         clover_pim_context_fused_experimental_enabled=clover_pim_context_fused_experimental_enabled,
+        clover_pim_rank_spread_alloc_experimental_enabled=clover_pim_rank_spread_alloc_experimental_enabled,
+        clover_fine_head_grouping_experimental_enabled=clover_fine_head_grouping_experimental_enabled,
+        clover_target_heads_per_group_experimental=clover_target_heads_per_group_experimental,
         attention_rpc_cross_key_batch_enabled=True,
         attention_actor_side_batching_enabled=False,
     )
@@ -188,6 +213,11 @@ def run_requests(
 
 
 def summarize_runs(records: List[Dict[str, object]]) -> Dict[str, object]:
+    attention_debugs = [
+        item["metrics"].get("attention_backend_before_free", item["metrics"]["attention_backend"])
+        .get("backend_debug", {})
+        for item in records
+    ]
     latencies = [float(item["metrics"]["latency"]) for item in records]
     ttfts = [float(item["metrics"]["ttft"]) for item in records]
     tpots = [float(item["metrics"]["tpot"]) for item in records]
@@ -210,33 +240,116 @@ def summarize_runs(records: List[Dict[str, object]]) -> Dict[str, object]:
     ]
     clover_prepare = [
         float(
-            item["metrics"]["attention_backend"]["backend_debug"]
+            attention_debug
             .get("clover_op_timing_totals_s", {})
             .get("prepare_decode_record_s", 0.0)
         )
-        for item in records
+        for attention_debug in attention_debugs
     ]
     clover_finalize = [
         float(
-            item["metrics"]["attention_backend"]["backend_debug"]
+            attention_debug
             .get("clover_op_timing_totals_s", {})
             .get("finalize_decode_records_s", 0.0)
         )
-        for item in records
+        for attention_debug in attention_debugs
+    ]
+    clover_finalize_build = [
+        float(
+            attention_debug
+            .get("clover_op_timing_totals_s", {})
+            .get("finalize_build_work_s", 0.0)
+        )
+        for attention_debug in attention_debugs
+    ]
+    clover_finalize_slot_weight_build = [
+        float(
+            attention_debug
+            .get("clover_op_timing_totals_s", {})
+            .get("finalize_slot_weight_build_s", 0.0)
+        )
+        for attention_debug in attention_debugs
+    ]
+    clover_finalize_slot_score_build = [
+        float(
+            attention_debug
+            .get("clover_op_timing_totals_s", {})
+            .get("finalize_slot_score_build_s", 0.0)
+        )
+        for attention_debug in attention_debugs
+    ]
+    clover_finalize_slot_score_shadow_prep = [
+        float(
+            attention_debug
+            .get("clover_op_timing_totals_s", {})
+            .get("finalize_slot_score_shadow_prep_s", 0.0)
+        )
+        for attention_debug in attention_debugs
+    ]
+    clover_finalize_outputs = [
+        float(
+            attention_debug
+            .get("clover_op_timing_totals_s", {})
+            .get("finalize_outputs_s", 0.0)
+        )
+        for attention_debug in attention_debugs
     ]
     clover_cpu_shadow_append = [
         float(
-            item["metrics"]["attention_backend"]["backend_debug"]
+            attention_debug
             .get("clover_op_timing_totals_s", {})
             .get("cpu_shadow_append_s", 0.0)
         )
-        for item in records
+        for attention_debug in attention_debugs
+    ]
+    helper_profiles = [
+        attention_debug.get("resident_store_debug", {}).get("helper_profile", {})
+        for attention_debug in attention_debugs
+    ]
+    qk_rounds_total = [int(profile.get("qk_rounds_total", 0)) for profile in helper_profiles]
+    qk_batched_rounds = [int(profile.get("qk_batched_rounds", 0)) for profile in helper_profiles]
+    qk_fallback_rounds = [int(profile.get("qk_fallback_rounds", 0)) for profile in helper_profiles]
+    qk_avg_round_size = [
+        (float(profile.get("qk_round_items_total", 0)) / max(float(profile.get("qk_rounds_total", 0)), 1.0))
+        for profile in helper_profiles
+    ]
+    qk_avg_active_ranks = [
+        (float(profile.get("qk_active_ranks_total", 0)) / max(float(profile.get("qk_rounds_total", 0)), 1.0))
+        for profile in helper_profiles
+    ]
+    av_rounds_total = [int(profile.get("av_rounds_total", 0)) for profile in helper_profiles]
+    av_batched_rounds = [int(profile.get("av_batched_rounds", 0)) for profile in helper_profiles]
+    av_fallback_rounds = [int(profile.get("av_fallback_rounds", 0)) for profile in helper_profiles]
+    av_avg_round_size = [
+        (float(profile.get("av_round_items_total", 0)) / max(float(profile.get("av_rounds_total", 0)), 1.0))
+        for profile in helper_profiles
+    ]
+    av_avg_active_ranks = [
+        (float(profile.get("av_active_ranks_total", 0)) / max(float(profile.get("av_rounds_total", 0)), 1.0))
+        for profile in helper_profiles
+    ]
+    helper_timing_keys = [
+        "qk_batched_round_total_ns",
+        "qk_batched_xfer_to_ns",
+        "qk_batched_launch_ns",
+        "qk_batched_xfer_from_ns",
+        "qk_fallback_round_total_ns",
+        "qk_fallback_launch_ns",
+        "qk_fallback_sync_ns",
+        "qk_fallback_xfer_from_ns",
+        "av_batched_round_total_ns",
+        "av_batched_xfer_to_ns",
+        "av_batched_launch_ns",
+        "av_batched_xfer_from_ns",
+        "av_fallback_round_total_ns",
+        "av_fallback_launch_ns",
+        "av_fallback_sync_ns",
+        "av_fallback_xfer_from_ns",
     ]
     out_of_order_completions = sum(
         1 for item in records if int(item["repeat_idx"]) != int(item["completion_index"])
     )
-
-    return {
+    summary = {
         "repeats": len(records),
         "avg_latency": statistics.mean(latencies) if latencies else 0.0,
         "p95_latency": percentile(latencies, 0.95),
@@ -254,11 +367,36 @@ def summarize_runs(records: List[Dict[str, object]]) -> Dict[str, object]:
         "avg_scheduler_overhead_s": statistics.mean(scheduler_overheads) if scheduler_overheads else 0.0,
         "avg_clover_prepare_decode_record_s": statistics.mean(clover_prepare) if clover_prepare else 0.0,
         "avg_clover_finalize_decode_records_s": statistics.mean(clover_finalize) if clover_finalize else 0.0,
+        "avg_clover_finalize_build_work_s": statistics.mean(clover_finalize_build) if clover_finalize_build else 0.0,
+        "avg_clover_finalize_slot_weight_build_s": statistics.mean(clover_finalize_slot_weight_build)
+        if clover_finalize_slot_weight_build
+        else 0.0,
+        "avg_clover_finalize_slot_score_build_s": statistics.mean(clover_finalize_slot_score_build)
+        if clover_finalize_slot_score_build
+        else 0.0,
+        "avg_clover_finalize_slot_score_shadow_prep_s": statistics.mean(clover_finalize_slot_score_shadow_prep)
+        if clover_finalize_slot_score_shadow_prep
+        else 0.0,
+        "avg_clover_finalize_outputs_s": statistics.mean(clover_finalize_outputs) if clover_finalize_outputs else 0.0,
         "avg_clover_cpu_shadow_append_s": statistics.mean(clover_cpu_shadow_append)
         if clover_cpu_shadow_append
         else 0.0,
+        "avg_helper_qk_rounds_total": statistics.mean(qk_rounds_total) if qk_rounds_total else 0.0,
+        "avg_helper_qk_batched_rounds": statistics.mean(qk_batched_rounds) if qk_batched_rounds else 0.0,
+        "avg_helper_qk_fallback_rounds": statistics.mean(qk_fallback_rounds) if qk_fallback_rounds else 0.0,
+        "avg_helper_qk_round_size": statistics.mean(qk_avg_round_size) if qk_avg_round_size else 0.0,
+        "avg_helper_qk_active_ranks": statistics.mean(qk_avg_active_ranks) if qk_avg_active_ranks else 0.0,
+        "avg_helper_av_rounds_total": statistics.mean(av_rounds_total) if av_rounds_total else 0.0,
+        "avg_helper_av_batched_rounds": statistics.mean(av_batched_rounds) if av_batched_rounds else 0.0,
+        "avg_helper_av_fallback_rounds": statistics.mean(av_fallback_rounds) if av_fallback_rounds else 0.0,
+        "avg_helper_av_round_size": statistics.mean(av_avg_round_size) if av_avg_round_size else 0.0,
+        "avg_helper_av_active_ranks": statistics.mean(av_avg_active_ranks) if av_avg_active_ranks else 0.0,
         "out_of_order_completions": int(out_of_order_completions),
     }
+    for key in helper_timing_keys:
+        values = [float(profile.get(key, 0)) / 1e9 for profile in helper_profiles]
+        summary[f"avg_helper_{key[:-3]}_s"] = statistics.mean(values) if values else 0.0
+    return summary
 
 
 def main():
@@ -283,6 +421,27 @@ def main():
     )
     parser.add_argument("--pim-qk-mixed-heads", type=int, default=2)
     parser.add_argument("--pim-qk-mixed-window", type=int, default=128)
+    parser.add_argument(
+        "--pim-dpu-placement-policy",
+        default="rotated",
+        choices=["identity", "rotated", "rank_spread"],
+    )
+    parser.add_argument(
+        "--clover-pim-rank-spread-alloc-experimental-enabled",
+        action="store_true",
+        help="Enable Clover-only helper-side cross-rank logical DPU allocation.",
+    )
+    parser.add_argument(
+        "--clover-fine-head-grouping-experimental-enabled",
+        action="store_true",
+        help="Enable Clover-only finer per-layer head grouping for longer-context decode.",
+    )
+    parser.add_argument(
+        "--clover-target-heads-per-group-experimental",
+        type=int,
+        default=0,
+        help="Target Clover heads per resident group when fine head grouping is enabled; 0 defaults to 1.",
+    )
     parser.add_argument(
         "--output",
         default=os.path.join(REPO_ROOT, "artifacts", "clover_host_best_benchmark.jsonl"),
@@ -323,6 +482,7 @@ def main():
                         "pim_num_dpus": int(args.pim_num_dpus),
                         "pim_length": int(args.pim_length),
                         "pim_head_grouping_policy": str(args.pim_head_grouping_policy),
+                        "pim_dpu_placement_policy": str(args.pim_dpu_placement_policy),
                         "pim_qk_mixed_heads": int(args.pim_qk_mixed_heads),
                         "pim_qk_mixed_window": int(args.pim_qk_mixed_window),
                         "clover_shadow_check_token_interval": 4,
@@ -330,6 +490,15 @@ def main():
                         "clover_host_qk_mixed_enabled": False,
                         "clover_pim_attention_enabled": bool(args.mode == "pim_full"),
                         "clover_pim_context_fused_experimental_enabled": False,
+                        "clover_pim_rank_spread_alloc_experimental_enabled": bool(
+                            args.clover_pim_rank_spread_alloc_experimental_enabled or args.mode == "pim_full"
+                        ),
+                        "clover_fine_head_grouping_experimental_enabled": bool(
+                            args.clover_fine_head_grouping_experimental_enabled
+                        ),
+                        "clover_target_heads_per_group_experimental": int(
+                            args.clover_target_heads_per_group_experimental
+                        ),
                     },
                     "placement": placement,
                 }

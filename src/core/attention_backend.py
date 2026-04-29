@@ -187,7 +187,7 @@ class PimNaiveAttentionBackend:
         self.qk_check_limit = qk_check_limit
         if self.head_grouping_policy not in {"legacy", "balanced", "coarse", "segment_aware"}:
             raise ValueError(f"Unsupported head_grouping_policy: {self.head_grouping_policy}")
-        if self.dpu_placement_policy not in {"identity", "rotated"}:
+        if self.dpu_placement_policy not in {"identity", "rotated", "rank_spread"}:
             raise ValueError(f"Unsupported dpu_placement_policy: {self.dpu_placement_policy}")
         if self.resident_kv_dtype not in {"fp32", "fp16"}:
             raise ValueError(f"Unsupported resident_kv_dtype: {self.resident_kv_dtype}")
@@ -334,6 +334,25 @@ class PimNaiveAttentionBackend:
         max_groups_by_work = max(1, math.ceil(total_live_elems / target_group_live_elems))
         return max(1, min(max_groups, max_groups_by_heads, max_groups_by_work))
 
+    def _choose_group_physical_dpu(
+        self,
+        *,
+        group_idx: int,
+        num_groups: int,
+        dpu_rotation: int,
+    ) -> int:
+        if self.num_dpus <= 0:
+            return 0
+        if self.dpu_placement_policy == "rotated":
+            return (group_idx + dpu_rotation) % self.num_dpus
+        if self.dpu_placement_policy == "rank_spread":
+            # Clover experiment: widen the stride between neighboring groups to
+            # increase the chance that logical groups land on different ranks
+            # when the runtime maps logical DPUs contiguously.
+            stride = max(1, math.ceil(self.num_dpus / max(1, num_groups)))
+            return (dpu_rotation + group_idx * stride) % self.num_dpus
+        return group_idx % self.num_dpus
+
     def _build_head_groups(
         self,
         request_id: str,
@@ -373,10 +392,11 @@ class PimNaiveAttentionBackend:
                 head_start = head_end
 
         for group_idx, (head_start, head_end) in enumerate(group_ranges):
-            if self.dpu_placement_policy == "rotated":
-                physical_dpu = (group_idx + dpu_rotation) % max(self.num_dpus, 1)
-            else:
-                physical_dpu = group_idx % max(self.num_dpus, 1)
+            physical_dpu = self._choose_group_physical_dpu(
+                group_idx=group_idx,
+                num_groups=len(group_ranges),
+                dpu_rotation=dpu_rotation,
+            )
             k_slot = f"{request_id}:layer{layer_idx}:group{group_idx}:k"
             v_slot = f"{request_id}:layer{layer_idx}:group{group_idx}:v"
             initial_k_group = layer_key[:, head_start:head_end, :].contiguous()

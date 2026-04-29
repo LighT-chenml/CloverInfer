@@ -107,6 +107,8 @@ class _KVSlotHelperClient:
     CMD_SOFTMAX_AV_BATCH = 10
     CMD_QK_SOFTMAX_AV_BATCH = 11
     CMD_QK_SOFTMAX_AV_PARTIAL_BATCH = 12
+    CMD_GET_PROFILE = 13
+    CMD_GET_TOPOLOGY = 14
     MAX_SLOTS_PER_DPU = 64
     MAX_BATCH_ITEMS = 32
 
@@ -118,6 +120,19 @@ class _KVSlotHelperClient:
         self.proc: subprocess.Popen | None = None
         self.restarts = 0
         self.persistent_state_active = False
+        self.helper_env: Dict[str, str] = {}
+
+    def set_env_flag(self, name: str, enabled: bool) -> None:
+        value = "1" if enabled else "0"
+        if self.helper_env.get(name) == value:
+            return
+        self.helper_env[name] = value
+        if self.proc is not None and self.proc.poll() is None:
+            if self.persistent_state_active:
+                raise RuntimeError(
+                    f"cannot reconfigure kvslot helper flag {name} while persistent DPU state is active"
+                )
+            self.close()
 
     def _ensure_proc(self) -> subprocess.Popen:
         if self.proc is not None and self.proc.poll() is None:
@@ -134,12 +149,15 @@ class _KVSlotHelperClient:
                     "kvslot helper exited while persistent DPU state was active: "
                     f"{stderr_text.strip()}"
                 )
+        env = os.environ.copy()
+        env.update(self.helper_env)
         self.proc = subprocess.Popen(
             [self.binary_path, "--stdio", "--num-dpus", str(self.num_dpus)],
             cwd=self.cwd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=env,
         )
         self.restarts += 1
         return self.proc
@@ -272,6 +290,68 @@ class _KVSlotHelperClient:
                 }
             )
         return stats
+
+    def get_profile_stats(self) -> Dict[str, int]:
+        header = struct.pack("<IIII", self.MAGIC, self.CMD_GET_PROFILE, 0, 0)
+        self._write(header)
+        out = struct.unpack("<32Q", self._read_exact(32 * 8))
+        keys = [
+            "qk_rounds_total",
+            "qk_batched_rounds",
+            "qk_fallback_rounds",
+            "qk_round_items_total",
+            "qk_batched_items_total",
+            "qk_active_ranks_total",
+            "qk_max_round_size",
+            "qk_max_active_ranks",
+            "av_rounds_total",
+            "av_batched_rounds",
+            "av_fallback_rounds",
+            "av_round_items_total",
+            "av_batched_items_total",
+            "av_active_ranks_total",
+            "av_max_round_size",
+            "av_max_active_ranks",
+            "qk_batched_round_total_ns",
+            "qk_batched_xfer_to_ns",
+            "qk_batched_launch_ns",
+            "qk_batched_xfer_from_ns",
+            "qk_fallback_round_total_ns",
+            "qk_fallback_launch_ns",
+            "qk_fallback_sync_ns",
+            "qk_fallback_xfer_from_ns",
+            "av_batched_round_total_ns",
+            "av_batched_xfer_to_ns",
+            "av_batched_launch_ns",
+            "av_batched_xfer_from_ns",
+            "av_fallback_round_total_ns",
+            "av_fallback_launch_ns",
+            "av_fallback_sync_ns",
+            "av_fallback_xfer_from_ns",
+        ]
+        return {key: int(value) for key, value in zip(keys, out)}
+
+    def get_topology(self) -> Dict[str, object]:
+        header = struct.pack("<IIII", self.MAGIC, self.CMD_GET_TOPOLOGY, 0, 0)
+        self._write(header)
+        raw_header = struct.unpack("<IIII", self._read_exact(16))
+        nr_dpus = int(raw_header[0])
+        nr_ranks = int(raw_header[1])
+        items = []
+        for _ in range(nr_dpus):
+            logical_dpu_id, rank_index, rank_id, _reserved = struct.unpack("<IIII", self._read_exact(16))
+            items.append(
+                {
+                    "logical_dpu_id": int(logical_dpu_id),
+                    "rank_index": int(rank_index),
+                    "rank_id": int(rank_id),
+                }
+            )
+        return {
+            "nr_dpus": nr_dpus,
+            "nr_ranks": nr_ranks,
+            "items": items,
+        }
 
     def qk_scores_batch(self, queries: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
         if queries.dim() != 2:
@@ -959,6 +1039,7 @@ class UpmemKVSlotStore(ResidentKVStore):
         self._slot_id_map: Dict[tuple[str, str], int] = {}
         self._free_slot_ids_by_dpu: list[list[int]] = [[] for _ in range(num_dpus)]
         self._next_slot_seq_by_dpu = [0 for _ in range(num_dpus)]
+        self._helper_topology_cache: Dict[int, Dict[str, int]] = {}
         self.dpu_allocations = 0
         self.fallback_allocations = 0
         self.dpu_free_ops = 0
@@ -1003,6 +1084,32 @@ class UpmemKVSlotStore(ResidentKVStore):
             "qk_softmax_weighted_value_sum_batch_dpu_items": 0,
             "qk_softmax_weighted_value_sum_batch_host_fallback_items": 0,
         }
+
+    def set_experimental_flags(
+        self,
+        *,
+        context_fused_enabled: bool | None = None,
+        shape_rounds_enabled: bool | None = None,
+        rank_spread_alloc_enabled: bool | None = None,
+    ) -> None:
+        if context_fused_enabled is not None:
+            self.helper.set_env_flag("CLOVER_KVSLOT_CONTEXT_FUSED", bool(context_fused_enabled))
+        if shape_rounds_enabled is not None:
+            self.helper.set_env_flag("CLOVER_KVSLOT_SHAPE_ROUNDS", bool(shape_rounds_enabled))
+        if rank_spread_alloc_enabled is not None:
+            self.helper.set_env_flag("CLOVER_KVSLOT_RANK_SPREAD_ALLOC", bool(rank_spread_alloc_enabled))
+
+    def _topology_rank_index(self, physical_dpu: int) -> int | None:
+        item = self._helper_topology_cache.get(int(physical_dpu))
+        if item is None:
+            return None
+        return int(item.get("rank_index", 0))
+
+    def _topology_rank_id(self, physical_dpu: int) -> int | None:
+        item = self._helper_topology_cache.get(int(physical_dpu))
+        if item is None:
+            return None
+        return int(item.get("rank_id", 0))
 
     def _record_timing(self, name: str, started_at: float) -> None:
         self.op_timing_totals_s[name] += float(time.perf_counter() - started_at)
@@ -1352,6 +1459,8 @@ class UpmemKVSlotStore(ResidentKVStore):
                     {
                         "slot_id": int(segment["slot_id"]),
                         "physical_dpu": int(segment["physical_dpu"]),
+                        "rank_index": self._topology_rank_index(int(segment["physical_dpu"])),
+                        "rank_id": self._topology_rank_id(int(segment["physical_dpu"])),
                         "seq_len": int(segment["seq_len"]),
                         "capacity": int(segment["capacity"]),
                     }
@@ -1363,6 +1472,9 @@ class UpmemKVSlotStore(ResidentKVStore):
                 "backend": self.backend_name,
                 "storage": "dpu",
                 "slot_id": int(slot_info["slot_id"]),
+                "physical_dpu": int(slot_info.get("physical_dpu", 0)),
+                "rank_index": self._topology_rank_index(int(slot_info.get("physical_dpu", 0))),
+                "rank_id": self._topology_rank_id(int(slot_info.get("physical_dpu", 0))),
                 "seq_len": int(slot_info["seq_len"]),
                 "capacity": int(slot_info["capacity"]),
                 "group_heads": int(slot_info["group_heads"]),
@@ -1405,12 +1517,30 @@ class UpmemKVSlotStore(ResidentKVStore):
 
     def get_debug_info(self) -> Dict[str, object]:
         allocator_stats = []
+        helper_profile = {}
+        helper_topology = {}
         helper_live = self.helper.proc is not None and self.helper.proc.poll() is None
         if self.helper.persistent_state_active or helper_live:
             try:
                 allocator_stats = self.helper.get_allocator_stats()
             except Exception:
                 allocator_stats = []
+            try:
+                helper_profile = self.helper.get_profile_stats()
+            except Exception:
+                helper_profile = {}
+            try:
+                helper_topology = self.helper.get_topology()
+                self._helper_topology_cache = {
+                    int(item["logical_dpu_id"]): {
+                        "rank_index": int(item["rank_index"]),
+                        "rank_id": int(item["rank_id"]),
+                    }
+                    for item in helper_topology.get("items", [])
+                }
+            except Exception:
+                helper_topology = {}
+                self._helper_topology_cache = {}
         pool_capacity_elems = 256 * 32 * 128
         for stats in allocator_stats:
             tail_free = max(pool_capacity_elems - int(stats["next_free_elem"]), 0)
@@ -1424,6 +1554,9 @@ class UpmemKVSlotStore(ResidentKVStore):
             "backend": self.backend_name,
             "num_dpus": self.num_dpus,
             "kv_dtype": self.kv_dtype,
+            "helper_env": dict(self.helper.helper_env),
+            "helper_profile": helper_profile,
+            "helper_topology": helper_topology,
             "live_slots": len(self.slot_mapping),
             "dpu_allocations": self.dpu_allocations,
             "dpu_free_ops": self.dpu_free_ops,

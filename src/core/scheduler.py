@@ -404,6 +404,15 @@ class GlobalScheduler:
                         "pim_context_fused_experimental_enabled": bool(
                             self.cluster_config.clover_pim_context_fused_experimental_enabled
                         ),
+                        "pim_rank_spread_alloc_experimental_enabled": bool(
+                            self.cluster_config.clover_pim_rank_spread_alloc_experimental_enabled
+                        ),
+                        "fine_head_grouping_experimental_enabled": bool(
+                            self.cluster_config.clover_fine_head_grouping_experimental_enabled
+                        ),
+                        "target_heads_per_group_experimental": int(
+                            self.cluster_config.clover_target_heads_per_group_experimental
+                        ),
                     }
                 )
 

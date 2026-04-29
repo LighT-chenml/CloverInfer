@@ -2,6 +2,7 @@
 #include <dpu_management.h>
 #include <inttypes.h>
 #include <math.h>
+#include <time.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +42,7 @@ typedef struct {
     uint32_t *next_free_elem;
     free_range_t *free_ranges;
     uint32_t *num_free_ranges;
+    kvslot_profile_stats_t profile;
 } kvslot_runner_t;
 
 typedef struct {
@@ -81,8 +83,8 @@ typedef struct {
     int ready;
 } qk_slot_item_t;
 
-static int launch_qk_slot_item_async(const qk_slot_item_t *item);
-static int finish_qk_slot_item(qk_slot_item_t *item);
+static int launch_qk_slot_item_async(const qk_slot_item_t *item, kvslot_profile_stats_t *profile);
+static int finish_qk_slot_item(qk_slot_item_t *item, kvslot_profile_stats_t *profile);
 static int can_use_batched_qk_round(
     kvslot_runner_t *runner,
     qk_slot_item_t *items,
@@ -128,6 +130,44 @@ static int read_qk_slot_item_payload(FILE *file, qk_slot_item_t *item);
 static void cleanup_qk_slot_item(qk_slot_item_t *item);
 static int fetch_qk_slot_row_maxes(qk_slot_item_t *item);
 static int fetch_qk_slot_row_sums(qk_slot_item_t *item);
+static uint32_t count_round_active_ranks_qk(
+    kvslot_runner_t *runner,
+    qk_slot_item_t *items,
+    const uint32_t *round_indices,
+    uint32_t round_count);
+static uint32_t count_round_active_ranks_av(
+    kvslot_runner_t *runner,
+    av_item_t *items,
+    const uint32_t *round_indices,
+    uint32_t round_count);
+static void record_qk_round_profile(
+    kvslot_runner_t *runner,
+    qk_slot_item_t *items,
+    const uint32_t *round_indices,
+    uint32_t round_count,
+    int used_batched);
+static void record_av_round_profile(
+    kvslot_runner_t *runner,
+    av_item_t *items,
+    const uint32_t *round_indices,
+    uint32_t round_count,
+    int used_batched);
+static void record_qk_round_timing(
+    kvslot_runner_t *runner,
+    int used_batched,
+    uint64_t round_total_ns,
+    uint64_t xfer_to_ns,
+    uint64_t launch_ns,
+    uint64_t xfer_from_ns,
+    uint64_t sync_ns);
+static void record_av_round_timing(
+    kvslot_runner_t *runner,
+    int used_batched,
+    uint64_t round_total_ns,
+    uint64_t xfer_to_ns,
+    uint64_t launch_ns,
+    uint64_t xfer_from_ns,
+    uint64_t sync_ns);
 
 static size_t slot_table_index(uint32_t physical_dpu_id, uint32_t local_slot_id)
 {
@@ -173,6 +213,28 @@ static int flush_exact(FILE *file)
     return fflush(file) == 0 ? 0 : 1;
 }
 
+static uint64_t monotonic_time_ns(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static uint64_t elapsed_ns_since(uint64_t start_ns)
+{
+    uint64_t end_ns;
+    if (start_ns == 0) {
+        return 0;
+    }
+    end_ns = monotonic_time_ns();
+    if (end_ns < start_ns) {
+        return 0;
+    }
+    return end_ns - start_ns;
+}
+
 static int context_fused_experiment_enabled(void)
 {
     const char *value = getenv("CLOVER_KVSLOT_CONTEXT_FUSED");
@@ -180,6 +242,435 @@ static int context_fused_experiment_enabled(void)
         return 0;
     }
     return 1;
+}
+
+static int shape_rounds_experiment_enabled(void)
+{
+    const char *value = getenv("CLOVER_KVSLOT_SHAPE_ROUNDS");
+    if (value == NULL || value[0] == '\0' || strcmp(value, "0") == 0) {
+        return 0;
+    }
+    return 1;
+}
+
+static int rank_spread_alloc_experiment_enabled(void)
+{
+    const char *value = getenv("CLOVER_KVSLOT_RANK_SPREAD_ALLOC");
+    if (value == NULL || value[0] == '\0' || strcmp(value, "0") == 0) {
+        return 0;
+    }
+    return 1;
+}
+
+static int init_runner_topology_storage(kvslot_runner_t *runner)
+{
+    runner->ranks = calloc(runner->nr_ranks, sizeof(*runner->ranks));
+    runner->physical_dpus = calloc(runner->nr_dpus, sizeof(*runner->physical_dpus));
+    runner->physical_dpu_rank_indices = calloc(runner->nr_dpus, sizeof(*runner->physical_dpu_rank_indices));
+    if (runner->ranks == NULL || runner->physical_dpus == NULL || runner->physical_dpu_rank_indices == NULL) {
+        fprintf(stderr, "Failed to allocate DPU topology metadata\n");
+        free(runner->physical_dpu_rank_indices);
+        runner->physical_dpu_rank_indices = NULL;
+        free(runner->physical_dpus);
+        runner->physical_dpus = NULL;
+        free(runner->ranks);
+        runner->ranks = NULL;
+        return 1;
+    }
+    return 0;
+}
+
+static void destroy_runner_topology_storage(kvslot_runner_t *runner)
+{
+    free(runner->physical_dpu_rank_indices);
+    runner->physical_dpu_rank_indices = NULL;
+    free(runner->physical_dpus);
+    runner->physical_dpus = NULL;
+    free(runner->ranks);
+    runner->ranks = NULL;
+}
+
+static int collect_runner_ranks(kvslot_runner_t *runner)
+{
+    struct dpu_set_t rank_set;
+    uint32_t each_rank = 0;
+    DPU_RANK_FOREACH(runner->dpu_set, rank_set, each_rank)
+    {
+        if (each_rank >= runner->nr_ranks) {
+            fprintf(stderr, "Collected too many ranks while initializing topology\n");
+            return 1;
+        }
+        runner->ranks[each_rank] = dpu_rank_from_set(rank_set);
+    }
+    if (each_rank != runner->nr_ranks) {
+        fprintf(stderr, "Failed to collect all allocated ranks: expected=%u actual=%u\n", runner->nr_ranks, each_rank);
+        return 1;
+    }
+    return 0;
+}
+
+static int collect_runner_physical_dpus_default(kvslot_runner_t *runner)
+{
+    struct dpu_set_t dpu;
+    uint32_t each_dpu = 0;
+    DPU_FOREACH(runner->dpu_set, dpu, each_dpu)
+    {
+        struct dpu_t *dpu_ptr = dpu_from_set(dpu);
+        struct dpu_rank_t *rank_ptr = dpu_get_rank(dpu_ptr);
+        uint32_t rank_idx = 0;
+        if (each_dpu >= runner->nr_dpus) {
+            fprintf(stderr, "Collected too many DPUs while initializing topology\n");
+            return 1;
+        }
+        runner->physical_dpus[each_dpu] = dpu;
+        for (; rank_idx < runner->nr_ranks; ++rank_idx) {
+            if (runner->ranks[rank_idx] == rank_ptr) {
+                break;
+            }
+        }
+        if (rank_idx == runner->nr_ranks) {
+            fprintf(stderr, "Failed to resolve rank for DPU %u\n", each_dpu);
+            return 1;
+        }
+        runner->physical_dpu_rank_indices[each_dpu] = rank_idx;
+    }
+    if (each_dpu != runner->nr_dpus) {
+        fprintf(stderr, "Collected unexpected DPU count: expected=%u actual=%u\n", runner->nr_dpus, each_dpu);
+        return 1;
+    }
+    return 0;
+}
+
+static int collect_runner_physical_dpus_rank_spread(kvslot_runner_t *runner)
+{
+    uint32_t logical_dpu = 0;
+    uint32_t rank_pass = 0;
+
+    while (logical_dpu < runner->nr_dpus) {
+        uint32_t added_this_pass = 0;
+        struct dpu_set_t rank_set;
+        uint32_t rank_idx = 0;
+        DPU_RANK_FOREACH(runner->dpu_set, rank_set, rank_idx)
+        {
+            struct dpu_set_t dpu;
+            uint32_t dpu_in_rank = 0;
+            int selected = 0;
+            DPU_FOREACH(rank_set, dpu, dpu_in_rank)
+            {
+                if (dpu_in_rank != rank_pass) {
+                    continue;
+                }
+                runner->physical_dpus[logical_dpu] = dpu;
+                runner->physical_dpu_rank_indices[logical_dpu] = rank_idx;
+                logical_dpu += 1;
+                added_this_pass += 1;
+                selected = 1;
+                break;
+            }
+            if (!selected) {
+                continue;
+            }
+            if (logical_dpu >= runner->nr_dpus) {
+                break;
+            }
+        }
+        if (added_this_pass == 0) {
+            fprintf(stderr, "Failed to spread %u logical DPUs across allocated ranks\n", runner->nr_dpus);
+            return 1;
+        }
+        rank_pass += 1;
+    }
+    return 0;
+}
+
+static int qk_items_round_compatible(const qk_slot_item_t *seed, const qk_slot_item_t *item)
+{
+    if (seed == NULL || item == NULL || !seed->ready || !item->ready) {
+        return 0;
+    }
+    if (item->num_heads != seed->num_heads || item->window != seed->window || item->head_dim != seed->head_dim) {
+        return 0;
+    }
+    if (item->slot_args.mode != seed->slot_args.mode) {
+        return 0;
+    }
+    return 1;
+}
+
+static int av_items_round_compatible(const av_item_t *seed, const av_item_t *item)
+{
+    if (seed == NULL || item == NULL || !seed->ready || !item->ready) {
+        return 0;
+    }
+    if (item->padded_weight_bytes != seed->padded_weight_bytes || item->padded_context_bytes != seed->padded_context_bytes) {
+        return 0;
+    }
+    if (item->weights_resident_on_dpu != seed->weights_resident_on_dpu) {
+        return 0;
+    }
+    return 1;
+}
+
+static uint32_t build_qk_launch_round(
+    kvslot_runner_t *runner,
+    qk_slot_item_t *items,
+    uint32_t num_items,
+    const uint8_t *processed,
+    uint8_t *used_dpus,
+    uint32_t *round_indices)
+{
+    uint32_t seed_idx = UINT32_MAX;
+    uint32_t round_count = 0;
+    int shape_rounds_enabled = shape_rounds_experiment_enabled();
+
+    if (runner == NULL || items == NULL || processed == NULL || used_dpus == NULL || round_indices == NULL) {
+        return 0;
+    }
+
+    memset(used_dpus, 0, runner->nr_dpus * sizeof(*used_dpus));
+    for (uint32_t idx = 0; idx < num_items; ++idx) {
+        if (!processed[idx]) {
+            seed_idx = idx;
+            break;
+        }
+    }
+    if (seed_idx == UINT32_MAX) {
+        return 0;
+    }
+
+    used_dpus[items[seed_idx].physical_dpu_id] = 1;
+    round_indices[round_count++] = seed_idx;
+    for (uint32_t idx = 0; idx < num_items; ++idx) {
+        if (idx == seed_idx || processed[idx]) {
+            continue;
+        }
+        if (used_dpus[items[idx].physical_dpu_id]) {
+            continue;
+        }
+        if (shape_rounds_enabled && !qk_items_round_compatible(&items[seed_idx], &items[idx])) {
+            continue;
+        }
+        used_dpus[items[idx].physical_dpu_id] = 1;
+        round_indices[round_count++] = idx;
+    }
+    return round_count;
+}
+
+static uint32_t build_av_launch_round(
+    kvslot_runner_t *runner,
+    av_item_t *items,
+    uint32_t num_items,
+    const uint8_t *processed,
+    uint8_t *used_dpus,
+    uint32_t *round_indices)
+{
+    uint32_t seed_idx = UINT32_MAX;
+    uint32_t round_count = 0;
+    int shape_rounds_enabled = shape_rounds_experiment_enabled();
+
+    if (runner == NULL || items == NULL || processed == NULL || used_dpus == NULL || round_indices == NULL) {
+        return 0;
+    }
+
+    memset(used_dpus, 0, runner->nr_dpus * sizeof(*used_dpus));
+    for (uint32_t idx = 0; idx < num_items; ++idx) {
+        if (!processed[idx]) {
+            seed_idx = idx;
+            break;
+        }
+    }
+    if (seed_idx == UINT32_MAX) {
+        return 0;
+    }
+
+    used_dpus[items[seed_idx].physical_dpu_id] = 1;
+    round_indices[round_count++] = seed_idx;
+    for (uint32_t idx = 0; idx < num_items; ++idx) {
+        if (idx == seed_idx || processed[idx]) {
+            continue;
+        }
+        if (used_dpus[items[idx].physical_dpu_id]) {
+            continue;
+        }
+        if (shape_rounds_enabled && !av_items_round_compatible(&items[seed_idx], &items[idx])) {
+            continue;
+        }
+        used_dpus[items[idx].physical_dpu_id] = 1;
+        round_indices[round_count++] = idx;
+    }
+    return round_count;
+}
+
+static uint32_t count_round_active_ranks_qk(
+    kvslot_runner_t *runner,
+    qk_slot_item_t *items,
+    const uint32_t *round_indices,
+    uint32_t round_count)
+{
+    uint8_t *rank_used = NULL;
+    uint32_t active_rank_count = 0;
+
+    if (runner == NULL || items == NULL || round_indices == NULL || round_count == 0 || runner->nr_ranks == 0) {
+        return 0;
+    }
+    rank_used = calloc(runner->nr_ranks, sizeof(*rank_used));
+    if (rank_used == NULL) {
+        return 0;
+    }
+    for (uint32_t pos = 0; pos < round_count; ++pos) {
+        uint32_t physical_dpu_id = items[round_indices[pos]].physical_dpu_id;
+        uint32_t rank_idx;
+        if (physical_dpu_id >= runner->nr_dpus) {
+            continue;
+        }
+        rank_idx = runner->physical_dpu_rank_indices[physical_dpu_id];
+        if (rank_idx < runner->nr_ranks && !rank_used[rank_idx]) {
+            rank_used[rank_idx] = 1;
+            active_rank_count += 1;
+        }
+    }
+    free(rank_used);
+    return active_rank_count;
+}
+
+static uint32_t count_round_active_ranks_av(
+    kvslot_runner_t *runner,
+    av_item_t *items,
+    const uint32_t *round_indices,
+    uint32_t round_count)
+{
+    uint8_t *rank_used = NULL;
+    uint32_t active_rank_count = 0;
+
+    if (runner == NULL || items == NULL || round_indices == NULL || round_count == 0 || runner->nr_ranks == 0) {
+        return 0;
+    }
+    rank_used = calloc(runner->nr_ranks, sizeof(*rank_used));
+    if (rank_used == NULL) {
+        return 0;
+    }
+    for (uint32_t pos = 0; pos < round_count; ++pos) {
+        uint32_t physical_dpu_id = items[round_indices[pos]].physical_dpu_id;
+        uint32_t rank_idx;
+        if (physical_dpu_id >= runner->nr_dpus) {
+            continue;
+        }
+        rank_idx = runner->physical_dpu_rank_indices[physical_dpu_id];
+        if (rank_idx < runner->nr_ranks && !rank_used[rank_idx]) {
+            rank_used[rank_idx] = 1;
+            active_rank_count += 1;
+        }
+    }
+    free(rank_used);
+    return active_rank_count;
+}
+
+static void record_qk_round_profile(
+    kvslot_runner_t *runner,
+    qk_slot_item_t *items,
+    const uint32_t *round_indices,
+    uint32_t round_count,
+    int used_batched)
+{
+    uint32_t active_ranks;
+    if (runner == NULL || round_count == 0) {
+        return;
+    }
+    active_ranks = count_round_active_ranks_qk(runner, items, round_indices, round_count);
+    runner->profile.qk_rounds_total += 1;
+    runner->profile.qk_round_items_total += round_count;
+    runner->profile.qk_active_ranks_total += active_ranks;
+    if ((uint64_t)round_count > runner->profile.qk_max_round_size) {
+        runner->profile.qk_max_round_size = round_count;
+    }
+    if ((uint64_t)active_ranks > runner->profile.qk_max_active_ranks) {
+        runner->profile.qk_max_active_ranks = active_ranks;
+    }
+    if (used_batched) {
+        runner->profile.qk_batched_rounds += 1;
+        runner->profile.qk_batched_items_total += round_count;
+    } else {
+        runner->profile.qk_fallback_rounds += 1;
+    }
+}
+
+static void record_av_round_profile(
+    kvslot_runner_t *runner,
+    av_item_t *items,
+    const uint32_t *round_indices,
+    uint32_t round_count,
+    int used_batched)
+{
+    uint32_t active_ranks;
+    if (runner == NULL || round_count == 0) {
+        return;
+    }
+    active_ranks = count_round_active_ranks_av(runner, items, round_indices, round_count);
+    runner->profile.av_rounds_total += 1;
+    runner->profile.av_round_items_total += round_count;
+    runner->profile.av_active_ranks_total += active_ranks;
+    if ((uint64_t)round_count > runner->profile.av_max_round_size) {
+        runner->profile.av_max_round_size = round_count;
+    }
+    if ((uint64_t)active_ranks > runner->profile.av_max_active_ranks) {
+        runner->profile.av_max_active_ranks = active_ranks;
+    }
+    if (used_batched) {
+        runner->profile.av_batched_rounds += 1;
+        runner->profile.av_batched_items_total += round_count;
+    } else {
+        runner->profile.av_fallback_rounds += 1;
+    }
+}
+
+static void record_qk_round_timing(
+    kvslot_runner_t *runner,
+    int used_batched,
+    uint64_t round_total_ns,
+    uint64_t xfer_to_ns,
+    uint64_t launch_ns,
+    uint64_t xfer_from_ns,
+    uint64_t sync_ns)
+{
+    if (runner == NULL) {
+        return;
+    }
+    if (used_batched) {
+        runner->profile.qk_batched_round_total_ns += round_total_ns;
+        runner->profile.qk_batched_xfer_to_ns += xfer_to_ns;
+        runner->profile.qk_batched_launch_ns += launch_ns;
+        runner->profile.qk_batched_xfer_from_ns += xfer_from_ns;
+    } else {
+        runner->profile.qk_fallback_round_total_ns += round_total_ns;
+        runner->profile.qk_fallback_launch_ns += launch_ns;
+        runner->profile.qk_fallback_sync_ns += sync_ns;
+        runner->profile.qk_fallback_xfer_from_ns += xfer_from_ns;
+    }
+}
+
+static void record_av_round_timing(
+    kvslot_runner_t *runner,
+    int used_batched,
+    uint64_t round_total_ns,
+    uint64_t xfer_to_ns,
+    uint64_t launch_ns,
+    uint64_t xfer_from_ns,
+    uint64_t sync_ns)
+{
+    if (runner == NULL) {
+        return;
+    }
+    if (used_batched) {
+        runner->profile.av_batched_round_total_ns += round_total_ns;
+        runner->profile.av_batched_xfer_to_ns += xfer_to_ns;
+        runner->profile.av_batched_launch_ns += launch_ns;
+        runner->profile.av_batched_xfer_from_ns += xfer_from_ns;
+    } else {
+        runner->profile.av_fallback_round_total_ns += round_total_ns;
+        runner->profile.av_fallback_launch_ns += launch_ns;
+        runner->profile.av_fallback_sync_ns += sync_ns;
+        runner->profile.av_fallback_xfer_from_ns += xfer_from_ns;
+    }
 }
 
 static void free_slot(host_slot_t *slot)
@@ -390,9 +881,11 @@ static int runner_get_dpu_and_slot(
 
 static int runner_init(kvslot_runner_t *runner, uint32_t requested_dpus)
 {
+    int rank_spread_enabled;
     if (runner == NULL) {
         return 1;
     }
+    memset(runner, 0, sizeof(*runner));
     runner->nr_dpus = 0;
     runner->nr_ranks = 0;
     runner->ranks = NULL;
@@ -402,8 +895,14 @@ static int runner_init(kvslot_runner_t *runner, uint32_t requested_dpus)
     runner->next_free_elem = NULL;
     runner->free_ranges = NULL;
     runner->num_free_ranges = NULL;
-    DPU_ASSERT(dpu_alloc(requested_dpus, NULL, &runner->dpu_set));
-    DPU_ASSERT(dpu_get_nr_dpus(runner->dpu_set, &runner->nr_dpus));
+    rank_spread_enabled = rank_spread_alloc_experiment_enabled();
+    if (rank_spread_enabled) {
+        DPU_ASSERT(dpu_alloc_ranks(requested_dpus, NULL, &runner->dpu_set));
+        runner->nr_dpus = requested_dpus;
+    } else {
+        DPU_ASSERT(dpu_alloc(requested_dpus, NULL, &runner->dpu_set));
+        DPU_ASSERT(dpu_get_nr_dpus(runner->dpu_set, &runner->nr_dpus));
+    }
     DPU_ASSERT(dpu_get_nr_ranks(runner->dpu_set, &runner->nr_ranks));
     DPU_ASSERT(dpu_load(runner->dpu_set, DPU_BINARY, NULL));
     if (runner->nr_dpus != requested_dpus) {
@@ -413,69 +912,26 @@ static int runner_init(kvslot_runner_t *runner, uint32_t requested_dpus)
         runner->nr_ranks = 0;
         return 1;
     }
-    runner->ranks = calloc(runner->nr_ranks, sizeof(*runner->ranks));
-    runner->physical_dpus = calloc(runner->nr_dpus, sizeof(*runner->physical_dpus));
-    runner->physical_dpu_rank_indices = calloc(runner->nr_dpus, sizeof(*runner->physical_dpu_rank_indices));
-    if (runner->ranks == NULL || runner->physical_dpus == NULL || runner->physical_dpu_rank_indices == NULL) {
-        fprintf(stderr, "Failed to allocate DPU topology metadata\n");
-        free(runner->physical_dpu_rank_indices);
-        runner->physical_dpu_rank_indices = NULL;
-        free(runner->physical_dpus);
-        runner->physical_dpus = NULL;
-        free(runner->ranks);
-        runner->ranks = NULL;
+    if (init_runner_topology_storage(runner) != 0) {
         dpu_free(runner->dpu_set);
         runner->nr_dpus = 0;
         runner->nr_ranks = 0;
         return 1;
     }
-    {
-        struct dpu_set_t rank_set;
-        uint32_t each_rank = 0;
-        DPU_RANK_FOREACH(runner->dpu_set, rank_set, each_rank)
-        {
-            runner->ranks[each_rank] = dpu_rank_from_set(rank_set);
-        }
-    }
-    {
-        struct dpu_set_t dpu;
-        uint32_t each_dpu = 0;
-        DPU_FOREACH(runner->dpu_set, dpu, each_dpu)
-        {
-            struct dpu_t *dpu_ptr = dpu_from_set(dpu);
-            struct dpu_rank_t *rank_ptr = dpu_get_rank(dpu_ptr);
-            uint32_t rank_idx = 0;
-            runner->physical_dpus[each_dpu] = dpu;
-            for (; rank_idx < runner->nr_ranks; ++rank_idx) {
-                if (runner->ranks[rank_idx] == rank_ptr) {
-                    break;
-                }
-            }
-            if (rank_idx == runner->nr_ranks) {
-                fprintf(stderr, "Failed to resolve rank for DPU %u\n", each_dpu);
-                free(runner->physical_dpu_rank_indices);
-                runner->physical_dpu_rank_indices = NULL;
-                free(runner->physical_dpus);
-                runner->physical_dpus = NULL;
-                free(runner->ranks);
-                runner->ranks = NULL;
-                dpu_free(runner->dpu_set);
-                runner->nr_dpus = 0;
-                runner->nr_ranks = 0;
-                return 1;
-            }
-            runner->physical_dpu_rank_indices[each_dpu] = rank_idx;
-        }
+    if (collect_runner_ranks(runner) != 0
+        || (rank_spread_enabled ? collect_runner_physical_dpus_rank_spread(runner)
+                                : collect_runner_physical_dpus_default(runner))
+            != 0) {
+        destroy_runner_topology_storage(runner);
+        dpu_free(runner->dpu_set);
+        runner->nr_dpus = 0;
+        runner->nr_ranks = 0;
+        return 1;
     }
     runner->slots = calloc((size_t)runner->nr_dpus * KVSLOT_MAX_SLOTS_PER_DPU, sizeof(host_slot_t));
     if (runner->slots == NULL) {
         fprintf(stderr, "Failed to allocate slot table\n");
-        free(runner->physical_dpu_rank_indices);
-        runner->physical_dpu_rank_indices = NULL;
-        free(runner->physical_dpus);
-        runner->physical_dpus = NULL;
-        free(runner->ranks);
-        runner->ranks = NULL;
+        destroy_runner_topology_storage(runner);
         dpu_free(runner->dpu_set);
         runner->nr_dpus = 0;
         runner->nr_ranks = 0;
@@ -486,12 +942,7 @@ static int runner_init(kvslot_runner_t *runner, uint32_t requested_dpus)
         fprintf(stderr, "Failed to allocate next_free_elem table\n");
         free(runner->slots);
         runner->slots = NULL;
-        free(runner->physical_dpu_rank_indices);
-        runner->physical_dpu_rank_indices = NULL;
-        free(runner->physical_dpus);
-        runner->physical_dpus = NULL;
-        free(runner->ranks);
-        runner->ranks = NULL;
+        destroy_runner_topology_storage(runner);
         dpu_free(runner->dpu_set);
         runner->nr_dpus = 0;
         runner->nr_ranks = 0;
@@ -504,12 +955,7 @@ static int runner_init(kvslot_runner_t *runner, uint32_t requested_dpus)
         runner->next_free_elem = NULL;
         free(runner->slots);
         runner->slots = NULL;
-        free(runner->physical_dpu_rank_indices);
-        runner->physical_dpu_rank_indices = NULL;
-        free(runner->physical_dpus);
-        runner->physical_dpus = NULL;
-        free(runner->ranks);
-        runner->ranks = NULL;
+        destroy_runner_topology_storage(runner);
         dpu_free(runner->dpu_set);
         runner->nr_dpus = 0;
         runner->nr_ranks = 0;
@@ -524,12 +970,7 @@ static int runner_init(kvslot_runner_t *runner, uint32_t requested_dpus)
         runner->next_free_elem = NULL;
         free(runner->slots);
         runner->slots = NULL;
-        free(runner->physical_dpu_rank_indices);
-        runner->physical_dpu_rank_indices = NULL;
-        free(runner->physical_dpus);
-        runner->physical_dpus = NULL;
-        free(runner->ranks);
-        runner->ranks = NULL;
+        destroy_runner_topology_storage(runner);
         dpu_free(runner->dpu_set);
         runner->nr_dpus = 0;
         runner->nr_ranks = 0;
@@ -556,12 +997,7 @@ static void runner_destroy(kvslot_runner_t *runner)
     runner->free_ranges = NULL;
     free(runner->num_free_ranges);
     runner->num_free_ranges = NULL;
-    free(runner->physical_dpu_rank_indices);
-    runner->physical_dpu_rank_indices = NULL;
-    free(runner->physical_dpus);
-    runner->physical_dpus = NULL;
-    free(runner->ranks);
-    runner->ranks = NULL;
+    destroy_runner_topology_storage(runner);
     if (runner->nr_dpus > 0) {
         dpu_free(runner->dpu_set);
         runner->nr_dpus = 0;
@@ -813,6 +1249,47 @@ static int handle_get_stats(kvslot_runner_t *runner)
         kvslot_allocator_stats_t stats = collect_allocator_stats(runner, physical_dpu_id);
         if (write_exact(stdout, &stats, sizeof(stats)) != 0) {
             fprintf(stderr, "Failed to write allocator stats for DPU %u\n", physical_dpu_id);
+            return 1;
+        }
+    }
+    return flush_exact(stdout);
+}
+
+static int handle_get_profile(kvslot_runner_t *runner)
+{
+    if (runner == NULL) {
+        return 1;
+    }
+    if (write_exact(stdout, &runner->profile, sizeof(runner->profile)) != 0) {
+        fprintf(stderr, "Failed to write kvslot profile stats\n");
+        return 1;
+    }
+    return flush_exact(stdout);
+}
+
+static int handle_get_topology(kvslot_runner_t *runner)
+{
+    kvslot_topology_header_t header;
+    if (runner == NULL) {
+        return 1;
+    }
+    memset(&header, 0, sizeof(header));
+    header.nr_dpus = runner->nr_dpus;
+    header.nr_ranks = runner->nr_ranks;
+    if (write_exact(stdout, &header, sizeof(header)) != 0) {
+        fprintf(stderr, "Failed to write kvslot topology header\n");
+        return 1;
+    }
+    for (uint32_t physical_dpu_id = 0; physical_dpu_id < runner->nr_dpus; ++physical_dpu_id) {
+        kvslot_topology_item_t item;
+        struct dpu_t *dpu_ptr = dpu_from_set(runner->physical_dpus[physical_dpu_id]);
+        struct dpu_rank_t *rank_ptr = dpu_ptr != NULL ? dpu_get_rank(dpu_ptr) : NULL;
+        memset(&item, 0, sizeof(item));
+        item.logical_dpu_id = physical_dpu_id;
+        item.rank_index = physical_dpu_id < runner->nr_dpus ? runner->physical_dpu_rank_indices[physical_dpu_id] : 0;
+        item.rank_id = rank_ptr != NULL ? (uint32_t)dpu_get_rank_id(rank_ptr) : 0;
+        if (write_exact(stdout, &item, sizeof(item)) != 0) {
+            fprintf(stderr, "Failed to write kvslot topology item %u\n", physical_dpu_id);
             return 1;
         }
     }
@@ -1081,19 +1558,13 @@ static int handle_qk_slot_batch(kvslot_runner_t *runner)
 
     while (processed_count < args.num_slots && rc == 0) {
         uint32_t round_indices[KVSLOT_MAX_HEADS];
-        uint32_t round_count = 0;
-
-        memset(used_dpus, 0, runner->nr_dpus * sizeof(*used_dpus));
-        for (uint32_t idx = 0; idx < args.num_slots; ++idx) {
-            if (processed[idx]) {
-                continue;
-            }
-            if (used_dpus[items[idx].physical_dpu_id]) {
-                continue;
-            }
-            used_dpus[items[idx].physical_dpu_id] = 1;
-            round_indices[round_count++] = idx;
-        }
+        uint32_t round_count = build_qk_launch_round(
+            runner,
+            items,
+            args.num_slots,
+            processed,
+            used_dpus,
+            round_indices);
         if (round_count == 0) {
             fprintf(stderr, "Failed to build qk slot batch launch round\n");
             rc = 1;
@@ -1101,25 +1572,36 @@ static int handle_qk_slot_batch(kvslot_runner_t *runner)
         }
 
         if (can_use_batched_qk_round(runner, items, round_indices, round_count)) {
+            record_qk_round_profile(runner, items, round_indices, round_count, 1);
             if (execute_batched_qk_round(runner, items, round_indices, round_count) != 0) {
                 fprintf(stderr, "Failed to execute batched qk round\n");
                 rc = 1;
             }
         } else {
+            uint64_t round_start_ns = monotonic_time_ns();
+            record_qk_round_profile(runner, items, round_indices, round_count, 0);
             for (uint32_t pos = 0; pos < round_count; ++pos) {
-                if (launch_qk_slot_item_async(&items[round_indices[pos]]) != 0) {
+                if (launch_qk_slot_item_async(&items[round_indices[pos]], &runner->profile) != 0) {
                     fprintf(stderr, "Failed to launch qk batch item %u\n", round_indices[pos]);
                     rc = 1;
                     break;
                 }
             }
             for (uint32_t pos = 0; pos < round_count && rc == 0; ++pos) {
-                if (finish_qk_slot_item(&items[round_indices[pos]]) != 0) {
+                if (finish_qk_slot_item(&items[round_indices[pos]], &runner->profile) != 0) {
                     fprintf(stderr, "Failed to finish qk batch item %u\n", round_indices[pos]);
                     rc = 1;
                     break;
                 }
             }
+            record_qk_round_timing(
+                runner,
+                0,
+                elapsed_ns_since(round_start_ns),
+                0,
+                0,
+                0,
+                0);
         }
         for (uint32_t pos = 0; pos < round_count && rc == 0; ++pos) {
             processed[round_indices[pos]] = 1;
@@ -1278,13 +1760,16 @@ static void cleanup_qk_slot_item(qk_slot_item_t *item)
     memset(item, 0, sizeof(*item));
 }
 
-static int launch_qk_slot_item_async(const qk_slot_item_t *item)
+static int launch_qk_slot_item_async(const qk_slot_item_t *item, kvslot_profile_stats_t *profile)
 {
     uint32_t kernel_command = KVSLOT_KERNEL_QK_SLOT;
+    uint64_t start_ns;
+    uint64_t launch_start_ns;
 
     if (item == NULL || !item->ready) {
         return 1;
     }
+    start_ns = monotonic_time_ns();
     DPU_ASSERT(dpu_copy_to(item->target_dpu, "kvslot_kernel_command", 0, &kernel_command, sizeof(kernel_command)));
     DPU_ASSERT(dpu_copy_to(item->target_dpu, "runtime_slot_args", 0, &item->runtime_args, sizeof(item->runtime_args)));
     DPU_ASSERT(dpu_copy_to(item->target_dpu, "qk_slot_args", 0, &item->slot_args, sizeof(item->slot_args)));
@@ -1302,20 +1787,33 @@ static int launch_qk_slot_item_async(const qk_slot_item_t *item)
         item->queries,
         (size_t)item->num_heads * item->head_dim * sizeof(*item->queries)
     ));
+    if (profile != NULL) {
+        profile->qk_fallback_launch_ns += elapsed_ns_since(start_ns);
+    }
+    launch_start_ns = monotonic_time_ns();
     DPU_ASSERT(dpu_launch(item->target_dpu, DPU_ASYNCHRONOUS));
+    if (profile != NULL) {
+        profile->qk_fallback_launch_ns += elapsed_ns_since(launch_start_ns);
+    }
     return 0;
 }
 
-static int finish_qk_slot_item(qk_slot_item_t *item)
+static int finish_qk_slot_item(qk_slot_item_t *item, kvslot_profile_stats_t *profile)
 {
     size_t score_bytes;
     size_t aligned_score_bytes;
     uint32_t *aligned_scores = NULL;
+    uint64_t sync_start_ns;
+    uint64_t xfer_start_ns;
 
     if (item == NULL || !item->ready) {
         return 1;
     }
+    sync_start_ns = monotonic_time_ns();
     DPU_ASSERT(dpu_sync(item->target_dpu));
+    if (profile != NULL) {
+        profile->qk_fallback_sync_ns += elapsed_ns_since(sync_start_ns);
+    }
     if (item->slot_args.mode != KVSLOT_QK_SLOT_MODE_RAW_SCORES) {
         return 0;
     }
@@ -1323,6 +1821,7 @@ static int finish_qk_slot_item(qk_slot_item_t *item)
         score_bytes = (size_t)item->num_heads * item->score_stride * sizeof(*item->raw_scores);
         aligned_score_bytes = (score_bytes + 7u) & ~((size_t)7u);
         if (aligned_score_bytes == score_bytes) {
+            xfer_start_ns = monotonic_time_ns();
             DPU_ASSERT(dpu_copy_from(
                 item->target_dpu,
                 "qk_slot_scores_bits",
@@ -1330,6 +1829,9 @@ static int finish_qk_slot_item(qk_slot_item_t *item)
                 item->raw_scores,
                 score_bytes
             ));
+            if (profile != NULL) {
+                profile->qk_fallback_xfer_from_ns += elapsed_ns_since(xfer_start_ns);
+            }
             return 0;
         }
         aligned_scores = calloc(1, aligned_score_bytes);
@@ -1337,6 +1839,7 @@ static int finish_qk_slot_item(qk_slot_item_t *item)
             fprintf(stderr, "Failed to allocate aligned qk slot score buffer (%zu bytes)\n", aligned_score_bytes);
             return 1;
         }
+        xfer_start_ns = monotonic_time_ns();
         DPU_ASSERT(dpu_copy_from(
             item->target_dpu,
             "qk_slot_scores_bits",
@@ -1344,11 +1847,18 @@ static int finish_qk_slot_item(qk_slot_item_t *item)
             aligned_scores,
             aligned_score_bytes
         ));
+        if (profile != NULL) {
+            profile->qk_fallback_xfer_from_ns += elapsed_ns_since(xfer_start_ns);
+        }
         memcpy(item->raw_scores, aligned_scores, score_bytes);
         free(aligned_scores);
     }
+    xfer_start_ns = monotonic_time_ns();
     if (fetch_qk_slot_row_maxes(item) != 0) {
         return 1;
+    }
+    if (profile != NULL) {
+        profile->qk_fallback_xfer_from_ns += elapsed_ns_since(xfer_start_ns);
     }
     return 0;
 }
@@ -1455,6 +1965,16 @@ static int can_use_batched_qk_round(
         }
     }
     free(rank_used);
+    if (rank_spread_alloc_experiment_enabled() && active_rank_count > 1) {
+        /*
+         * Clover rank-spread alloc backs logical DPUs with one selected DPU per
+         * physical rank. A batched round over DPU_SET_RANKS would iterate every
+         * DPU in each active rank and push dummy payloads to the unused ones,
+         * which is much more expensive than launching the selected DPUs
+         * individually. Keep the original batched path for single-rank rounds.
+         */
+        return 0;
+    }
     if (active_rank_count > 16u) {
         return 0;
     }
@@ -1487,10 +2007,18 @@ static int execute_batched_qk_round(
     struct dpu_rank_t **active_ranks = NULL;
     struct dpu_set_t launch_set;
     struct dpu_set_t dpu;
+    uint64_t round_start_ns;
+    uint64_t xfer_to_start_ns;
+    uint64_t launch_start_ns;
+    uint64_t xfer_from_start_ns;
+    uint64_t xfer_to_ns = 0;
+    uint64_t launch_ns = 0;
+    uint64_t xfer_from_ns = 0;
 
     if (!can_use_batched_qk_round(runner, items, round_indices, round_count)) {
         return 1;
     }
+    round_start_ns = monotonic_time_ns();
 
     items_by_dpu = calloc(runner->nr_dpus, sizeof(*items_by_dpu));
     if (items_by_dpu == NULL) {
@@ -1611,6 +2139,7 @@ static int execute_batched_qk_round(
         }
     }
 
+    xfer_to_start_ns = monotonic_time_ns();
     DPU_ASSERT(dpu_broadcast_to(launch_set, "kvslot_kernel_command", 0, &kernel_command, sizeof(kernel_command), DPU_XFER_DEFAULT));
 
     DPU_FOREACH(launch_set, dpu) {
@@ -1664,9 +2193,13 @@ static int execute_batched_qk_round(
             query_bytes,
             DPU_XFER_DEFAULT));
     }
+    xfer_to_ns += elapsed_ns_since(xfer_to_start_ns);
 
+    launch_start_ns = monotonic_time_ns();
     DPU_ASSERT(dpu_launch(launch_set, DPU_SYNCHRONOUS));
+    launch_ns += elapsed_ns_since(launch_start_ns);
 
+    xfer_from_start_ns = monotonic_time_ns();
     if (score_bytes > 0 && items[round_indices[0]].slot_args.mode == KVSLOT_QK_SLOT_MODE_RAW_SCORES) {
         DPU_FOREACH(launch_set, dpu) {
             qk_slot_item_t *item = find_qk_round_item_for_dpu(runner, items_by_dpu, dpu);
@@ -1706,6 +2239,15 @@ static int execute_batched_qk_round(
             (size_t)num_heads * sizeof(*dummy_row_sum_bits),
             DPU_XFER_DEFAULT));
     }
+    xfer_from_ns += elapsed_ns_since(xfer_from_start_ns);
+    record_qk_round_timing(
+        runner,
+        1,
+        elapsed_ns_since(round_start_ns),
+        xfer_to_ns,
+        launch_ns,
+        xfer_from_ns,
+        0);
 
     free(dummy_row_sum_bits);
     free(active_ranks);
@@ -1908,8 +2450,11 @@ static int softmax_av_item_from_qk_scores(
     return 1;
 }
 
-static int finish_av_item(av_item_t *item)
+static int finish_av_item(av_item_t *item, kvslot_profile_stats_t *profile)
 {
+    uint64_t sync_start_ns;
+    uint64_t xfer_start_ns;
+
     if (item == NULL || !item->ready) {
         return 1;
     }
@@ -1917,10 +2462,18 @@ static int finish_av_item(av_item_t *item)
         return 0;
     }
     if (!item->context_from_qk_kernel) {
+        sync_start_ns = monotonic_time_ns();
         DPU_ASSERT(dpu_sync(item->target_dpu));
+        if (profile != NULL) {
+            profile->av_fallback_sync_ns += elapsed_ns_since(sync_start_ns);
+        }
     }
     if (item->context_bytes > 0) {
+        xfer_start_ns = monotonic_time_ns();
         DPU_ASSERT(dpu_copy_from(item->target_dpu, "av_context_bits", 0, item->context, item->padded_context_bytes));
+        if (profile != NULL) {
+            profile->av_fallback_xfer_from_ns += elapsed_ns_since(xfer_start_ns);
+        }
     }
     return 0;
 }
@@ -1936,19 +2489,29 @@ static int prepare_av_item(kvslot_runner_t *runner, uint32_t slot_id, av_item_t 
     return 0;
 }
 
-static int launch_av_item_async(const av_item_t *item)
+static int launch_av_item_async(const av_item_t *item, kvslot_profile_stats_t *profile)
 {
     uint32_t kernel_command = KVSLOT_KERNEL_AV;
+    uint64_t start_ns;
+    uint64_t launch_start_ns;
 
     if (item == NULL || !item->ready) {
         return 1;
     }
+    start_ns = monotonic_time_ns();
     DPU_ASSERT(dpu_copy_to(item->target_dpu, "kvslot_kernel_command", 0, &kernel_command, sizeof(kernel_command)));
     DPU_ASSERT(dpu_copy_to(item->target_dpu, "runtime_slot_args", 0, &item->runtime_args, sizeof(item->runtime_args)));
     if (item->weight_bytes > 0 && !item->weights_resident_on_dpu) {
         DPU_ASSERT(dpu_copy_to(item->target_dpu, "av_weights_bits", 0, item->weights, item->padded_weight_bytes));
     }
+    if (profile != NULL) {
+        profile->av_fallback_launch_ns += elapsed_ns_since(start_ns);
+    }
+    launch_start_ns = monotonic_time_ns();
     DPU_ASSERT(dpu_launch(item->target_dpu, DPU_ASYNCHRONOUS));
+    if (profile != NULL) {
+        profile->av_fallback_launch_ns += elapsed_ns_since(launch_start_ns);
+    }
     return 0;
 }
 
@@ -2004,6 +2567,9 @@ static int can_use_batched_av_round(
         }
     }
     free(rank_used);
+    if (rank_spread_alloc_experiment_enabled() && active_rank_count > 1) {
+        return 0;
+    }
     if (active_rank_count > KVSLOT_QK_MAX_ACTIVE_DPUS) {
         return 0;
     }
@@ -2028,10 +2594,18 @@ static int execute_batched_av_round(
     struct dpu_rank_t **active_ranks = NULL;
     struct dpu_set_t launch_set;
     struct dpu_set_t dpu;
+    uint64_t round_start_ns;
+    uint64_t xfer_to_start_ns;
+    uint64_t launch_start_ns;
+    uint64_t xfer_from_start_ns;
+    uint64_t xfer_to_ns = 0;
+    uint64_t launch_ns = 0;
+    uint64_t xfer_from_ns = 0;
 
     if (!can_use_batched_av_round(runner, items, round_indices, round_count)) {
         return 1;
     }
+    round_start_ns = monotonic_time_ns();
 
     items_by_dpu = calloc(runner->nr_dpus, sizeof(*items_by_dpu));
     if (items_by_dpu == NULL) {
@@ -2109,6 +2683,7 @@ static int execute_batched_av_round(
         }
     }
 
+    xfer_to_start_ns = monotonic_time_ns();
     DPU_ASSERT(dpu_broadcast_to(launch_set, "kvslot_kernel_command", 0, &kernel_command, sizeof(kernel_command), DPU_XFER_DEFAULT));
 
     DPU_FOREACH(launch_set, dpu) {
@@ -2136,9 +2711,13 @@ static int execute_batched_av_round(
             padded_weight_bytes,
             DPU_XFER_DEFAULT));
     }
+    xfer_to_ns += elapsed_ns_since(xfer_to_start_ns);
 
+    launch_start_ns = monotonic_time_ns();
     DPU_ASSERT(dpu_launch(launch_set, DPU_SYNCHRONOUS));
+    launch_ns += elapsed_ns_since(launch_start_ns);
 
+    xfer_from_start_ns = monotonic_time_ns();
     if (padded_context_bytes > 0) {
         DPU_FOREACH(launch_set, dpu) {
             av_item_t *item = find_av_round_item_for_dpu(runner, items_by_dpu, dpu);
@@ -2152,6 +2731,15 @@ static int execute_batched_av_round(
             padded_context_bytes,
             DPU_XFER_DEFAULT));
     }
+    xfer_from_ns += elapsed_ns_since(xfer_from_start_ns);
+    record_av_round_timing(
+        runner,
+        1,
+        elapsed_ns_since(round_start_ns),
+        xfer_to_ns,
+        launch_ns,
+        xfer_from_ns,
+        0);
 
     free(active_ranks);
     free(rank_used);
@@ -2336,7 +2924,12 @@ static int handle_av(kvslot_runner_t *runner, uint32_t slot_id)
         cleanup_av_item(&item);
         return 1;
     }
-    if (launch_av_item_async(&item) != 0 || finish_av_item(&item) != 0 || write_av_item_response(&item) != 0 || flush_exact(stdout) != 0) {
+    if (
+        launch_av_item_async(&item, NULL) != 0
+        || finish_av_item(&item, NULL) != 0
+        || write_av_item_response(&item) != 0
+        || flush_exact(stdout) != 0
+    ) {
         fprintf(stderr, "Failed to execute av for slot %u\n", slot_id);
         rc = 1;
     }
@@ -2392,19 +2985,13 @@ static int handle_av_batch(kvslot_runner_t *runner)
 
     while (processed_count < args.num_slots && rc == 0) {
         uint32_t round_indices[KVSLOT_MAX_HEADS];
-        uint32_t round_count = 0;
-
-        memset(used_dpus, 0, runner->nr_dpus * sizeof(*used_dpus));
-        for (uint32_t idx = 0; idx < args.num_slots; ++idx) {
-            if (processed[idx]) {
-                continue;
-            }
-            if (used_dpus[items[idx].physical_dpu_id]) {
-                continue;
-            }
-            used_dpus[items[idx].physical_dpu_id] = 1;
-            round_indices[round_count++] = idx;
-        }
+        uint32_t round_count = build_av_launch_round(
+            runner,
+            items,
+            args.num_slots,
+            processed,
+            used_dpus,
+            round_indices);
         if (round_count == 0) {
             fprintf(stderr, "Failed to build av batch launch round\n");
             rc = 1;
@@ -2412,25 +2999,36 @@ static int handle_av_batch(kvslot_runner_t *runner)
         }
 
         if (can_use_batched_av_round(runner, items, round_indices, round_count)) {
+            record_av_round_profile(runner, items, round_indices, round_count, 1);
             if (execute_batched_av_round(runner, items, round_indices, round_count) != 0) {
                 fprintf(stderr, "Failed to execute batched av round\n");
                 rc = 1;
             }
         } else {
+            uint64_t round_start_ns = monotonic_time_ns();
+            record_av_round_profile(runner, items, round_indices, round_count, 0);
             for (uint32_t pos = 0; pos < round_count; ++pos) {
-                if (launch_av_item_async(&items[round_indices[pos]]) != 0) {
+                if (launch_av_item_async(&items[round_indices[pos]], &runner->profile) != 0) {
                     fprintf(stderr, "Failed to launch av batch item %u\n", round_indices[pos]);
                     rc = 1;
                     break;
                 }
             }
             for (uint32_t pos = 0; pos < round_count && rc == 0; ++pos) {
-                if (finish_av_item(&items[round_indices[pos]]) != 0) {
+                if (finish_av_item(&items[round_indices[pos]], &runner->profile) != 0) {
                     fprintf(stderr, "Failed to finish av batch item %u\n", round_indices[pos]);
                     rc = 1;
                     break;
                 }
             }
+            record_av_round_timing(
+                runner,
+                0,
+                elapsed_ns_since(round_start_ns),
+                0,
+                0,
+                0,
+                0);
         }
         for (uint32_t pos = 0; pos < round_count && rc == 0; ++pos) {
             processed[round_indices[pos]] = 1;
@@ -2524,19 +3122,13 @@ static int handle_softmax_av_batch(kvslot_runner_t *runner)
 
     while (processed_count < args.num_slots && rc == 0) {
         uint32_t round_indices[KVSLOT_MAX_HEADS];
-        uint32_t round_count = 0;
-
-        memset(used_dpus, 0, runner->nr_dpus * sizeof(*used_dpus));
-        for (uint32_t idx = 0; idx < args.num_slots; ++idx) {
-            if (processed[idx]) {
-                continue;
-            }
-            if (used_dpus[items[idx].physical_dpu_id]) {
-                continue;
-            }
-            used_dpus[items[idx].physical_dpu_id] = 1;
-            round_indices[round_count++] = idx;
-        }
+        uint32_t round_count = build_av_launch_round(
+            runner,
+            items,
+            args.num_slots,
+            processed,
+            used_dpus,
+            round_indices);
         if (round_count == 0) {
             fprintf(stderr, "Failed to build softmax av batch launch round\n");
             rc = 1;
@@ -2544,25 +3136,36 @@ static int handle_softmax_av_batch(kvslot_runner_t *runner)
         }
 
         if (can_use_batched_av_round(runner, items, round_indices, round_count)) {
+            record_av_round_profile(runner, items, round_indices, round_count, 1);
             if (execute_batched_av_round(runner, items, round_indices, round_count) != 0) {
                 fprintf(stderr, "Failed to execute batched softmax av round\n");
                 rc = 1;
             }
         } else {
+            uint64_t round_start_ns = monotonic_time_ns();
+            record_av_round_profile(runner, items, round_indices, round_count, 0);
             for (uint32_t pos = 0; pos < round_count; ++pos) {
-                if (launch_av_item_async(&items[round_indices[pos]]) != 0) {
+                if (launch_av_item_async(&items[round_indices[pos]], &runner->profile) != 0) {
                     fprintf(stderr, "Failed to launch softmax av batch item %u\n", round_indices[pos]);
                     rc = 1;
                     break;
                 }
             }
             for (uint32_t pos = 0; pos < round_count && rc == 0; ++pos) {
-                if (finish_av_item(&items[round_indices[pos]]) != 0) {
+                if (finish_av_item(&items[round_indices[pos]], &runner->profile) != 0) {
                     fprintf(stderr, "Failed to finish softmax av batch item %u\n", round_indices[pos]);
                     rc = 1;
                     break;
                 }
             }
+            record_av_round_timing(
+                runner,
+                0,
+                elapsed_ns_since(round_start_ns),
+                0,
+                0,
+                0,
+                0);
         }
         for (uint32_t pos = 0; pos < round_count && rc == 0; ++pos) {
             processed[round_indices[pos]] = 1;
@@ -2671,44 +3274,49 @@ static int handle_qk_softmax_av_batch(kvslot_runner_t *runner)
 
     while (processed_count < args.num_slots && rc == 0) {
         uint32_t round_indices[KVSLOT_MAX_HEADS];
-        uint32_t round_count = 0;
-
-        memset(used_dpus, 0, runner->nr_dpus * sizeof(*used_dpus));
-        for (uint32_t idx = 0; idx < args.num_slots; ++idx) {
-            if (processed[idx]) {
-                continue;
-            }
-            if (used_dpus[qk_items[idx].physical_dpu_id]) {
-                continue;
-            }
-            used_dpus[qk_items[idx].physical_dpu_id] = 1;
-            round_indices[round_count++] = idx;
-        }
+        uint32_t round_count = build_qk_launch_round(
+            runner,
+            qk_items,
+            args.num_slots,
+            processed,
+            used_dpus,
+            round_indices);
         if (round_count == 0) {
             fprintf(stderr, "Failed to build qk-softmax-av qk round\n");
             rc = 1;
             break;
         }
         if (can_use_batched_qk_round(runner, qk_items, round_indices, round_count)) {
+            record_qk_round_profile(runner, qk_items, round_indices, round_count, 1);
             if (execute_batched_qk_round(runner, qk_items, round_indices, round_count) != 0) {
                 fprintf(stderr, "Failed to execute batched qk-softmax-av qk round\n");
                 rc = 1;
             }
         } else {
+            uint64_t round_start_ns = monotonic_time_ns();
+            record_qk_round_profile(runner, qk_items, round_indices, round_count, 0);
             for (uint32_t pos = 0; pos < round_count; ++pos) {
-                if (launch_qk_slot_item_async(&qk_items[round_indices[pos]]) != 0) {
+                if (launch_qk_slot_item_async(&qk_items[round_indices[pos]], &runner->profile) != 0) {
                     fprintf(stderr, "Failed to launch qk-softmax-av qk item %u\n", round_indices[pos]);
                     rc = 1;
                     break;
                 }
             }
             for (uint32_t pos = 0; pos < round_count && rc == 0; ++pos) {
-                if (finish_qk_slot_item(&qk_items[round_indices[pos]]) != 0) {
+                if (finish_qk_slot_item(&qk_items[round_indices[pos]], &runner->profile) != 0) {
                     fprintf(stderr, "Failed to finish qk-softmax-av qk item %u\n", round_indices[pos]);
                     rc = 1;
                     break;
                 }
             }
+            record_qk_round_timing(
+                runner,
+                0,
+                elapsed_ns_since(round_start_ns),
+                0,
+                0,
+                0,
+                0);
         }
         for (uint32_t pos = 0; pos < round_count && rc == 0; ++pos) {
             processed[round_indices[pos]] = 1;
@@ -2735,31 +3343,26 @@ static int handle_qk_softmax_av_batch(kvslot_runner_t *runner)
         }
         while (processed_count < args.num_slots && rc == 0) {
             uint32_t round_indices[KVSLOT_MAX_HEADS];
-            uint32_t round_count = 0;
-
-            memset(used_dpus, 0, runner->nr_dpus * sizeof(*used_dpus));
-            for (uint32_t idx = 0; idx < args.num_slots; ++idx) {
-                if (processed[idx]) {
-                    continue;
-                }
-                if (used_dpus[av_items[idx].physical_dpu_id]) {
-                    continue;
-                }
-                used_dpus[av_items[idx].physical_dpu_id] = 1;
-                round_indices[round_count++] = idx;
-            }
+            uint32_t round_count = build_av_launch_round(
+                runner,
+                av_items,
+                args.num_slots,
+                processed,
+                used_dpus,
+                round_indices);
             if (round_count == 0) {
                 fprintf(stderr, "Failed to build qk-softmax-av partial context fetch round\n");
                 rc = 1;
                 break;
             }
+            record_av_round_profile(runner, av_items, round_indices, round_count, 1);
             if (fetch_batched_context_fused_round(runner, av_items, round_indices, round_count) != 0) {
                 fprintf(stderr, "Failed to fetch batched qk-softmax-av partial context round\n");
                 rc = 1;
                 break;
             }
             for (uint32_t pos = 0; pos < round_count; ++pos) {
-                if (finish_av_item(&av_items[round_indices[pos]]) != 0) {
+                if (finish_av_item(&av_items[round_indices[pos]], NULL) != 0) {
                     fprintf(stderr, "Failed to finish qk-softmax-av partial context-fused item %u\n", round_indices[pos]);
                     rc = 1;
                     break;
@@ -2773,44 +3376,49 @@ static int handle_qk_softmax_av_batch(kvslot_runner_t *runner)
     } else {
         while (processed_count < args.num_slots && rc == 0) {
             uint32_t round_indices[KVSLOT_MAX_HEADS];
-            uint32_t round_count = 0;
-
-            memset(used_dpus, 0, runner->nr_dpus * sizeof(*used_dpus));
-            for (uint32_t idx = 0; idx < args.num_slots; ++idx) {
-                if (processed[idx]) {
-                    continue;
-                }
-                if (used_dpus[av_items[idx].physical_dpu_id]) {
-                    continue;
-                }
-                used_dpus[av_items[idx].physical_dpu_id] = 1;
-                round_indices[round_count++] = idx;
-            }
+            uint32_t round_count = build_av_launch_round(
+                runner,
+                av_items,
+                args.num_slots,
+                processed,
+                used_dpus,
+                round_indices);
             if (round_count == 0) {
                 fprintf(stderr, "Failed to build qk-softmax-av av round\n");
                 rc = 1;
                 break;
             }
             if (can_use_batched_av_round(runner, av_items, round_indices, round_count)) {
+                record_av_round_profile(runner, av_items, round_indices, round_count, 1);
                 if (execute_batched_av_round(runner, av_items, round_indices, round_count) != 0) {
                     fprintf(stderr, "Failed to execute batched qk-softmax-av av round\n");
                     rc = 1;
                 }
             } else {
+                uint64_t round_start_ns = monotonic_time_ns();
+                record_av_round_profile(runner, av_items, round_indices, round_count, 0);
                 for (uint32_t pos = 0; pos < round_count; ++pos) {
-                    if (launch_av_item_async(&av_items[round_indices[pos]]) != 0) {
+                    if (launch_av_item_async(&av_items[round_indices[pos]], &runner->profile) != 0) {
                         fprintf(stderr, "Failed to launch qk-softmax-av av item %u\n", round_indices[pos]);
                         rc = 1;
                         break;
                     }
                 }
                 for (uint32_t pos = 0; pos < round_count && rc == 0; ++pos) {
-                    if (finish_av_item(&av_items[round_indices[pos]]) != 0) {
+                    if (finish_av_item(&av_items[round_indices[pos]], &runner->profile) != 0) {
                         fprintf(stderr, "Failed to finish qk-softmax-av av item %u\n", round_indices[pos]);
                         rc = 1;
                         break;
                     }
                 }
+                record_av_round_timing(
+                    runner,
+                    0,
+                    elapsed_ns_since(round_start_ns),
+                    0,
+                    0,
+                    0,
+                    0);
             }
             for (uint32_t pos = 0; pos < round_count && rc == 0; ++pos) {
                 processed[round_indices[pos]] = 1;
@@ -2924,39 +3532,36 @@ static int handle_qk_softmax_av_partial_batch(kvslot_runner_t *runner)
 
     while (processed_count < args.num_slots && rc == 0) {
         uint32_t round_indices[KVSLOT_MAX_HEADS];
-        uint32_t round_count = 0;
-
-        memset(used_dpus, 0, runner->nr_dpus * sizeof(*used_dpus));
-        for (uint32_t idx = 0; idx < args.num_slots; ++idx) {
-            if (processed[idx]) {
-                continue;
-            }
-            if (used_dpus[qk_items[idx].physical_dpu_id]) {
-                continue;
-            }
-            used_dpus[qk_items[idx].physical_dpu_id] = 1;
-            round_indices[round_count++] = idx;
-        }
+        uint32_t round_count = build_qk_launch_round(
+            runner,
+            qk_items,
+            args.num_slots,
+            processed,
+            used_dpus,
+            round_indices);
         if (round_count == 0) {
             fprintf(stderr, "Failed to build qk-softmax-av partial qk round\n");
             rc = 1;
             break;
         }
         if (can_use_batched_qk_round(runner, qk_items, round_indices, round_count)) {
+            record_qk_round_profile(runner, qk_items, round_indices, round_count, 1);
             if (execute_batched_qk_round(runner, qk_items, round_indices, round_count) != 0) {
                 fprintf(stderr, "Failed to execute batched qk-softmax-av partial qk round\n");
                 rc = 1;
             }
         } else {
+            uint64_t round_start_ns = monotonic_time_ns();
+            record_qk_round_profile(runner, qk_items, round_indices, round_count, 0);
             for (uint32_t pos = 0; pos < round_count; ++pos) {
-                if (launch_qk_slot_item_async(&qk_items[round_indices[pos]]) != 0) {
+                if (launch_qk_slot_item_async(&qk_items[round_indices[pos]], &runner->profile) != 0) {
                     fprintf(stderr, "Failed to launch qk-softmax-av partial qk item %u\n", round_indices[pos]);
                     rc = 1;
                     break;
                 }
             }
             for (uint32_t pos = 0; pos < round_count && rc == 0; ++pos) {
-                if (finish_qk_slot_item(&qk_items[round_indices[pos]]) != 0) {
+                if (finish_qk_slot_item(&qk_items[round_indices[pos]], &runner->profile) != 0) {
                     fprintf(stderr, "Failed to finish qk-softmax-av partial qk item %u\n", round_indices[pos]);
                     rc = 1;
                     break;
@@ -2967,6 +3572,14 @@ static int handle_qk_softmax_av_partial_batch(kvslot_runner_t *runner)
                     break;
                 }
             }
+            record_qk_round_timing(
+                runner,
+                0,
+                elapsed_ns_since(round_start_ns),
+                0,
+                0,
+                0,
+                0);
         }
         for (uint32_t pos = 0; pos < round_count && rc == 0; ++pos) {
             processed[round_indices[pos]] = 1;
@@ -2980,7 +3593,7 @@ static int handle_qk_softmax_av_partial_batch(kvslot_runner_t *runner)
             rc = 1;
             break;
         }
-        if (finish_av_item(&av_items[idx]) != 0) {
+        if (finish_av_item(&av_items[idx], NULL) != 0) {
             fprintf(stderr, "Failed to finish qk-softmax-av partial context-fused item %u\n", idx);
             rc = 1;
             break;
@@ -3056,6 +3669,10 @@ static int run_stdio_mode(uint32_t requested_dpus)
             rc = handle_free(&runner, header.slot_id);
         } else if (header.command == KVSLOT_CMD_GET_STATS) {
             rc = handle_get_stats(&runner);
+        } else if (header.command == KVSLOT_CMD_GET_PROFILE) {
+            rc = handle_get_profile(&runner);
+        } else if (header.command == KVSLOT_CMD_GET_TOPOLOGY) {
+            rc = handle_get_topology(&runner);
         } else if (header.command == KVSLOT_CMD_QK_BATCH) {
             rc = handle_qk_batch(&runner);
         } else if (header.command == KVSLOT_CMD_AV) {
