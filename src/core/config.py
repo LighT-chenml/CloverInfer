@@ -31,6 +31,7 @@ class ClusterConfig(BaseModel):
     pim_qk_mixed_heads: int = 2
     pim_qk_mixed_window: int = 128
     pim_length: int = 128
+    pim_block_tokens: int = 256
     pim_max_resident_groups_per_layer: int = 0
     pim_head_grouping_policy: str = "balanced"
     pim_dpu_placement_policy: str = "rotated"

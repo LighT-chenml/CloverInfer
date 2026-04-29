@@ -160,6 +160,7 @@ class PimNaiveAttentionBackend:
         repo_root: str | None = None,
         num_dpus: int = 4,
         length: int = 128,
+        block_tokens: int = 256,
         resident_store_backend: str = "host",
         max_resident_groups_per_layer: int = 0,
         head_grouping_policy: str = "balanced",
@@ -178,6 +179,7 @@ class PimNaiveAttentionBackend:
         self.repo_root = repo_root or os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         self.num_dpus = num_dpus
         self.length = length
+        self.block_tokens = max(1, int(block_tokens))
         self.resident_store_backend = resident_store_backend
         self.max_resident_groups_per_layer = max(0, int(max_resident_groups_per_layer))
         self.head_grouping_policy = str(head_grouping_policy)
@@ -228,7 +230,12 @@ class PimNaiveAttentionBackend:
         self.resident_metadata_enabled = True
         self.resident_compute_enabled = True
         if resident_store_backend == "upmem_kvslot":
-            self.resident_store = UpmemKVSlotStore(self.repo_root, self.num_dpus, kv_dtype=self.resident_kv_dtype)
+            self.resident_store = UpmemKVSlotStore(
+                self.repo_root,
+                self.num_dpus,
+                kv_dtype=self.resident_kv_dtype,
+                block_tokens=self.block_tokens,
+            )
         elif resident_store_backend == "host":
             self.resident_store = HostResidentKVStore()
         else:

@@ -103,6 +103,7 @@ def make_scheduler(args):
         pim_qk_mixed_heads=args.pim_qk_mixed_heads,
         pim_qk_mixed_window=args.pim_qk_mixed_window,
         pim_length=args.pim_length,
+        pim_block_tokens=args.pim_block_tokens,
         pim_head_grouping_policy=args.pim_head_grouping_policy,
         pim_dpu_placement_policy=pim_dpu_placement_policy,
         clover_cpu_shadow_enabled=clover_cpu_shadow_enabled,
@@ -414,6 +415,7 @@ def main():
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--pim-num-dpus", type=int, default=4)
     parser.add_argument("--pim-length", type=int, default=128)
+    parser.add_argument("--pim-block-tokens", type=int, default=256)
     parser.add_argument(
         "--pim-head-grouping-policy",
         default="balanced",
@@ -481,6 +483,7 @@ def main():
                         "concurrency": concurrency,
                         "pim_num_dpus": int(args.pim_num_dpus),
                         "pim_length": int(args.pim_length),
+                        "pim_block_tokens": int(args.pim_block_tokens),
                         "pim_head_grouping_policy": str(args.pim_head_grouping_policy),
                         "pim_dpu_placement_policy": str(args.pim_dpu_placement_policy),
                         "pim_qk_mixed_heads": int(args.pim_qk_mixed_heads),

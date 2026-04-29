@@ -376,6 +376,7 @@ class GlobalScheduler:
             attention_backend_kwargs = {
                 "num_dpus": int(self.cluster_config.pim_num_dpus),
                 "length": int(self.cluster_config.pim_length),
+                "block_tokens": int(self.cluster_config.pim_block_tokens),
                 "resident_store_backend": str(self.cluster_config.pim_resident_store_backend),
                 "max_resident_groups_per_layer": int(self.cluster_config.pim_max_resident_groups_per_layer),
                 "head_grouping_policy": str(self.cluster_config.pim_head_grouping_policy),
