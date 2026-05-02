@@ -233,6 +233,28 @@ class CausalModelAdapter:
 
         raise ValueError(f"Unsupported model type for start_token: {self.model_type}")
 
+    def start_token_batch(self, token_ids: list[int], positions: list[int]) -> torch.Tensor:
+        if len(token_ids) != len(positions):
+            raise ValueError("token_ids and positions must have the same length")
+        if not token_ids:
+            return torch.empty((0, 1, self.hidden_size), dtype=self.dtype).cpu()
+
+        input_ids = torch.tensor([[int(tid)] for tid in token_ids], dtype=torch.long, device=self.device)
+
+        if self.model_type == "opt":
+            position_ids = torch.tensor([[int(pos)] for pos in positions], dtype=torch.long, device=self.device)
+            attention_mask = torch.ones((len(token_ids), 1), dtype=torch.long, device=self.device)
+            hidden = self.backbone.embed_tokens(input_ids)
+            hidden = hidden + self.backbone.embed_positions(attention_mask, position_ids=position_ids)
+            return hidden.detach().cpu()
+
+        if self.model_type == "qwen":
+            hidden = self.backbone.wte(input_ids)
+            hidden = self.backbone.drop(hidden)
+            return hidden.detach().cpu()
+
+        raise ValueError(f"Unsupported model type for start_token_batch: {self.model_type}")
+
     def prepare_attention(
         self,
         hidden_state: torch.Tensor,
@@ -249,6 +271,27 @@ class CausalModelAdapter:
             return self._prepare_qwen_attention(hidden, layer_idx, context_len)
         raise ValueError(f"Unsupported model type for prepare_attention: {self.model_type}")
 
+    def prepare_attention_batch(
+        self,
+        hidden_state: torch.Tensor,
+        layer_idx: int,
+        request_ids: list[str],
+        context_lens: list[int],
+    ) -> Dict[str, object]:
+        del request_ids
+        if hidden_state.dim() != 3:
+            raise ValueError("hidden_state must be [B, 1, H]")
+        batch = int(hidden_state.shape[0])
+        if batch != len(context_lens):
+            raise ValueError("context_lens length must match hidden_state batch size")
+        hidden = hidden_state.to(self.device)
+
+        if self.model_type == "opt":
+            return self._prepare_opt_attention_batch(hidden, layer_idx)
+        if self.model_type == "qwen":
+            return self._prepare_qwen_attention_batch(hidden, layer_idx, context_lens)
+        raise ValueError(f"Unsupported model type for prepare_attention_batch: {self.model_type}")
+
     def _prepare_opt_attention(self, hidden: torch.Tensor, layer_idx: int) -> Dict[str, object]:
         layer = self.layers[layer_idx]
         residual = hidden
@@ -260,6 +303,34 @@ class CausalModelAdapter:
         batch, seq_len, _ = hidden.shape
         if batch != 1 or seq_len != 1:
             raise ValueError("The first refactor supports batch=1, seq_len=1 decode only")
+
+        query = attn.q_proj(hidden) * attn.scaling
+        key = attn.k_proj(hidden)
+        value = attn.v_proj(hidden)
+
+        query = query.view(batch, seq_len, self.num_heads, self.head_dim).squeeze(1)
+        key = key.view(batch, seq_len, self.num_heads, self.head_dim).squeeze(1)
+        value = value.view(batch, seq_len, self.num_heads, self.head_dim).squeeze(1)
+
+        return {
+            "residual": residual.detach().cpu(),
+            "query": query.detach().cpu(),
+            "key": key.detach().cpu(),
+            "value": value.detach().cpu(),
+            "score_scale": 1.0,
+        }
+
+    def _prepare_opt_attention_batch(self, hidden: torch.Tensor, layer_idx: int) -> Dict[str, object]:
+        layer = self.layers[layer_idx]
+        residual = hidden
+
+        if layer.do_layer_norm_before:
+            hidden = layer.self_attn_layer_norm(hidden)
+
+        attn = layer.self_attn
+        batch, seq_len, _ = hidden.shape
+        if seq_len != 1:
+            raise ValueError("decode expects seq_len=1 for prepare_attention_batch")
 
         query = attn.q_proj(hidden) * attn.scaling
         key = attn.k_proj(hidden)
@@ -308,6 +379,29 @@ class CausalModelAdapter:
             "score_scale": 1.0 / math.sqrt(self.head_dim),
         }
 
+    def _prepare_qwen_attention_batch(
+        self, hidden: torch.Tensor, layer_idx: int, context_lens: list[int]
+    ) -> Dict[str, object]:
+        batch = int(hidden.shape[0])
+        residuals: list[torch.Tensor] = []
+        queries: list[torch.Tensor] = []
+        keys: list[torch.Tensor] = []
+        values: list[torch.Tensor] = []
+        score_scale = 1.0 / math.sqrt(self.head_dim)
+        for i in range(batch):
+            prepared = self._prepare_qwen_attention(hidden[i : i + 1], layer_idx, int(context_lens[i]))
+            residuals.append(prepared["residual"])
+            queries.append(prepared["query"])
+            keys.append(prepared["key"])
+            values.append(prepared["value"])
+        return {
+            "residual": torch.cat(residuals, dim=0),
+            "query": torch.stack(queries, dim=0),
+            "key": torch.stack(keys, dim=0),
+            "value": torch.stack(values, dim=0),
+            "score_scale": float(score_scale),
+        }
+
     def _build_qwen_rotary_pos_emb(self, context_len: int):
         ntk_alpha = 1.0
         if self.backbone.use_dynamic_ntk and context_len > self.backbone.seq_length:
@@ -327,6 +421,30 @@ class CausalModelAdapter:
         if self.model_type == "qwen":
             return self._finish_qwen_layer(residual, attn_output, layer_idx)
         raise ValueError(f"Unsupported model type for finish_layer: {self.model_type}")
+
+    def finish_layer_batch(
+        self,
+        residual: torch.Tensor,
+        attention_context: torch.Tensor,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        if residual.dim() != 3:
+            raise ValueError("residual must be [B, 1, H]")
+        context = attention_context
+        if context.dim() == 3:
+            context = context.unsqueeze(1)
+        if context.dim() != 4:
+            raise ValueError("attention_context must be [B, heads, dim] or [B, 1, heads, dim]")
+        if residual.shape[0] != context.shape[0]:
+            raise ValueError("residual and attention_context batch sizes must match")
+
+        residual_dev = residual.to(self.device)
+        attn_output = context.reshape(residual_dev.shape[0], 1, self.hidden_size).contiguous().to(self.device)
+        if self.model_type == "opt":
+            return self._finish_opt_layer(residual_dev, attn_output, layer_idx)
+        if self.model_type == "qwen":
+            return self._finish_qwen_layer(residual_dev, attn_output, layer_idx)
+        raise ValueError(f"Unsupported model type for finish_layer_batch: {self.model_type}")
 
     def _finish_opt_layer(self, residual: torch.Tensor, attn_output: torch.Tensor, layer_idx: int) -> torch.Tensor:
         layer = self.layers[layer_idx]
@@ -375,6 +493,23 @@ class CausalModelAdapter:
 
         logits = self.model.lm_head(hidden)
         return int(torch.argmax(logits[:, -1, :], dim=-1).item())
+
+    def sample_next_token_batch(self, hidden_state: torch.Tensor) -> list[int]:
+        if hidden_state.dim() != 3:
+            raise ValueError("hidden_state must be [B, 1, H]")
+        hidden = hidden_state.to(self.device)
+        if self.model_type == "opt":
+            final_norm = getattr(self.backbone, "final_layer_norm", None)
+            if final_norm is not None:
+                hidden = final_norm(hidden)
+        elif self.model_type == "qwen":
+            hidden = self.backbone.ln_f(hidden)
+        else:
+            raise ValueError(f"Unsupported model type for sample_next_token_batch: {self.model_type}")
+
+        logits = self.model.lm_head(hidden)
+        token_ids = torch.argmax(logits[:, -1, :], dim=-1)
+        return [int(item) for item in token_ids.detach().cpu().tolist()]
 
     def decode_tokens(self, token_ids: List[int]) -> str:
         return self.tokenizer.decode(token_ids, skip_special_tokens=True)

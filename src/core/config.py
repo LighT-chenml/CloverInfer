@@ -36,6 +36,10 @@ class ClusterConfig(BaseModel):
     pim_head_grouping_policy: str = "balanced"
     pim_dpu_placement_policy: str = "rotated"
     pim_resident_kv_dtype: str = "fp32"
+    pim_tail_capacity_buckets: List[int] = [16, 32, 64, 128, 256]
+    pim_kvslot_best_round_seed_enabled: bool = False
+    pim_kvslot_shape_rounds_experimental_enabled: bool = False
+    pim_kvslot_context_fused_experimental_enabled: bool = False
     clover_cpu_shadow_enabled: bool = True
     clover_shadow_checks_enabled: bool = True
     clover_op_profiling_enabled: bool = True
@@ -56,8 +60,12 @@ class ClusterConfig(BaseModel):
     attention_rpc_batch_max_size: int = 8
     attention_rpc_cross_key_batch_enabled: bool = False
     attention_actor_side_batching_enabled: bool = False
+    attention_wavefront_cohort_policy: str = "batch"  # "batch" (default) or "step"
     attention_actor_batch_window_s: float = 0.001
     attention_actor_batch_max_size: int = 8
+    decode_continuous_batching_enabled: bool = False
+    decode_continuous_max_batch_size: int = 8
+    decode_continuous_batch_window_s: float = 0.001
 
 class ModelConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")

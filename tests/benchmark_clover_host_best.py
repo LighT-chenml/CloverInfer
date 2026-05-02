@@ -17,6 +17,27 @@ from src.core.config import ClusterConfig, ModelConfig
 from src.core.scheduler import GlobalScheduler
 
 
+def build_ray_runtime_env(*, force_rebuild_kvslot_helper: bool = False) -> Dict[str, object]:
+    excludes = [
+        ".git/",
+        "artifacts/",
+        "model/",
+        "**/__pycache__/",
+        "*.pyc",
+    ]
+    env_vars: Dict[str, str] = {
+        "PYTHONPATH": REPO_ROOT,
+        "CLOVER_SHARED_REPO_ROOT": REPO_ROOT,
+    }
+    if force_rebuild_kvslot_helper:
+        env_vars["CLOVER_FORCE_REBUILD_KVSLOT"] = "1"
+    return {
+        "working_dir": REPO_ROOT,
+        "excludes": excludes,
+        "env_vars": env_vars,
+    }
+
+
 def percentile(values: List[float], pct: float) -> float:
     if not values:
         return 0.0
@@ -85,6 +106,17 @@ def make_scheduler(args):
     if hasattr(args, "clover_target_heads_per_group_experimental"):
         clover_target_heads_per_group_experimental = int(args.clover_target_heads_per_group_experimental)
 
+    tail_buckets: List[int] = []
+    if str(getattr(args, "pim_tail_capacity_buckets", "")).strip():
+        for item in str(getattr(args, "pim_tail_capacity_buckets", "")).split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                tail_buckets.append(int(item))
+            except Exception:
+                continue
+
     cluster = ClusterConfig(
         num_prefill_workers=1,
         num_attention_nodes=1,
@@ -118,7 +150,15 @@ def make_scheduler(args):
         clover_fine_head_grouping_experimental_enabled=clover_fine_head_grouping_experimental_enabled,
         clover_target_heads_per_group_experimental=clover_target_heads_per_group_experimental,
         attention_rpc_cross_key_batch_enabled=True,
+        attention_rpc_batch_window_s=float(getattr(args, "attention_rpc_batch_window_s", 0.001)),
+        attention_rpc_batch_max_size=int(getattr(args, "attention_rpc_batch_max_size", 8)),
+        attention_wavefront_cohort_policy=str(getattr(args, "attention_wavefront_cohort_policy", "batch")),
         attention_actor_side_batching_enabled=False,
+        pim_resident_kv_dtype=str(getattr(args, "pim_resident_kv_dtype", "fp32")),
+        pim_tail_capacity_buckets=tail_buckets if tail_buckets else [16, 32, 64, 128, 256],
+        pim_kvslot_best_round_seed_enabled=bool(getattr(args, "pim_kvslot_best_round_seed_enabled", False)),
+        pim_kvslot_shape_rounds_experimental_enabled=bool(getattr(args, "pim_kvslot_shape_rounds_enabled", False)),
+        pim_kvslot_context_fused_experimental_enabled=bool(getattr(args, "pim_kvslot_context_fused_enabled", False)),
     )
     model = ModelConfig(
         model_name=args.model_name,
@@ -414,8 +454,31 @@ def main():
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--pim-num-dpus", type=int, default=4)
+    parser.add_argument(
+        "--pim-force-rebuild-kvslot-helper",
+        action="store_true",
+        help="Force rebuilding the kvslot helper on Ray workers (sets CLOVER_FORCE_REBUILD_KVSLOT=1).",
+    )
+    parser.add_argument("--attention-rpc-batch-window-s", type=float, default=0.001)
+    parser.add_argument("--attention-rpc-batch-max-size", type=int, default=8)
+    parser.add_argument(
+        "--attention-wavefront-cohort-policy",
+        default="batch",
+        choices=["batch", "step"],
+        help="How to key attention wavefront batching when decode wave persist is enabled. "
+        "'batch' keeps cohort_id in the key; 'step' batches all requests at the same step/layer together.",
+    )
     parser.add_argument("--pim-length", type=int, default=128)
     parser.add_argument("--pim-block-tokens", type=int, default=256)
+    parser.add_argument("--pim-resident-kv-dtype", default="fp32", choices=["fp32", "fp16"])
+    parser.add_argument(
+        "--pim-tail-capacity-buckets",
+        default="16,32,64,128,256",
+        help="Comma-separated capacity buckets (<= pim-block-tokens) for blocked resident KV tail blocks.",
+    )
+    parser.add_argument("--pim-kvslot-best-round-seed-enabled", action="store_true")
+    parser.add_argument("--pim-kvslot-shape-rounds-enabled", action="store_true")
+    parser.add_argument("--pim-kvslot-context-fused-enabled", action="store_true")
     parser.add_argument(
         "--pim-head-grouping-policy",
         default="balanced",
@@ -462,7 +525,7 @@ def main():
 
     ray.init(
         address=args.address,
-        runtime_env={"env_vars": {"PYTHONPATH": REPO_ROOT}},
+        runtime_env=build_ray_runtime_env(force_rebuild_kvslot_helper=bool(args.pim_force_rebuild_kvslot_helper)),
         ignore_reinit_error=True,
     )
 

@@ -11,7 +11,15 @@ from src.core.config import ClusterConfig, ModelConfig
 
 async def test_decoding_flow():
     if not ray.is_initialized():
-        ray.init(ignore_reinit_error=True, runtime_env={"env_vars": {"PYTHONPATH": os.getcwd()}})
+        # Ship the local repo to the cluster so remote workers import the same sources.
+        ray.init(
+            ignore_reinit_error=True,
+            runtime_env={
+                "working_dir": os.getcwd(),
+                "excludes": [".git/", "artifacts/", "model/", "**/__pycache__/", "*.pyc"],
+                "env_vars": {"PYTHONPATH": os.getcwd()},
+            },
+        )
 
     cluster_conf = ClusterConfig(
         num_prefill_workers=1,

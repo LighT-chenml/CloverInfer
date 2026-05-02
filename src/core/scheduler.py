@@ -5,6 +5,7 @@ import time
 from typing import Dict, List
 
 import ray
+import torch
 
 from .config import ClusterConfig, ModelConfig
 from .nodes import AttentionNode, DecodeDenseNode, PrefillNode
@@ -89,6 +90,11 @@ class GlobalScheduler:
         self.attention_rpc_cross_key_batch_enabled = bool(
             getattr(cluster_config, "attention_rpc_cross_key_batch_enabled", False)
         )
+        self.attention_wavefront_cohort_policy = str(
+            getattr(cluster_config, "attention_wavefront_cohort_policy", "batch")
+        ).strip().lower()
+        if self.attention_wavefront_cohort_policy not in {"batch", "step"}:
+            self.attention_wavefront_cohort_policy = "batch"
         self.attention_actor_side_batching_enabled = bool(
             getattr(cluster_config, "attention_actor_side_batching_enabled", False)
         )
@@ -102,6 +108,8 @@ class GlobalScheduler:
         self._attention_wavefront_tasks: dict[tuple[int, int], asyncio.Task] = {}
         self._attention_wavefront_expected_sizes: dict[tuple[int, int], int] = {}
         self._active_decode_requests = 0
+        # Continuous decode engine state (optional).
+        self._continuous_engine = None
 
     def _attention_batch_target_size(self) -> int:
         return max(1, min(self._active_decode_requests, self.attention_batch_max_size))
@@ -342,7 +350,12 @@ class GlobalScheduler:
             cohort_id = str(decode_wave.get("cohort_id", "default"))
             if "group_size" in decode_wave:
                 cohort_size = max(1, int(decode_wave["group_size"]))
-            key = (int(decode_step), int(prepared["layer_idx"]), cohort_id)
+            if self.attention_wavefront_cohort_policy == "step":
+                # Force different requests at the same decode step to share the same key,
+                # maximizing batch formation even if submission cohort ids differ.
+                key = (int(decode_step), int(prepared["layer_idx"]))
+            else:
+                key = (int(decode_step), int(prepared["layer_idx"]), cohort_id)
         else:
             key = (int(decode_step), int(prepared["layer_idx"]))
         barrier_group_size = await self._synchronize_attention_layer(key)
@@ -382,6 +395,7 @@ class GlobalScheduler:
                 "head_grouping_policy": str(self.cluster_config.pim_head_grouping_policy),
                 "dpu_placement_policy": str(self.cluster_config.pim_dpu_placement_policy),
                 "resident_kv_dtype": str(self.cluster_config.pim_resident_kv_dtype),
+                "tail_capacity_buckets": list(self.cluster_config.pim_tail_capacity_buckets),
                 "qk_full_enabled": bool(self.cluster_config.pim_qk_full_enabled),
                 "qk_full_shadow_check": bool(self.cluster_config.pim_qk_full_shadow_check),
                 "softmax_av_fused_enabled": bool(self.cluster_config.pim_softmax_av_fused_enabled),
@@ -391,6 +405,9 @@ class GlobalScheduler:
                 "qk_mixed_window": int(self.cluster_config.pim_qk_mixed_window),
                 "decode_batch_window_s": float(self.cluster_config.attention_actor_batch_window_s),
                 "decode_batch_max_size": int(self.cluster_config.attention_actor_batch_max_size),
+                "best_round_seed_enabled": bool(self.cluster_config.pim_kvslot_best_round_seed_enabled),
+                "shape_rounds_enabled": bool(self.cluster_config.pim_kvslot_shape_rounds_experimental_enabled),
+                "context_fused_enabled": bool(self.cluster_config.pim_kvslot_context_fused_experimental_enabled),
             }
             if self.cluster_config.attention_backend == "cloverinfer":
                 attention_backend_kwargs.update(
@@ -452,7 +469,39 @@ class GlobalScheduler:
         print(f"Cluster initialized: {infos}")
         return infos
 
+    async def shutdown_cluster(self) -> bool:
+        """Best-effort cleanup to release external resources (e.g. kvslot helper)."""
+        # Stop continuous engine loop so it doesn't keep issuing decode work while we free state.
+        engine = getattr(self, "_continuous_engine", None)
+        if engine is not None:
+            try:
+                await engine.shutdown()
+            except Exception:
+                pass
+            self._continuous_engine = None
+
+        # Kill actors to ensure subprocesses / DPU handles are released.
+        actors = []
+        actors.extend(getattr(self, "prefill_nodes", []) or [])
+        actors.extend(getattr(self, "attention_nodes", []) or [])
+        actors.extend(getattr(self, "decode_dense_nodes", []) or [])
+        for actor in actors:
+            try:
+                ray.kill(actor)
+            except Exception:
+                pass
+        self.prefill_nodes = []
+        self.attention_nodes = []
+        self.decode_dense_nodes = []
+        return True
+
     async def submit_request(self, prompt: str, return_metrics: bool = False, max_new_tokens: int | None = None):
+        if bool(getattr(self.cluster_config, "decode_continuous_batching_enabled", False)):
+            return await self._submit_request_via_continuous_engine(
+                prompt,
+                return_metrics=return_metrics,
+                max_new_tokens=max_new_tokens,
+            )
         self._inflight_request_count += 1
         request_start = time.time()
         stage_timing = _empty_stage_timing()
@@ -622,3 +671,412 @@ class GlobalScheduler:
             return generated_text, metrics
 
         return generated_text
+
+    async def _submit_request_via_continuous_engine(
+        self,
+        prompt: str,
+        *,
+        return_metrics: bool = False,
+        max_new_tokens: int | None = None,
+    ):
+        # Phase-1 engine: step-batched decode.
+        if self._continuous_engine is None:
+            self._continuous_engine = ContinuousDecodeEngine(self)
+        # Maintain the same inflight accounting as the baseline path.
+        self._inflight_request_count += 1
+        try:
+            return await self._continuous_engine.enqueue(
+                prompt,
+                max_new_tokens=max_new_tokens,
+                return_metrics=return_metrics,
+            )
+        finally:
+            self._inflight_request_count = max(0, self._inflight_request_count - 1)
+
+
+class ContinuousDecodeEngine:
+    """Step-batched decode engine.
+
+    Each decode step forms a batch of active requests and iterates layers in lock-step:
+    dense.prepare_attention_batch -> attention.decode_layer_batch -> dense.finish_layer_batch.
+    Dense stays KV-free; KV cache lives in the attention backend.
+    """
+
+    def __init__(self, scheduler: GlobalScheduler):
+        self.scheduler = scheduler
+        self.batch_window_s = max(0.0, float(getattr(scheduler.cluster_config, "decode_continuous_batch_window_s", 0.001)))
+        self.max_batch_size = max(1, int(getattr(scheduler.cluster_config, "decode_continuous_max_batch_size", 8)))
+        self._pending: list[tuple[str, int, bool, float, asyncio.Future]] = []
+        self._active: list[dict] = []
+        self._active_rr_cursor: int = 0
+        self._task: asyncio.Task | None = None
+        self._debug_last_stats: dict[str, object] = {}
+        self._shutdown_requested = False
+
+    async def enqueue(
+        self,
+        prompt: str,
+        *,
+        max_new_tokens: int | None,
+        return_metrics: bool = False,
+    ):
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        max_tokens = int(max_new_tokens or self.scheduler.model_config.max_new_tokens)
+        request_start = time.time()
+        self._pending.append((str(prompt), max_tokens, bool(return_metrics), float(request_start), future))
+        if self._task is None:
+            self._task = asyncio.create_task(self._run())
+        return await future
+
+    async def shutdown(self) -> None:
+        """Stop the engine loop and best-effort finalize/cancel outstanding work."""
+        self._shutdown_requested = True
+        task = self._task
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except Exception:
+                pass
+        self._task = None
+        # Best-effort: free active requests to release kvslot helper state.
+        attention = self.scheduler.attention_nodes[0] if self.scheduler.attention_nodes else None
+        if attention is not None:
+            for item in list(self._active):
+                try:
+                    await attention.free_request.remote(item["request_id"])
+                except Exception:
+                    pass
+        for prompt, max_tokens, need_metrics, request_start, future in list(self._pending):
+            if not future.done():
+                future.cancel()
+        self._pending.clear()
+        self._active.clear()
+
+    async def _sleep_window(self):
+        if self.batch_window_s > 0:
+            await asyncio.sleep(self.batch_window_s)
+
+    async def _run(self):
+        try:
+            # Phase-2: persistent engine loop.
+            # Maintain a global active set and execute decode in step-batches, admitting new
+            # requests continuously while previous ones are decoding.
+            while (not self._shutdown_requested) and (self._pending or self._active):
+                await self._sleep_window()
+                await self._admit_pending()
+                if not self._active:
+                    continue
+                await self._decode_one_step_batch()
+        finally:
+            self._task = None
+            if self._pending:
+                self._task = asyncio.create_task(self._run())
+
+    async def _admit_pending(self) -> None:
+        """Move pending requests into the active set (prefill + attention.init_request)."""
+        prefill = self.scheduler.prefill_nodes[0]
+        attention = self.scheduler.attention_nodes[0]
+
+        if not self._pending:
+            return
+
+        stage_timing = _empty_stage_timing()
+        rpc_started = time.perf_counter()
+        batch = self._pending[: self.max_batch_size]
+        del self._pending[: self.max_batch_size]
+
+        async def _prefill_one(prompt: str):
+            out = await prefill.process_prompt.remote(prompt)
+            return out, time.time()
+
+        # Prefill in parallel so the batch window doesn't serialize the GPU.
+        prefill_tasks = [
+            asyncio.create_task(_prefill_one(prompt))
+            for prompt, _max_tokens, _need_metrics, _request_start, _future in batch
+        ]
+        prefill_results = await asyncio.gather(*prefill_tasks, return_exceptions=True)
+        stage_timing["scheduler"]["prefill_rpc_s"] += time.perf_counter() - rpc_started
+
+        init_tasks: list[asyncio.Task] = []
+        init_task_items: list[dict] = []
+
+        for (prompt, max_tokens, need_metrics, request_start, future), result in zip(batch, prefill_results):
+            if future.done():
+                continue
+            if isinstance(result, Exception):
+                future.set_exception(result)
+                continue
+            prefill_out, first_token_time = result
+            try:
+                request_id = str(prefill_out["request_id"])
+                prompt_len = int(prefill_out["prompt_len"])
+                first_token = int(prefill_out["first_token_id"])
+                item = {
+                    "prompt": prompt,
+                    "future": future,
+                    "need_metrics": bool(need_metrics),
+                    "request_start": float(request_start),
+                    "first_token_time": float(first_token_time),
+                    "request_id": request_id,
+                    "prompt_len": prompt_len,
+                    "max_tokens": int(max_tokens),
+                    "generated_ids": [first_token],
+                    "current_token": first_token,
+                    "done": bool(max_tokens <= 1),
+                    "next_step": 1,  # decode step counter; first token already produced by prefill
+                }
+                # Ray remote calls return ObjectRef; asyncio needs a coroutine.
+                async def _await_ref(ref):
+                    return await ref
+
+                init_ref = attention.init_request.remote(
+                    request_id,
+                    prefill_out["initial_kv"],
+                    int(max_tokens),
+                )
+                init_tasks.append(asyncio.create_task(_await_ref(init_ref)))
+                init_task_items.append(item)
+            except Exception as exc:
+                future.set_exception(exc)
+
+        # Init KV state in parallel.
+        if init_tasks:
+            rpc_started = time.perf_counter()
+            init_results = await asyncio.gather(*init_tasks, return_exceptions=True)
+            stage_timing["scheduler"]["attention_init_rpc_s"] += time.perf_counter() - rpc_started
+            for item, result in zip(init_task_items, init_results):
+                future = item["future"]
+                if future.done():
+                    continue
+                if isinstance(result, Exception):
+                    future.set_exception(result)
+                    item["done"] = True
+                else:
+                    self.scheduler._active_decode_requests += 1
+                    # Requests with max_tokens <= 1 finalize immediately.
+                    if item["done"]:
+                        await self._finalize_item(item)
+                    else:
+                        self._active.append(item)
+                # Attach stage timing so later finalize can report something meaningful.
+                current_stage = item.get("stage_timing")
+                if current_stage is None:
+                    item["stage_timing"] = stage_timing
+                else:
+                    for key in stage_timing.get("scheduler", {}):
+                        current_stage["scheduler"][key] = float(current_stage["scheduler"].get(key, 0.0)) + float(
+                            stage_timing["scheduler"].get(key, 0.0)
+                        )
+                    for key in stage_timing.get("actors", {}):
+                        current_stage["actors"][key] = float(current_stage["actors"].get(key, 0.0)) + float(
+                            stage_timing["actors"].get(key, 0.0)
+                        )
+
+        # If we admitted some items, update debug stats to reflect current active set.
+        num_layers = int(self.scheduler.runtime_model_spec.get("num_layers", 0))
+        if self._active:
+            max_tokens_seen = max(int(item.get("max_tokens", 0)) for item in self._active)
+        else:
+            max_tokens_seen = 0
+        self._debug_last_stats.update(
+            {
+                "engine_batch_size": int(len(self._active)),
+                "engine_num_layers": int(num_layers),
+                "engine_max_tokens": int(max_tokens_seen),
+            }
+        )
+
+    async def _finalize_item(self, item: dict) -> None:
+        attention = self.scheduler.attention_nodes[0]
+        dense = self.scheduler.decode_dense_nodes[0]
+        future = item["future"]
+        if future.done():
+            return
+        stage_timing = item.get("stage_timing")
+        if stage_timing is None:
+            stage_timing = _empty_stage_timing()
+            item["stage_timing"] = stage_timing
+        attention_debug_before_free = None
+        if item.get("need_metrics", False):
+            try:
+                attention_debug_before_free = await attention.get_info.remote()
+            except Exception:
+                attention_debug_before_free = None
+        try:
+            rpc_started = time.perf_counter()
+            await attention.free_request.remote(item["request_id"])
+            stage_timing["scheduler"]["free_request_rpc_s"] += time.perf_counter() - rpc_started
+        except Exception:
+            pass
+        self.scheduler._active_decode_requests = max(0, self.scheduler._active_decode_requests - 1)
+        try:
+            rpc_started = time.perf_counter()
+            decode_result = await dense.decode_tokens.remote(item["generated_ids"])
+            stage_timing["scheduler"]["decode_tokens_rpc_s"] += time.perf_counter() - rpc_started
+            stage_timing["actors"]["dense_decode_tokens_compute_s"] += float(
+                decode_result.get("profile", {}).get("compute_s", 0.0)
+            )
+            generated_text = str(decode_result.get("text", ""))
+        except Exception as exc:
+            future.set_exception(exc)
+            return
+
+        if item.get("need_metrics", False):
+            request_end = time.time()
+            latency = float(request_end - float(item["request_start"]))
+            total_tokens = int(len(item["generated_ids"]))
+            ttft = float(float(item["first_token_time"]) - float(item["request_start"]))
+            tpot = (latency - ttft) / max(total_tokens - 1, 1)
+            throughput = (float(total_tokens) / latency) if latency > 0 else 0.0
+            engine_stats = dict(self._debug_last_stats or {})
+            # Fill counts and totals for compatibility with baseline analysis.
+            stage_timing["counts"]["decode_steps"] = int(item.get("next_step", 1))
+            stage_timing["counts"]["decode_layers"] = int(item.get("decode_layers", 0))
+            scheduler_rpc_total = sum(float(v) for v in stage_timing["scheduler"].values())
+            actor_compute_total = sum(float(v) for v in stage_timing["actors"].values())
+            stage_timing["scheduler"]["total_rpc_s"] = float(scheduler_rpc_total)
+            stage_timing["actors"]["total_compute_s"] = float(actor_compute_total)
+            stage_timing["scheduler_overhead_s"] = max(0.0, float(latency - scheduler_rpc_total))
+            metrics = {
+                "ttft": float(ttft),
+                "tpot": float(tpot),
+                "latency": float(latency),
+                "throughput": float(throughput),
+                "total_tokens": int(total_tokens),
+                "stage_timing": stage_timing,
+                "attention_backend_before_free": attention_debug_before_free or {},
+                "attention_backend": attention_debug_before_free or {},
+                "continuous_engine": engine_stats,
+            }
+            future.set_result((generated_text, metrics))
+        else:
+            future.set_result(generated_text)
+
+    def _pick_step_batch(self) -> list[dict]:
+        """Pick up to max_batch_size active items in a round-robin fashion."""
+        if not self._active:
+            return []
+        start = int(self._active_rr_cursor) % len(self._active)
+        picked: list[dict] = []
+        idx = start
+        visited = 0
+        while visited < len(self._active) and len(picked) < self.max_batch_size:
+            item = self._active[idx]
+            if (not item.get("done", False)) and (not item["future"].done()):
+                picked.append(item)
+            idx = (idx + 1) % len(self._active)
+            visited += 1
+        self._active_rr_cursor = idx
+        return picked
+
+    async def _decode_one_step_batch(self) -> None:
+        dense = self.scheduler.decode_dense_nodes[0]
+        attention = self.scheduler.attention_nodes[0]
+        num_layers = int(self.scheduler.runtime_model_spec.get("num_layers", 0))
+
+        step_active = self._pick_step_batch()
+        if not step_active:
+            return
+
+        # NOTE: For phase-2, we keep "step-batched" but allow different requests to be at different steps.
+        # Each item carries its own next_step counter and context_len/position is derived from it.
+        token_ids = [int(item["current_token"]) for item in step_active]
+        positions = [int(item["prompt_len"]) + int(item["next_step"]) - 1 for item in step_active]
+        rpc_started = time.perf_counter()
+        hidden_result = await dense.start_token_batch.remote(token_ids, positions)
+        rpc_elapsed = time.perf_counter() - rpc_started
+        for item in step_active:
+            stage_timing = item.get("stage_timing")
+            if stage_timing is None:
+                stage_timing = _empty_stage_timing()
+                item["stage_timing"] = stage_timing
+            stage_timing["scheduler"]["start_token_rpc_s"] += float(rpc_elapsed) / max(len(step_active), 1)
+            stage_timing["actors"]["dense_start_token_compute_s"] += float(
+                hidden_result.get("profile", {}).get("compute_s", 0.0)
+            ) / max(len(step_active), 1)
+        hidden = hidden_result["hidden"]
+
+        for layer_idx in range(num_layers):
+            context_lens = [int(item["prompt_len"]) + int(item["next_step"]) for item in step_active]
+            request_ids = [str(item["request_id"]) for item in step_active]
+            rpc_started = time.perf_counter()
+            prepared = await dense.prepare_attention_batch.remote(hidden, int(layer_idx), request_ids, context_lens)
+            rpc_elapsed = time.perf_counter() - rpc_started
+            for item in step_active:
+                stage_timing = item["stage_timing"]
+                stage_timing["scheduler"]["prepare_attention_rpc_s"] += float(rpc_elapsed) / max(len(step_active), 1)
+                stage_timing["actors"]["dense_prepare_attention_compute_s"] += float(
+                    prepared.get("profile", {}).get("compute_s", 0.0)
+                ) / max(len(step_active), 1)
+            q = prepared["query"]
+            k_new = prepared["key"]
+            v_new = prepared["value"]
+            residual = prepared["residual"]
+            score_scale = float(prepared.get("score_scale", 1.0))
+
+            payloads = []
+            for i, req_id in enumerate(request_ids):
+                payloads.append(
+                    {
+                        "request_id": req_id,
+                        "layer_idx": int(layer_idx),
+                        "query": q[i],
+                        "key": k_new[i],
+                        "value": v_new[i],
+                        "score_scale": score_scale,
+                    }
+                )
+            rpc_started = time.perf_counter()
+            attention_out = await attention.decode_layer_batch.remote(payloads)
+            rpc_elapsed = time.perf_counter() - rpc_started
+            per_item_compute = 0.0
+            if attention_out:
+                per_item_compute = float(attention_out[0].get("profile", {}).get("compute_s", 0.0))
+            for item in step_active:
+                stage_timing = item["stage_timing"]
+                stage_timing["scheduler"]["attention_decode_rpc_s"] += float(rpc_elapsed) / max(len(step_active), 1)
+                stage_timing["actors"]["attention_decode_compute_s"] += float(per_item_compute)
+            self._debug_last_stats["engine_last_attention_batch_size"] = int(len(payloads))
+            contexts = [item_out["context"] for item_out in attention_out]
+            context_tensor = torch.cat([ctx for ctx in contexts], dim=0)
+            finish = await dense.finish_layer_batch.remote(residual, context_tensor, int(layer_idx))
+            for item in step_active:
+                stage_timing = item["stage_timing"]
+                stage_timing["scheduler"]["finish_layer_rpc_s"] += 0.0  # remote overhead folded into RPC time below
+                stage_timing["actors"]["dense_finish_layer_compute_s"] += float(
+                    finish.get("profile", {}).get("compute_s", 0.0)
+                ) / max(len(step_active), 1)
+            hidden = finish["hidden"]
+            for item in step_active:
+                item["decode_layers"] = int(item.get("decode_layers", 0)) + 1
+
+        rpc_started = time.perf_counter()
+        sample = await dense.sample_next_token_batch.remote(hidden)
+        rpc_elapsed = time.perf_counter() - rpc_started
+        for item in step_active:
+            stage_timing = item["stage_timing"]
+            stage_timing["scheduler"]["sample_next_token_rpc_s"] += float(rpc_elapsed) / max(len(step_active), 1)
+            stage_timing["actors"]["dense_sample_next_token_compute_s"] += float(
+                sample.get("profile", {}).get("compute_s", 0.0)
+            ) / max(len(step_active), 1)
+        next_tokens = [int(x) for x in sample["token_ids"]]
+        for item, next_token in zip(step_active, next_tokens):
+            item["generated_ids"].append(next_token)
+            item["current_token"] = next_token
+            item["next_step"] = int(item["next_step"]) + 1
+            if next_token == 2:
+                item["done"] = True
+            elif int(item["next_step"]) >= int(item["max_tokens"]):
+                item["done"] = True
+
+        # Retire finished items.
+        done_now = [item for item in step_active if item.get("done", False) and (not item["future"].done())]
+        for item in done_now:
+            await self._finalize_item(item)
+        self._active = [item for item in self._active if (not item.get("done", False)) and (not item["future"].done())]
+
+
+# Backwards-compatible alias for Ray deserialization / older pickles.
+_ContinuousDecodeEngine = ContinuousDecodeEngine

@@ -6,6 +6,7 @@ import os
 import numpy as np
 import struct
 import subprocess
+import shutil
 import time
 from typing import Dict
 
@@ -109,7 +110,7 @@ class _KVSlotHelperClient:
     CMD_QK_SOFTMAX_AV_PARTIAL_BATCH = 12
     CMD_GET_PROFILE = 13
     CMD_GET_TOPOLOGY = 14
-    MAX_SLOTS_PER_DPU = 64
+    MAX_SLOTS_PER_DPU = 256
     MAX_BATCH_ITEMS = 32
 
     def __init__(self, binary_path: str, num_dpus: int, cwd: str, kv_dtype: str = "fp32"):
@@ -121,6 +122,16 @@ class _KVSlotHelperClient:
         self.restarts = 0
         self.persistent_state_active = False
         self.helper_env: Dict[str, str] = {}
+        # Host-side micro profiling to understand overheads (dtype conversion,
+        # serialization, pipe I/O) when running fp16 resident KV experiments.
+        self.host_profile_totals_s: Dict[str, float] = {
+            "allocate_group_write": 0.0,
+            "allocate_group_read": 0.0,
+            "append_group_write": 0.0,
+            "append_group_read": 0.0,
+            "materialize_group_read": 0.0,
+        }
+        self.host_profile_counts: Dict[str, int] = {key: 0 for key in self.host_profile_totals_s}
 
     def set_env_flag(self, name: str, enabled: bool) -> None:
         value = "1" if enabled else "0"
@@ -145,6 +156,8 @@ class _KVSlotHelperClient:
                 except Exception:
                     stderr_text = ""
             if self.persistent_state_active:
+                # In long-running experiments the helper can crash (e.g. transient
+                # driver issues). Raise, but include a hint to help debugging.
                 raise RuntimeError(
                     "kvslot helper exited while persistent DPU state was active: "
                     f"{stderr_text.strip()}"
@@ -216,9 +229,18 @@ class _KVSlotHelperClient:
         seq_len, group_heads, head_dim = (int(dim) for dim in initial_k.shape)
         header = struct.pack("<IIII", self.MAGIC, self.CMD_ALLOCATE, slot_id, 0)
         args = struct.pack("<IIIII", int(capacity), seq_len, group_heads, head_dim, self._dtype_code())
-        payload = header + args + initial_k.numpy().tobytes(order="C") + initial_v.numpy().tobytes(order="C")
-        self._write(payload)
+        # Avoid building a single large bytes object (extra copy). The tensors
+        # are already CPU-contiguous from the resident store encode path.
+        started = time.perf_counter()
+        k_np = initial_k.numpy()
+        v_np = initial_v.numpy()
+        self._write_parts([header, args, memoryview(k_np).cast("B"), memoryview(v_np).cast("B")])
+        self.host_profile_totals_s["allocate_group_write"] += float(time.perf_counter() - started)
+        self.host_profile_counts["allocate_group_write"] += 1
+        started = time.perf_counter()
         out = struct.unpack("<IIIII", self._read_exact(20))
+        self.host_profile_totals_s["allocate_group_read"] += float(time.perf_counter() - started)
+        self.host_profile_counts["allocate_group_read"] += 1
         return {
             "capacity": int(out[0]),
             "seq_len": int(out[1]),
@@ -230,9 +252,16 @@ class _KVSlotHelperClient:
         append_len, group_heads, head_dim = (int(dim) for dim in k_new.shape)
         header = struct.pack("<IIII", self.MAGIC, self.CMD_APPEND, slot_id, 0)
         args = struct.pack("<IIIII", 0, append_len, group_heads, head_dim, self._dtype_code())
-        payload = header + args + k_new.numpy().tobytes(order="C") + v_new.numpy().tobytes(order="C")
-        self._write(payload)
+        started = time.perf_counter()
+        k_np = k_new.numpy()
+        v_np = v_new.numpy()
+        self._write_parts([header, args, memoryview(k_np).cast("B"), memoryview(v_np).cast("B")])
+        self.host_profile_totals_s["append_group_write"] += float(time.perf_counter() - started)
+        self.host_profile_counts["append_group_write"] += 1
+        started = time.perf_counter()
         out = struct.unpack("<IIIII", self._read_exact(20))
+        self.host_profile_totals_s["append_group_read"] += float(time.perf_counter() - started)
+        self.host_profile_counts["append_group_read"] += 1
         return {
             "capacity": int(out[0]),
             "seq_len": int(out[1]),
@@ -252,14 +281,18 @@ class _KVSlotHelperClient:
             k = torch.empty((0, group_heads, head_dim), dtype=dtype)
             v = torch.empty((0, group_heads, head_dim), dtype=dtype)
         else:
+            started = time.perf_counter()
             k_bytes = self._read_exact(elems * elem_bytes)
             v_bytes = self._read_exact(elems * elem_bytes)
+            # struct.unpack is very slow for large payloads; use frombuffer.
             if elem_bytes == 2:
-                k = torch.tensor(struct.unpack(f"<{elems}h", k_bytes), dtype=torch.int16).view(seq_len, group_heads, head_dim)
-                v = torch.tensor(struct.unpack(f"<{elems}h", v_bytes), dtype=torch.int16).view(seq_len, group_heads, head_dim)
+                k = torch.from_numpy(np.frombuffer(k_bytes, dtype="<i2").copy()).view(seq_len, group_heads, head_dim)
+                v = torch.from_numpy(np.frombuffer(v_bytes, dtype="<i2").copy()).view(seq_len, group_heads, head_dim)
             else:
-                k = torch.tensor(struct.unpack(f"<{elems}i", k_bytes), dtype=torch.int32).view(seq_len, group_heads, head_dim)
-                v = torch.tensor(struct.unpack(f"<{elems}i", v_bytes), dtype=torch.int32).view(seq_len, group_heads, head_dim)
+                k = torch.from_numpy(np.frombuffer(k_bytes, dtype="<i4").copy()).view(seq_len, group_heads, head_dim)
+                v = torch.from_numpy(np.frombuffer(v_bytes, dtype="<i4").copy()).view(seq_len, group_heads, head_dim)
+            self.host_profile_totals_s["materialize_group_read"] += float(time.perf_counter() - started)
+            self.host_profile_counts["materialize_group_read"] += 1
         return k, v, {
             "capacity": capacity,
             "seq_len": seq_len,
@@ -1021,16 +1054,47 @@ class UpmemKVSlotStore(ResidentKVStore):
     backend_name = "upmem_kvslot_store"
     POOL_CAPACITY_ELEMS = 256 * 32 * 128
 
-    def __init__(self, repo_root: str, num_dpus: int, kv_dtype: str = "fp32", block_tokens: int = 256):
+    def __init__(
+        self,
+        repo_root: str,
+        num_dpus: int,
+        kv_dtype: str = "fp32",
+        block_tokens: int = 256,
+        tail_capacity_buckets: list[int] | None = None,
+        dpu_placement_policy: str = "rotated",
+    ):
         self.repo_root = repo_root
         self.num_dpus = num_dpus
         self.kv_dtype = str(kv_dtype)
         self.block_tokens = max(1, int(block_tokens))
+        if tail_capacity_buckets is None:
+            tail_capacity_buckets = [16, 32, 64, 128, 256]
+        sanitized: list[int] = []
+        for value in tail_capacity_buckets:
+            try:
+                bucket = int(value)
+            except Exception:
+                continue
+            if bucket <= 0:
+                continue
+            if bucket > self.block_tokens:
+                continue
+            if bucket not in sanitized:
+                sanitized.append(bucket)
+        if not sanitized:
+            sanitized = [min(16, self.block_tokens), self.block_tokens]
+        sanitized.sort()
+        self.tail_capacity_buckets = sanitized
+        self.dpu_placement_policy = str(dpu_placement_policy)
         if self.kv_dtype not in {"fp32", "fp16"}:
             raise ValueError(f"Unsupported resident kv dtype: {self.kv_dtype}")
-        kvslot_dir = os.path.join(repo_root, "src", "pim", "upmem_kvslot")
+        if self.dpu_placement_policy not in {"identity", "rotated", "rank_spread"}:
+            raise ValueError(f"Unsupported dpu placement policy: {self.dpu_placement_policy}")
+        kvslot_dir, helper_binary_path = self._resolve_kvslot_helper_paths(repo_root)
+        self.kvslot_dir = kvslot_dir
+        self.helper_binary_path = helper_binary_path
         self.helper = _KVSlotHelperClient(
-            binary_path=os.path.join(kvslot_dir, "build", "host_kvslot"),
+            binary_path=helper_binary_path,
             num_dpus=num_dpus,
             cwd=kvslot_dir,
             kv_dtype=self.kv_dtype,
@@ -1048,6 +1112,8 @@ class UpmemKVSlotStore(ResidentKVStore):
         self.dpu_live_slots = 0
         self.dpu_capacity_fallbacks = 0
         self.dpu_live_elems_by_dpu = [0 for _ in range(num_dpus)]
+        self.last_allocate_error = ""
+        self.last_allocate_error_stage = ""
         self.op_timing_totals_s: Dict[str, float] = {
             "allocate_group": 0.0,
             "append_group": 0.0,
@@ -1090,17 +1156,117 @@ class UpmemKVSlotStore(ResidentKVStore):
             "qk_softmax_weighted_value_sum_batch_host_fallback_items": 0,
         }
 
+    def _kvslot_dir_candidates(self, repo_root: str) -> list[str]:
+        candidates = [os.path.join(repo_root, "src", "pim", "upmem_kvslot")]
+        shared_repo_root = os.environ.get("CLOVER_SHARED_REPO_ROOT", "").strip()
+        if shared_repo_root:
+            candidates.append(os.path.join(shared_repo_root, "src", "pim", "upmem_kvslot"))
+        shared_kvslot_dir = os.environ.get("CLOVER_SHARED_UPMEM_KVSLOT_DIR", "").strip()
+        if shared_kvslot_dir:
+            candidates.append(shared_kvslot_dir)
+
+        deduped: list[str] = []
+        seen = set()
+        for candidate in candidates:
+            normalized = os.path.abspath(candidate)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(normalized)
+        return deduped
+
+    def _try_build_kvslot_helper(self, kvslot_dir: str) -> bool:
+        host_binary_path = os.path.join(kvslot_dir, "build", "host_kvslot")
+        # Ray `working_dir` often ships prebuilt artifacts under `build/`.
+        # If we change sources (e.g. `host_kvslot.c`) but an old binary is present,
+        # we must rebuild or we'll silently run stale code.
+        force_rebuild = os.environ.get("CLOVER_FORCE_REBUILD_KVSLOT", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        )
+        if os.path.isfile(host_binary_path) and not force_rebuild:
+            # If this directory contains sources, we still want to detect stale binaries.
+            # If it doesn't, accept the prebuilt binary.
+            has_sources = os.path.isfile(os.path.join(kvslot_dir, "Makefile")) and os.path.isfile(
+                os.path.join(kvslot_dir, "host_kvslot.c")
+            )
+            if not has_sources:
+                return True
+
+        if not os.path.isfile(os.path.join(kvslot_dir, "Makefile")):
+            return False
+        if not os.path.isfile(os.path.join(kvslot_dir, "host_kvslot.c")):
+            return False
+
+        if os.path.isfile(host_binary_path) and not force_rebuild:
+            # Rebuild when sources are newer than the binary.
+            try:
+                binary_mtime = os.path.getmtime(host_binary_path)
+                source_paths = [
+                    os.path.join(kvslot_dir, "Makefile"),
+                    os.path.join(kvslot_dir, "common.h"),
+                    os.path.join(kvslot_dir, "host_kvslot.c"),
+                    os.path.join(kvslot_dir, "dpu_kvslot.c"),
+                ]
+                sources_mtime = max(
+                    os.path.getmtime(path) for path in source_paths if os.path.isfile(path)
+                )
+                if sources_mtime <= binary_mtime:
+                    return True
+            except Exception:
+                # If we can't stat, fall through to `make` and let it decide.
+                pass
+
+            # If we don't have the UPMEM toolchain available locally, avoid failing hard:
+            # keep using the existing binary even if sources appear newer.
+            if shutil.which("dpu-upmem-dpurte-clang") is None:
+                return True
+
+        try:
+            subprocess.run(
+                ["make", "-C", kvslot_dir],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=180,
+            )
+        except Exception:
+            return False
+        return os.path.isfile(host_binary_path)
+
+    def _resolve_kvslot_helper_paths(self, repo_root: str) -> tuple[str, str]:
+        for kvslot_dir in self._kvslot_dir_candidates(repo_root):
+            if not os.path.isdir(kvslot_dir):
+                continue
+            # Always go through `_try_build_kvslot_helper()` so mtime/force-rebuild logic is honored.
+            if self._try_build_kvslot_helper(kvslot_dir):
+                return kvslot_dir, os.path.join(kvslot_dir, "build", "host_kvslot")
+
+        existing_dirs: list[str] = []
+        for kvslot_dir in self._kvslot_dir_candidates(repo_root):
+            if os.path.isdir(kvslot_dir):
+                existing_dirs.append(kvslot_dir)
+        fallback_dir = existing_dirs[0] if existing_dirs else self._kvslot_dir_candidates(repo_root)[0]
+        return fallback_dir, os.path.join(fallback_dir, "build", "host_kvslot")
+
     def set_experimental_flags(
         self,
         *,
         context_fused_enabled: bool | None = None,
         shape_rounds_enabled: bool | None = None,
+        best_round_seed_enabled: bool | None = None,
         rank_spread_alloc_enabled: bool | None = None,
     ) -> None:
         if context_fused_enabled is not None:
             self.helper.set_env_flag("CLOVER_KVSLOT_CONTEXT_FUSED", bool(context_fused_enabled))
         if shape_rounds_enabled is not None:
             self.helper.set_env_flag("CLOVER_KVSLOT_SHAPE_ROUNDS", bool(shape_rounds_enabled))
+        if best_round_seed_enabled is not None:
+            self.helper.set_env_flag("CLOVER_KVSLOT_BEST_ROUND_SEED", bool(best_round_seed_enabled))
         if rank_spread_alloc_enabled is not None:
             self.helper.set_env_flag("CLOVER_KVSLOT_RANK_SPREAD_ALLOC", bool(rank_spread_alloc_enabled))
 
@@ -1115,6 +1281,94 @@ class UpmemKVSlotStore(ResidentKVStore):
         if item is None:
             return None
         return int(item.get("rank_id", 0))
+
+    def _ensure_topology_cache(self) -> None:
+        if self.num_dpus <= 0 or self._helper_topology_cache:
+            return
+        try:
+            helper_topology = self.helper.get_topology()
+        except Exception:
+            return
+        self._helper_topology_cache = {
+            int(item["logical_dpu_id"]): {
+                "rank_index": int(item["rank_index"]),
+                "rank_id": int(item["rank_id"]),
+            }
+            for item in helper_topology.get("items", [])
+        }
+
+    def _placement_order(self, preferred_dpu: int | None = None) -> list[int]:
+        if self.num_dpus <= 0:
+            return [0]
+        base_physical_dpu = self._normalize_preferred_dpu(preferred_dpu)
+        if self.num_dpus == 1 or self.dpu_placement_policy in {"identity", "rotated"}:
+            return [
+                (base_physical_dpu + offset) % self.num_dpus
+                for offset in range(self.num_dpus)
+            ]
+
+        self._ensure_topology_cache()
+        if len(self._helper_topology_cache) < self.num_dpus:
+            return [
+                (base_physical_dpu + offset) % self.num_dpus
+                for offset in range(self.num_dpus)
+            ]
+
+        base_rank = self._topology_rank_index(base_physical_dpu)
+        if base_rank is None:
+            return [
+                (base_physical_dpu + offset) % self.num_dpus
+                for offset in range(self.num_dpus)
+            ]
+
+        dpus_by_rank: Dict[int, list[int]] = {}
+        for physical_dpu in range(self.num_dpus):
+            rank_index = self._topology_rank_index(physical_dpu)
+            if rank_index is None:
+                continue
+            dpus_by_rank.setdefault(int(rank_index), []).append(int(physical_dpu))
+        if not dpus_by_rank:
+            return [
+                (base_physical_dpu + offset) % self.num_dpus
+                for offset in range(self.num_dpus)
+            ]
+
+        rank_order = sorted(dpus_by_rank)
+        if int(base_rank) in rank_order:
+            base_pos = rank_order.index(int(base_rank))
+            rank_order = rank_order[base_pos:] + rank_order[:base_pos]
+        for rank_index, dpu_ids in dpus_by_rank.items():
+            dpu_ids.sort()
+            if rank_index == int(base_rank) and base_physical_dpu in dpu_ids:
+                base_pos = dpu_ids.index(base_physical_dpu)
+                dpus_by_rank[rank_index] = dpu_ids[base_pos:] + dpu_ids[:base_pos]
+
+        placement: list[int] = []
+        rank_pass = 0
+        while len(placement) < self.num_dpus:
+            added_this_pass = False
+            for rank_index in rank_order:
+                dpu_ids = dpus_by_rank.get(rank_index, [])
+                if rank_pass >= len(dpu_ids):
+                    continue
+                placement.append(int(dpu_ids[rank_pass]))
+                added_this_pass = True
+            if not added_this_pass:
+                break
+            rank_pass += 1
+        if len(placement) != self.num_dpus:
+            return [
+                (base_physical_dpu + offset) % self.num_dpus
+                for offset in range(self.num_dpus)
+            ]
+        return placement
+
+    def _placement_dpu_for_block(self, slot_info: Dict[str, object], block_idx: int) -> int:
+        placement_order = slot_info.get("placement_order")
+        if isinstance(placement_order, list) and placement_order:
+            return int(placement_order[int(block_idx) % len(placement_order)])
+        base_physical_dpu = int(slot_info.get("base_physical_dpu", slot_info.get("physical_dpu", 0)))
+        return self._placement_order(base_physical_dpu)[int(block_idx) % max(self.num_dpus, 1)]
 
     def _record_timing(self, name: str, started_at: float) -> None:
         self.op_timing_totals_s[name] += float(time.perf_counter() - started_at)
@@ -1186,6 +1440,24 @@ class UpmemKVSlotStore(ResidentKVStore):
     def _supports_dpu_shape(self, group_heads: int, head_dim: int) -> bool:
         return int(group_heads) <= 32 and int(head_dim) <= 128
 
+    def _bucket_block_capacity(self, seq_len: int) -> int:
+        """Pick a per-block capacity <= self.block_tokens to reduce MRAM waste.
+
+        The helper only supports capacities up to 256 (KVSLOT_MAX_CAPACITY). When
+        we always allocate blocks at `self.block_tokens`, tail blocks with just a
+        few tokens still reserve the full 256-token slice, which quickly exhausts
+        the per-DPU MRAM pool under concurrent long-context workloads.
+        """
+        want = max(1, int(seq_len))
+        cap_limit = max(1, int(self.block_tokens))
+        if want >= cap_limit:
+            return cap_limit
+
+        for bucket in self.tail_capacity_buckets:
+            if want <= int(bucket):
+                return int(bucket)
+        return cap_limit
+
     def _release_slot_reservation(
         self,
         key: tuple[str, str],
@@ -1256,7 +1528,7 @@ class UpmemKVSlotStore(ResidentKVStore):
         slot_info: Dict[str, object],
         window: int | None = None,
     ) -> list[tuple[Dict[str, object], int]]:
-        blocks = slot_info.get("blocks", slot_info.get("segments", []))
+        blocks = self._blocked_slot_blocks(slot_info)
         if not blocks:
             return []
         if window is None:
@@ -1277,6 +1549,9 @@ class UpmemKVSlotStore(ResidentKVStore):
     def _blocked_slot_blocks(self, slot_info: Dict[str, object]) -> list[Dict[str, object]]:
         return list(slot_info.get("blocks", slot_info.get("segments", [])))
 
+    def _is_blocked_slot(self, slot_info: Dict[str, object]) -> bool:
+        return str(slot_info.get("backend", "")) == "dpu_blocked"
+
     def _allocate_block_append_only(
         self,
         *,
@@ -1289,11 +1564,10 @@ class UpmemKVSlotStore(ResidentKVStore):
     ) -> Dict[str, object]:
         blocks = self._blocked_slot_blocks(slot_info)
         block_idx = len(blocks)
-        base_physical_dpu = int(slot_info.get("base_physical_dpu", slot_info.get("physical_dpu", 0)))
-        block_physical_dpu = (
-            (base_physical_dpu + block_idx) % max(self.num_dpus, 1) if self.num_dpus > 0 else 0
-        )
-        block_capacity = max(int(block_k.shape[0]), self.block_tokens)
+        block_physical_dpu = self._placement_dpu_for_block(slot_info, block_idx) if self.num_dpus > 0 else 0
+        # Use a bucketed capacity for tail blocks to avoid allocating the full
+        # block_tokens (usually 256) when we only need a small tail.
+        block_capacity = max(int(block_k.shape[0]), self._bucket_block_capacity(int(block_k.shape[0])))
         block_key = self._block_slot_key(key, block_idx)
         block_slot_id = self._assign_slot_id(block_key, preferred_dpu=block_physical_dpu)
         block_elem_count = self._slot_elem_count(block_capacity, group_heads, head_dim)
@@ -1335,7 +1609,9 @@ class UpmemKVSlotStore(ResidentKVStore):
             self.helper.persistent_state_active = True
             counters_applied = True
             return block
-        except Exception:
+        except Exception as exc:
+            self.last_allocate_error_stage = "blocked_allocate_block"
+            self.last_allocate_error = repr(exc)
             self._rollback_block_allocation(
                 block_key=block_key,
                 slot_id=block_slot_id,
@@ -1360,6 +1636,7 @@ class UpmemKVSlotStore(ResidentKVStore):
         allocated_blocks: list[Dict[str, object]] = []
         seq_len = int(initial_k.shape[0])
         seq_offset = 0
+        placement_order = self._placement_order(physical_dpu)
         slot_info = {
             "backend": "dpu_blocked",
             "blocks": allocated_blocks,
@@ -1370,6 +1647,7 @@ class UpmemKVSlotStore(ResidentKVStore):
             "head_dim": int(head_dim),
             "block_tokens": int(self.block_tokens),
             "base_physical_dpu": int(physical_dpu),
+            "placement_order": placement_order,
         }
         try:
             while seq_offset < seq_len:
@@ -1420,8 +1698,10 @@ class UpmemKVSlotStore(ResidentKVStore):
                     group_heads=group_heads,
                     head_dim=head_dim,
                 )
-            except Exception:
+            except Exception as exc:
                 self.dpu_allocate_failures += 1
+                self.last_allocate_error_stage = "allocate_group_blocked"
+                self.last_allocate_error = repr(exc)
                 blocked_slot_info = None
             if blocked_slot_info is not None:
                 self.slot_mapping[key] = blocked_slot_info
@@ -1442,8 +1722,10 @@ class UpmemKVSlotStore(ResidentKVStore):
                         self._encode_tensor(initial_k),
                         self._encode_tensor(initial_v),
                     )
-                except Exception:
+                except Exception as exc:
                     self.dpu_allocate_failures += 1
+                    self.last_allocate_error_stage = "allocate_group_regular"
+                    self.last_allocate_error = repr(exc)
                     if self.dpu_live_slots > 0:
                         raise
                     info = None
@@ -1492,9 +1774,9 @@ class UpmemKVSlotStore(ResidentKVStore):
         started_at = time.perf_counter()
         key = self._slot_key(k_slot, v_slot)
         slot_info = self.slot_mapping[key]
-        if slot_info["backend"] in {"dpu_segmented", "dpu_blocked"}:
+        if self._is_blocked_slot(slot_info):
             append_total = int(k_new.shape[0])
-            blocks = slot_info.get("blocks", slot_info.get("segments", []))
+            blocks = self._blocked_slot_blocks(slot_info)
             group_heads = int(slot_info["group_heads"])
             head_dim = int(slot_info["head_dim"])
             if append_total <= 0:
@@ -1518,7 +1800,6 @@ class UpmemKVSlotStore(ResidentKVStore):
                     block_v = v_new[append_offset : append_offset + take_len].contiguous()
                     staged_slot_info = dict(slot_info)
                     staged_slot_info["blocks"] = staged_blocks
-                    staged_slot_info["segments"] = staged_blocks
                     new_block = self._allocate_block_append_only(
                         key=key,
                         slot_info=staged_slot_info,
@@ -1579,15 +1860,22 @@ class UpmemKVSlotStore(ResidentKVStore):
         started_at = time.perf_counter()
         key = self._slot_key(k_slot, v_slot)
         slot_info = self.slot_mapping[key]
-        if slot_info["backend"] in {"dpu_segmented", "dpu_blocked"}:
+        if self._is_blocked_slot(slot_info):
             materialized_blocks = []
-            for block in slot_info.get("blocks", slot_info.get("segments", [])):
+            for block in self._blocked_slot_blocks(slot_info):
                 if int(block["seq_len"]) <= 0:
                     continue
                 k, v, info = self.helper.materialize_group(int(block["slot_id"]))
                 block["seq_len"] = int(info["seq_len"])
                 block["capacity"] = int(info["capacity"])
                 materialized_blocks.append((self._decode_tensor(k), self._decode_tensor(v)))
+            if not materialized_blocks:
+                empty = torch.empty(
+                    (0, int(slot_info["group_heads"]), int(slot_info["head_dim"])),
+                    dtype=torch.float32,
+                )
+                self._record_timing("materialize_group", started_at)
+                return empty, empty.clone()
             out = (
                 torch.cat([item[0] for item in materialized_blocks], dim=0).contiguous(),
                 torch.cat([item[1] for item in materialized_blocks], dim=0).contiguous(),
@@ -1608,8 +1896,8 @@ class UpmemKVSlotStore(ResidentKVStore):
     def slot_debug(self, k_slot: str, v_slot: str) -> Dict[str, object]:
         key = self._slot_key(k_slot, v_slot)
         slot_info = self.slot_mapping[key]
-        if slot_info["backend"] in {"dpu_segmented", "dpu_blocked"}:
-            blocks = slot_info.get("blocks", slot_info.get("segments", []))
+        if self._is_blocked_slot(slot_info):
+            blocks = self._blocked_slot_blocks(slot_info)
             return {
                 "backend": self.backend_name,
                 "storage": "dpu_blocked",
@@ -1668,8 +1956,8 @@ class UpmemKVSlotStore(ResidentKVStore):
         slot_info = self.slot_mapping.pop(key, None)
         if slot_info is None:
             return
-        if slot_info["backend"] in {"dpu_segmented", "dpu_blocked"}:
-            self._free_block_infos(slot_info.get("blocks", slot_info.get("segments", [])))
+        if self._is_blocked_slot(slot_info):
+            self._free_block_infos(self._blocked_slot_blocks(slot_info))
             self._record_timing("free_group", started_at)
             return
         slot_id = self._slot_id_map.pop(key, None)
@@ -1731,8 +2019,13 @@ class UpmemKVSlotStore(ResidentKVStore):
             "backend": self.backend_name,
             "num_dpus": self.num_dpus,
             "kv_dtype": self.kv_dtype,
+            "dpu_placement_policy": self.dpu_placement_policy,
+            "kvslot_dir": self.kvslot_dir,
+            "helper_binary_path": self.helper_binary_path,
             "helper_env": dict(self.helper.helper_env),
             "helper_profile": helper_profile,
+            "helper_host_profile_totals_s": dict(self.helper.host_profile_totals_s),
+            "helper_host_profile_counts": dict(self.helper.host_profile_counts),
             "helper_topology": helper_topology,
             "live_slots": len(self.slot_mapping),
             "dpu_allocations": self.dpu_allocations,
@@ -1740,6 +2033,8 @@ class UpmemKVSlotStore(ResidentKVStore):
             "dpu_allocate_failures": self.dpu_allocate_failures,
             "dpu_live_slots": self.dpu_live_slots,
             "dpu_capacity_fallbacks": self.dpu_capacity_fallbacks,
+            "last_allocate_error_stage": self.last_allocate_error_stage,
+            "last_allocate_error": self.last_allocate_error,
             "dpu_live_elems_by_dpu": list(self.dpu_live_elems_by_dpu),
             "dpu_pool_capacity_elems": self.POOL_CAPACITY_ELEMS,
             "fallback_allocations": self.fallback_allocations,
@@ -1771,12 +2066,12 @@ class UpmemKVSlotStore(ResidentKVStore):
         dpu_items: list[tuple[int, list[int], int, torch.Tensor]] = []
         dpu_refs: list[tuple[str, int]] = []
         host_fallback_queries: list[tuple[int, tuple[str, str, list[int], int, torch.Tensor]]] = []
-        segmented_outputs: Dict[int, list[torch.Tensor]] = {}
+        blocked_outputs: Dict[int, list[torch.Tensor]] = {}
 
         for idx, (k_slot, v_slot, local_head_indices, window, queries) in enumerate(slot_queries):
             key = self._slot_key(k_slot, v_slot)
             slot_info = self.slot_mapping[key]
-            if slot_info["backend"] in {"dpu_segmented", "dpu_blocked"}:
+            if self._is_blocked_slot(slot_info):
                 self.batch_item_totals["qk_slot_scores_batch_blocked_logical_items"] += 1
                 self.batch_item_totals["qk_slot_scores_batch_segmented_logical_items"] += 1
                 actual_window = min(int(window), int(slot_info["seq_len"]))
@@ -1787,7 +2082,7 @@ class UpmemKVSlotStore(ResidentKVStore):
                     dpu_items.append(
                         (int(block["slot_id"]), [int(v) for v in local_head_indices], int(take_len), queries)
                     )
-                    dpu_refs.append(("segmented", idx))
+                    dpu_refs.append(("blocked", idx))
             elif slot_info["backend"] == "dpu":
                 actual_window = min(int(window), int(slot_info["seq_len"]))
                 dpu_items.append((int(slot_info["slot_id"]), [int(v) for v in local_head_indices], actual_window, queries))
@@ -1814,9 +2109,9 @@ class UpmemKVSlotStore(ResidentKVStore):
                 if ref_kind == "regular":
                     outputs[logical_idx] = scores
                 else:
-                    segmented_outputs.setdefault(logical_idx, []).append(scores)
+                    blocked_outputs.setdefault(logical_idx, []).append(scores)
 
-        for logical_idx, score_parts in segmented_outputs.items():
+        for logical_idx, score_parts in blocked_outputs.items():
             outputs[logical_idx] = torch.cat(score_parts, dim=1).contiguous()
 
         self._record_timing("qk_slot_scores_batch_total", total_started_at)
@@ -1826,6 +2121,17 @@ class UpmemKVSlotStore(ResidentKVStore):
     def weighted_value_sum(self, k_slot: str, v_slot: str, weights: torch.Tensor) -> torch.Tensor:
         key = self._slot_key(k_slot, v_slot)
         slot_info = self.slot_mapping[key]
+        if self._is_blocked_slot(slot_info):
+            context: torch.Tensor | None = None
+            weight_offset = 0
+            for block, block_len in self._active_block_plan(slot_info):
+                block_weights = weights[:, weight_offset : weight_offset + int(block_len)].contiguous()
+                weight_offset += int(block_len)
+                block_context = self.helper.weighted_value_sum(int(block["slot_id"]), block_weights).to(torch.float32)
+                context = block_context if context is None else (context + block_context)
+            if context is None:
+                return torch.empty((weights.shape[0], int(slot_info["head_dim"])), dtype=torch.float32)
+            return context
         if slot_info["backend"] == "dpu":
             return self.helper.weighted_value_sum(int(slot_info["slot_id"]), weights)
         return self.host_fallback.weighted_value_sum(k_slot, v_slot, weights)
@@ -1839,12 +2145,12 @@ class UpmemKVSlotStore(ResidentKVStore):
         dpu_batch: list[tuple[int, torch.Tensor]] = []
         dpu_refs: list[tuple[str, int]] = []
         host_fallback_weights: list[tuple[int, tuple[str, str, torch.Tensor]]] = []
-        segmented_contexts: Dict[int, torch.Tensor] = {}
+        blocked_contexts: Dict[int, torch.Tensor] = {}
 
         for idx, (k_slot, v_slot, weights) in enumerate(slot_weights):
             key = self._slot_key(k_slot, v_slot)
             slot_info = self.slot_mapping[key]
-            if slot_info["backend"] in {"dpu_segmented", "dpu_blocked"}:
+            if self._is_blocked_slot(slot_info):
                 self.batch_item_totals["weighted_value_sum_batch_blocked_logical_items"] += 1
                 self.batch_item_totals["weighted_value_sum_batch_segmented_logical_items"] += 1
                 weight_offset = 0
@@ -1852,7 +2158,7 @@ class UpmemKVSlotStore(ResidentKVStore):
                     block_weights = weights[:, weight_offset : weight_offset + int(block_len)].contiguous()
                     weight_offset += int(block_len)
                     dpu_batch.append((int(block["slot_id"]), block_weights))
-                    dpu_refs.append(("segmented", idx))
+                    dpu_refs.append(("blocked", idx))
             elif slot_info["backend"] == "dpu":
                 dpu_batch.append((int(slot_info["slot_id"]), weights))
                 dpu_refs.append(("regular", idx))
@@ -1876,12 +2182,12 @@ class UpmemKVSlotStore(ResidentKVStore):
                 if ref_kind == "regular":
                     contexts[idx] = context
                 else:
-                    if idx not in segmented_contexts:
-                        segmented_contexts[idx] = context
+                    if idx not in blocked_contexts:
+                        blocked_contexts[idx] = context
                     else:
-                        segmented_contexts[idx] = segmented_contexts[idx] + context
+                        blocked_contexts[idx] = blocked_contexts[idx] + context
 
-        for idx, context in segmented_contexts.items():
+        for idx, context in blocked_contexts.items():
             contexts[idx] = context
 
         self._record_timing("weighted_value_sum_batch_total", total_started_at)
@@ -1899,16 +2205,16 @@ class UpmemKVSlotStore(ResidentKVStore):
         contexts: list[torch.Tensor | None] = [None for _ in slot_scores]
         dpu_batch: list[tuple[int, torch.Tensor]] = []
         dpu_indices: list[int] = []
-        segmented_scores: list[tuple[int, tuple[str, str, torch.Tensor]]] = []
+        blocked_scores: list[tuple[int, tuple[str, str, torch.Tensor]]] = []
         host_fallback_scores: list[tuple[int, tuple[str, str, torch.Tensor]]] = []
 
         for idx, (k_slot, v_slot, scores) in enumerate(slot_scores):
             key = self._slot_key(k_slot, v_slot)
             slot_info = self.slot_mapping[key]
-            if slot_info["backend"] in {"dpu_segmented", "dpu_blocked"}:
+            if self._is_blocked_slot(slot_info):
                 self.batch_item_totals["softmax_weighted_value_sum_batch_blocked_logical_items"] += 1
                 self.batch_item_totals["softmax_weighted_value_sum_batch_segmented_logical_items"] += 1
-                segmented_scores.append((idx, (k_slot, v_slot, scores)))
+                blocked_scores.append((idx, (k_slot, v_slot, scores)))
             elif slot_info["backend"] == "dpu":
                 dpu_batch.append((int(slot_info["slot_id"]), scores))
                 dpu_indices.append(idx)
@@ -1935,15 +2241,15 @@ class UpmemKVSlotStore(ResidentKVStore):
             for idx, context in zip(dpu_indices, dpu_contexts):
                 contexts[idx] = context
 
-        if segmented_scores:
-            segmented_weights = []
-            for _, (k_slot, v_slot, scores) in segmented_scores:
+        if blocked_scores:
+            blocked_weights = []
+            for _, (k_slot, v_slot, scores) in blocked_scores:
                 normalized_scores = scores.detach().cpu().to(torch.float32).contiguous()
-                segmented_weights.append(
+                blocked_weights.append(
                     (k_slot, v_slot, torch.softmax(normalized_scores, dim=-1))
                 )
-            segmented_contexts = self.weighted_value_sum_batch(segmented_weights)
-            for (idx, _), context in zip(segmented_scores, segmented_contexts):
+            blocked_contexts = self.weighted_value_sum_batch(blocked_weights)
+            for (idx, _), context in zip(blocked_scores, blocked_contexts):
                 contexts[idx] = context
 
         self._record_timing("softmax_weighted_value_sum_batch_total", total_started_at)
@@ -1961,7 +2267,7 @@ class UpmemKVSlotStore(ResidentKVStore):
         contexts: list[torch.Tensor | None] = [None for _ in slot_queries]
         dpu_batch: list[tuple[int, list[int], int, torch.Tensor, float]] = []
         dpu_indices: list[int] = []
-        segmented_queries: list[
+        blocked_queries: list[
             tuple[int, tuple[str, str, list[int], int, torch.Tensor, float]]
         ] = []
         host_fallback_queries: list[
@@ -1971,10 +2277,10 @@ class UpmemKVSlotStore(ResidentKVStore):
         for idx, (k_slot, v_slot, local_head_indices, window, queries, score_scale) in enumerate(slot_queries):
             key = self._slot_key(k_slot, v_slot)
             slot_info = self.slot_mapping[key]
-            if slot_info["backend"] in {"dpu_segmented", "dpu_blocked"}:
+            if self._is_blocked_slot(slot_info):
                 self.batch_item_totals["qk_softmax_weighted_value_sum_batch_blocked_logical_items"] += 1
                 self.batch_item_totals["qk_softmax_weighted_value_sum_batch_segmented_logical_items"] += 1
-                segmented_queries.append(
+                blocked_queries.append(
                     (
                         idx,
                         (k_slot, v_slot, [int(v) for v in local_head_indices], window, queries, float(score_scale)),
@@ -2020,22 +2326,20 @@ class UpmemKVSlotStore(ResidentKVStore):
             for idx, context in zip(dpu_indices, dpu_contexts):
                 contexts[idx] = context
 
-        if segmented_queries:
+        if blocked_queries:
             partial_batch: list[tuple[int, list[int], int, torch.Tensor, float]] = []
             partial_refs: list[tuple[int, int]] = []
             merged_contexts: Dict[int, torch.Tensor] = {}
             merged_row_max: Dict[int, torch.Tensor] = {}
             merged_row_sum: Dict[int, torch.Tensor] = {}
 
-            for logical_idx, (k_slot, v_slot, local_head_indices, window, queries, score_scale) in segmented_queries:
+            for logical_idx, (k_slot, v_slot, local_head_indices, window, queries, score_scale) in blocked_queries:
                 key = self._slot_key(k_slot, v_slot)
                 slot_info = self.slot_mapping[key]
                 actual_window = min(int(window), int(slot_info["seq_len"]))
                 if actual_window <= 0:
                     contexts[logical_idx] = torch.empty((len(local_head_indices), int(slot_info["head_dim"])), dtype=torch.float32)
                     continue
-                self.batch_item_totals["qk_softmax_weighted_value_sum_batch_blocked_logical_items"] += 1
-                self.batch_item_totals["qk_softmax_weighted_value_sum_batch_segmented_logical_items"] += 1
                 for block, take_len in self._active_block_plan(slot_info, actual_window):
                     partial_batch.append(
                         (

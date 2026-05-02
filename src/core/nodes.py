@@ -253,6 +253,17 @@ class DecodeDenseNode:
             },
         }
 
+    def start_token_batch(self, token_ids: List[int], positions: List[int]):
+        started_at = time.perf_counter()
+        hidden = self.adapter.start_token_batch([int(x) for x in token_ids], [int(x) for x in positions])
+        finished_at = time.perf_counter()
+        return {
+            "hidden": hidden,
+            "profile": {
+                "compute_s": float(finished_at - started_at),
+            },
+        }
+
     def prepare_attention(self, hidden_state, layer_idx: int, request_id: str, context_len: int):
         started_at = time.perf_counter()
         prepared = self.adapter.prepare_attention(hidden_state, layer_idx, request_id, context_len)
@@ -270,9 +281,43 @@ class DecodeDenseNode:
             },
         }
 
+    def prepare_attention_batch(self, hidden_state, layer_idx: int, request_ids: List[str], context_lens: List[int]):
+        started_at = time.perf_counter()
+        prepared = self.adapter.prepare_attention_batch(
+            hidden_state,
+            int(layer_idx),
+            [str(x) for x in request_ids],
+            [int(x) for x in context_lens],
+        )
+        finished_at = time.perf_counter()
+        return {
+            "request_ids": [str(x) for x in request_ids],
+            "layer_idx": int(layer_idx),
+            "residual": prepared["residual"],
+            "query": prepared["query"],
+            "key": prepared["key"],
+            "value": prepared["value"],
+            "score_scale": float(prepared.get("score_scale", 1.0)),
+            "profile": {
+                "compute_s": float(finished_at - started_at),
+                "batch_size": int(len(request_ids)),
+            },
+        }
+
     def finish_layer(self, residual, attention_context, layer_idx: int):
         started_at = time.perf_counter()
         hidden = self.adapter.finish_layer(residual, attention_context, layer_idx)
+        finished_at = time.perf_counter()
+        return {
+            "hidden": hidden,
+            "profile": {
+                "compute_s": float(finished_at - started_at),
+            },
+        }
+
+    def finish_layer_batch(self, residual, attention_context, layer_idx: int):
+        started_at = time.perf_counter()
+        hidden = self.adapter.finish_layer_batch(residual, attention_context, int(layer_idx))
         finished_at = time.perf_counter()
         return {
             "hidden": hidden,
@@ -287,6 +332,17 @@ class DecodeDenseNode:
         finished_at = time.perf_counter()
         return {
             "token_id": token_id,
+            "profile": {
+                "compute_s": float(finished_at - started_at),
+            },
+        }
+
+    def sample_next_token_batch(self, hidden_state):
+        started_at = time.perf_counter()
+        token_ids = self.adapter.sample_next_token_batch(hidden_state)
+        finished_at = time.perf_counter()
+        return {
+            "token_ids": [int(x) for x in token_ids],
             "profile": {
                 "compute_s": float(finished_at - started_at),
             },

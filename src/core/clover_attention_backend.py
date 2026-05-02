@@ -31,8 +31,17 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         host_qk_mixed_enabled: bool = False,
         pim_attention_enabled: bool = False,
         pim_context_fused_experimental_enabled: bool = False,
+        pim_rank_spread_alloc_experimental_enabled: bool = False,
+        fine_head_grouping_experimental_enabled: bool = False,
+        target_heads_per_group_experimental: int = 0,
         **kwargs,
     ):
+        # These Clover-only knobs are plumbed from the scheduler but are not
+        # consumed by the current backend yet. Pop them so the base class
+        # constructor doesn't error on unexpected kwargs.
+        _ = bool(pim_rank_spread_alloc_experimental_enabled)
+        _ = bool(fine_head_grouping_experimental_enabled)
+        _ = int(target_heads_per_group_experimental)
         super().__init__(*args, **kwargs)
         self.cpu_shadow_enabled = bool(cpu_shadow_enabled)
         self.shadow_checks_enabled = bool(shadow_checks_enabled)

@@ -166,6 +166,10 @@ class PimNaiveAttentionBackend:
         head_grouping_policy: str = "balanced",
         dpu_placement_policy: str = "rotated",
         resident_kv_dtype: str = "fp32",
+        tail_capacity_buckets: list[int] | None = None,
+        best_round_seed_enabled: bool = False,
+        shape_rounds_enabled: bool = False,
+        context_fused_enabled: bool = False,
         qk_check_interval: int = 1,
         qk_check_limit: int = 1,
         qk_full_enabled: bool = False,
@@ -185,6 +189,9 @@ class PimNaiveAttentionBackend:
         self.head_grouping_policy = str(head_grouping_policy)
         self.dpu_placement_policy = str(dpu_placement_policy)
         self.resident_kv_dtype = str(resident_kv_dtype)
+        self.best_round_seed_enabled = bool(best_round_seed_enabled)
+        self.shape_rounds_enabled = bool(shape_rounds_enabled)
+        self.context_fused_enabled = bool(context_fused_enabled)
         self.qk_check_interval = qk_check_interval
         self.qk_check_limit = qk_check_limit
         if self.head_grouping_policy not in {"legacy", "balanced", "coarse", "segment_aware"}:
@@ -235,6 +242,14 @@ class PimNaiveAttentionBackend:
                 self.num_dpus,
                 kv_dtype=self.resident_kv_dtype,
                 block_tokens=self.block_tokens,
+                tail_capacity_buckets=tail_capacity_buckets,
+                dpu_placement_policy=self.dpu_placement_policy,
+            )
+            self.resident_store.set_experimental_flags(
+                context_fused_enabled=self.context_fused_enabled,
+                shape_rounds_enabled=self.shape_rounds_enabled,
+                best_round_seed_enabled=self.best_round_seed_enabled,
+                rank_spread_alloc_enabled=(self.dpu_placement_policy == "rank_spread"),
             )
         elif resident_store_backend == "host":
             self.resident_store = HostResidentKVStore()
