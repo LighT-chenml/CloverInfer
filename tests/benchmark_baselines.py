@@ -325,7 +325,7 @@ def main():
     parser.add_argument(
         "--pim-head-grouping-policy",
         default="balanced",
-        choices=["legacy", "balanced", "coarse", "segment_aware"],
+        choices=["legacy", "balanced", "coarse", "segment_aware", "universal"],
     )
     parser.add_argument(
         "--pim-dpu-placement-policy",

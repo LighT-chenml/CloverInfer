@@ -194,7 +194,7 @@ class PimNaiveAttentionBackend:
         self.context_fused_enabled = bool(context_fused_enabled)
         self.qk_check_interval = qk_check_interval
         self.qk_check_limit = qk_check_limit
-        if self.head_grouping_policy not in {"legacy", "balanced", "coarse", "segment_aware"}:
+        if self.head_grouping_policy not in {"legacy", "balanced", "coarse", "segment_aware", "universal"}:
             raise ValueError(f"Unsupported head_grouping_policy: {self.head_grouping_policy}")
         if self.dpu_placement_policy not in {"identity", "rotated", "rank_spread"}:
             raise ValueError(f"Unsupported dpu_placement_policy: {self.dpu_placement_policy}")
@@ -338,6 +338,30 @@ class PimNaiveAttentionBackend:
             target_heads_per_group = 4 if int(seq_len) >= 192 else 2
             min_groups_by_shape = max(1, math.ceil(int(num_heads) / target_heads_per_group))
             return max(1, min(max_groups, min_groups_by_shape))
+
+        if self.head_grouping_policy == "universal":
+            # A "works everywhere" policy meant to be stable across OPT/Qwen/Llama-ish
+            # model shapes. Keep groups wide for short contexts (to reduce helper/RPC
+            # overhead), then gradually split as per-head work increases.
+            max_heads_per_group = 32
+            min_groups_by_shape = max(1, math.ceil(int(num_heads) / max_heads_per_group))
+
+            per_head_live_elems = max(1, int(seq_len) * int(head_dim))
+            # Heuristic tiers (in element count) rather than model-specific constants.
+            if per_head_live_elems <= 4_096:
+                target_heads_per_group = 16
+            elif per_head_live_elems <= 16_384:
+                target_heads_per_group = 8
+            elif per_head_live_elems <= 65_536:
+                target_heads_per_group = 4
+            else:
+                target_heads_per_group = 2
+            target_heads_per_group = max(1, min(int(target_heads_per_group), max_heads_per_group))
+            target_groups_by_heads = max(1, math.ceil(int(num_heads) / target_heads_per_group))
+
+            # Don't over-split beyond the available DPUs; also avoid creating more groups
+            # than needed for shape constraints.
+            return max(1, min(max_groups, max(min_groups_by_shape, target_groups_by_heads)))
 
         # Small decode workloads regress when we spread a layer across too many
         # tiny resident groups. Keep more heads together until each group has a

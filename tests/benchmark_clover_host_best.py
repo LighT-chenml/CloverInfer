@@ -482,7 +482,7 @@ def main():
     parser.add_argument(
         "--pim-head-grouping-policy",
         default="balanced",
-        choices=["legacy", "balanced", "coarse", "segment_aware"],
+        choices=["legacy", "balanced", "coarse", "segment_aware", "universal"],
     )
     parser.add_argument("--pim-qk-mixed-heads", type=int, default=2)
     parser.add_argument("--pim-qk-mixed-window", type=int, default=128)

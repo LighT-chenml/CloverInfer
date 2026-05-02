@@ -78,6 +78,9 @@ class CausalModelAdapter:
         self.model_config = self.model.config
         self.hidden_size = int(self.model.config.hidden_size)
         self.num_heads = int(self.model.config.num_attention_heads)
+        # GQA/MQA models (e.g. newer Qwen/Llama variants) may expose a smaller
+        # KV head count. If absent, default to standard MHA behavior.
+        self.num_kv_heads = int(getattr(self.model.config, "num_key_value_heads", self.num_heads) or self.num_heads)
         self.num_layers = int(self.model.config.num_hidden_layers)
         self.vocab_size = int(self.model.config.vocab_size)
         self.head_dim = self.hidden_size // self.num_heads
@@ -90,6 +93,15 @@ class CausalModelAdapter:
             self.layers = self.backbone.h
             self.head_dim = int(self.model.config.kv_channels)
             self.qwen_module = importlib.import_module(type(self.model).__module__)
+        elif self.model_type == "llama":
+            # LlamaForCausalLM: model.model is the decoder backbone.
+            backbone = getattr(self.model, "model", None)
+            if backbone is None:
+                raise ValueError("Unsupported Llama model wrapper: missing `.model` attribute")
+            self.backbone = backbone
+            self.layers = getattr(self.backbone, "layers", None)
+            if self.layers is None:
+                raise ValueError("Unsupported Llama backbone: missing `.layers` attribute")
         else:
             raise ValueError(f"Unsupported model type for now: {self.model_type}")
 
@@ -136,9 +148,12 @@ class CausalModelAdapter:
 
     def get_model_spec(self) -> Dict[str, int]:
         return {
+            "model_type": str(self.model_type),
             "num_layers": self.num_layers,
             "hidden_size": self.hidden_size,
             "num_heads": self.num_heads,
+            "num_kv_heads": self.num_kv_heads,
+            "head_dim": int(self.head_dim),
             "vocab_size": self.vocab_size,
         }
 
@@ -192,6 +207,20 @@ class CausalModelAdapter:
             return key[0].permute(1, 0, 2).contiguous().cpu()
         if self.model_type == "qwen":
             return key[0].contiguous().cpu()
+        if self.model_type == "llama":
+            # Llama caches can appear as either:
+            # - [B, heads, T, D] (common)
+            # - [B, T, heads, D] (some implementations)
+            # Normalize to [T, heads, D] on CPU.
+            t = key.detach()
+            if t.dim() == 4:
+                t = t[0]
+            if t.dim() != 3:
+                raise ValueError(f"Unsupported Llama key cache shape: {tuple(t.shape)}")
+            # If the first dim looks like heads, transpose to [T, heads, D].
+            if int(t.shape[0]) in {int(self.num_heads), int(self.num_kv_heads)}:
+                return t.permute(1, 0, 2).contiguous().cpu()
+            return t.contiguous().cpu()
         raise ValueError(f"Unsupported model type for cache normalization: {self.model_type}")
 
     def _normalize_value_cache(self, value: torch.Tensor) -> torch.Tensor:
@@ -199,6 +228,15 @@ class CausalModelAdapter:
             return value[0].permute(1, 0, 2).contiguous().cpu()
         if self.model_type == "qwen":
             return value[0].contiguous().cpu()
+        if self.model_type == "llama":
+            t = value.detach()
+            if t.dim() == 4:
+                t = t[0]
+            if t.dim() != 3:
+                raise ValueError(f"Unsupported Llama value cache shape: {tuple(t.shape)}")
+            if int(t.shape[0]) in {int(self.num_heads), int(self.num_kv_heads)}:
+                return t.permute(1, 0, 2).contiguous().cpu()
+            return t.contiguous().cpu()
         raise ValueError(f"Unsupported model type for cache normalization: {self.model_type}")
 
     def _denormalize_past_key_values(self, initial_kv: List[Dict[str, torch.Tensor]]):
@@ -212,6 +250,21 @@ class CausalModelAdapter:
             elif self.model_type == "qwen":
                 key = key.unsqueeze(0).contiguous()
                 value = value.unsqueeze(0).contiguous()
+            elif self.model_type == "llama":
+                # Transformers v5 prefers a Cache instance. Build a DynamicCache
+                # from the layer tensors (expected per-layer shape [B, heads, T, D]).
+                # Here `key/value` are [T, heads, D], so convert accordingly.
+                from transformers.cache_utils import DynamicCache
+
+                ddp_cache_data = []
+                for item in initial_kv:
+                    k = item["key"].to(self.device)
+                    v = item["value"].to(self.device)
+                    # [T, heads, D] -> [B, heads, T, D]
+                    k = k.permute(1, 0, 2).unsqueeze(0).contiguous()
+                    v = v.permute(1, 0, 2).unsqueeze(0).contiguous()
+                    ddp_cache_data.append((k, v))
+                return DynamicCache(ddp_cache_data=ddp_cache_data, config=self.model.config)
             else:
                 raise ValueError(f"Unsupported model type for cache restore: {self.model_type}")
             past_key_values.append((key, value))
@@ -229,6 +282,11 @@ class CausalModelAdapter:
         if self.model_type == "qwen":
             hidden = self.backbone.wte(input_ids)
             hidden = self.backbone.drop(hidden)
+            return hidden.detach().cpu()
+
+        if self.model_type == "llama":
+            # Llama uses RoPE inside attention; no explicit position embedding here.
+            hidden = self.backbone.embed_tokens(input_ids)
             return hidden.detach().cpu()
 
         raise ValueError(f"Unsupported model type for start_token: {self.model_type}")
@@ -253,6 +311,10 @@ class CausalModelAdapter:
             hidden = self.backbone.drop(hidden)
             return hidden.detach().cpu()
 
+        if self.model_type == "llama":
+            hidden = self.backbone.embed_tokens(input_ids)
+            return hidden.detach().cpu()
+
         raise ValueError(f"Unsupported model type for start_token_batch: {self.model_type}")
 
     def prepare_attention(
@@ -269,6 +331,8 @@ class CausalModelAdapter:
             return self._prepare_opt_attention(hidden, layer_idx)
         if self.model_type == "qwen":
             return self._prepare_qwen_attention(hidden, layer_idx, context_len)
+        if self.model_type == "llama":
+            return self._prepare_llama_attention(hidden, layer_idx, context_len)
         raise ValueError(f"Unsupported model type for prepare_attention: {self.model_type}")
 
     def prepare_attention_batch(
@@ -290,6 +354,8 @@ class CausalModelAdapter:
             return self._prepare_opt_attention_batch(hidden, layer_idx)
         if self.model_type == "qwen":
             return self._prepare_qwen_attention_batch(hidden, layer_idx, context_lens)
+        if self.model_type == "llama":
+            return self._prepare_llama_attention_batch(hidden, layer_idx, context_lens)
         raise ValueError(f"Unsupported model type for prepare_attention_batch: {self.model_type}")
 
     def _prepare_opt_attention(self, hidden: torch.Tensor, layer_idx: int) -> Dict[str, object]:
@@ -409,6 +475,68 @@ class CausalModelAdapter:
         rotary_pos_emb = self.backbone.rotary_emb(context_len, ntk_alpha=ntk_alpha)
         return [value[:, -1:, :, :] for value in rotary_pos_emb]
 
+    def _prepare_llama_attention(self, hidden: torch.Tensor, layer_idx: int, context_len: int) -> Dict[str, object]:
+        # Mirrors LlamaDecoderLayer/LlamaAttention qkv + RoPE, but leaves the
+        # actual attention (QK/softmax/AV) to the disaggregated attention node.
+        from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
+
+        layer = self.layers[layer_idx]
+        residual = hidden
+        hidden = layer.input_layernorm(hidden)
+
+        attn = layer.self_attn
+        batch, seq_len, _ = hidden.shape
+        if batch != 1 or seq_len != 1:
+            raise ValueError("The first refactor supports batch=1, seq_len=1 decode only")
+
+        # Position id for the *new* token is the current cache length.
+        position_ids = torch.tensor([[int(context_len)]], dtype=torch.long, device=self.device)
+        cos, sin = self.backbone.rotary_emb(hidden, position_ids=position_ids)
+
+        input_shape = hidden.shape[:-1]
+        hidden_shape = (*input_shape, -1, int(attn.head_dim))
+        query = attn.q_proj(hidden).view(hidden_shape).transpose(1, 2)  # [B, q_heads, 1, D]
+        key = attn.k_proj(hidden).view(hidden_shape).transpose(1, 2)    # [B, kv_heads, 1, D]
+        value = attn.v_proj(hidden).view(hidden_shape).transpose(1, 2)  # [B, kv_heads, 1, D]
+
+        query, key = apply_rotary_pos_emb(query, key, cos, sin)
+
+        # Expand KV heads to attention heads if the model uses GQA/MQA so that
+        # the downstream attention backend can stay in the "heads match" regime.
+        key = repeat_kv(key, int(attn.num_key_value_groups))
+        value = repeat_kv(value, int(attn.num_key_value_groups))
+
+        return {
+            "residual": residual.detach().cpu(),
+            "query": query[:, :, -1, :].squeeze(0).detach().cpu(),
+            "key": key[:, :, -1, :].squeeze(0).detach().cpu(),
+            "value": value[:, :, -1, :].squeeze(0).detach().cpu(),
+            "score_scale": float(attn.scaling),
+        }
+
+    def _prepare_llama_attention_batch(self, hidden: torch.Tensor, layer_idx: int, context_lens: list[int]) -> Dict[str, object]:
+        # Keep it simple and robust: per-sample RoPE depends on position, so loop.
+        batch = int(hidden.shape[0])
+        residuals: list[torch.Tensor] = []
+        queries: list[torch.Tensor] = []
+        keys: list[torch.Tensor] = []
+        values: list[torch.Tensor] = []
+        score_scale = 1.0 / math.sqrt(self.head_dim)
+        for i in range(batch):
+            prepared = self._prepare_llama_attention(hidden[i : i + 1], layer_idx, int(context_lens[i]))
+            residuals.append(prepared["residual"])
+            queries.append(prepared["query"])
+            keys.append(prepared["key"])
+            values.append(prepared["value"])
+            score_scale = float(prepared.get("score_scale", score_scale))
+        return {
+            "residual": torch.cat(residuals, dim=0),
+            "query": torch.stack(queries, dim=0),
+            "key": torch.stack(keys, dim=0),
+            "value": torch.stack(values, dim=0),
+            "score_scale": float(score_scale),
+        }
+
     def finish_layer(self, residual: torch.Tensor, attention_context: torch.Tensor, layer_idx: int) -> torch.Tensor:
         residual = residual.to(self.device)
         context = attention_context.to(self.device)
@@ -420,6 +548,8 @@ class CausalModelAdapter:
             return self._finish_opt_layer(residual, attn_output, layer_idx)
         if self.model_type == "qwen":
             return self._finish_qwen_layer(residual, attn_output, layer_idx)
+        if self.model_type == "llama":
+            return self._finish_llama_layer(residual, attn_output, layer_idx)
         raise ValueError(f"Unsupported model type for finish_layer: {self.model_type}")
 
     def finish_layer_batch(
@@ -444,6 +574,8 @@ class CausalModelAdapter:
             return self._finish_opt_layer(residual_dev, attn_output, layer_idx)
         if self.model_type == "qwen":
             return self._finish_qwen_layer(residual_dev, attn_output, layer_idx)
+        if self.model_type == "llama":
+            return self._finish_llama_layer(residual_dev, attn_output, layer_idx)
         raise ValueError(f"Unsupported model type for finish_layer_batch: {self.model_type}")
 
     def _finish_opt_layer(self, residual: torch.Tensor, attn_output: torch.Tensor, layer_idx: int) -> torch.Tensor:
@@ -480,6 +612,16 @@ class CausalModelAdapter:
         hidden = layernorm_input + layer.mlp(layernorm_output)
         return hidden.detach().cpu()
 
+    def _finish_llama_layer(self, residual: torch.Tensor, attn_output: torch.Tensor, layer_idx: int) -> torch.Tensor:
+        layer = self.layers[layer_idx]
+        attn_out = layer.self_attn.o_proj(attn_output)
+        hidden = residual + attn_out
+        residual_ffn = hidden
+        hidden = layer.post_attention_layernorm(hidden)
+        hidden = layer.mlp(hidden)
+        hidden = residual_ffn + hidden
+        return hidden.detach().cpu()
+
     def sample_next_token(self, hidden_state: torch.Tensor) -> int:
         hidden = hidden_state.to(self.device)
         if self.model_type == "opt":
@@ -488,6 +630,8 @@ class CausalModelAdapter:
                 hidden = final_norm(hidden)
         elif self.model_type == "qwen":
             hidden = self.backbone.ln_f(hidden)
+        elif self.model_type == "llama":
+            hidden = self.backbone.norm(hidden)
         else:
             raise ValueError(f"Unsupported model type for sample_next_token: {self.model_type}")
 
@@ -504,6 +648,8 @@ class CausalModelAdapter:
                 hidden = final_norm(hidden)
         elif self.model_type == "qwen":
             hidden = self.backbone.ln_f(hidden)
+        elif self.model_type == "llama":
+            hidden = self.backbone.norm(hidden)
         else:
             raise ValueError(f"Unsupported model type for sample_next_token_batch: {self.model_type}")
 

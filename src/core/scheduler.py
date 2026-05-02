@@ -57,9 +57,12 @@ class GlobalScheduler:
         self.attention_nodes = []
         self.decode_dense_nodes = []
         self.runtime_model_spec = {
+            "model_type": "unknown",
             "num_layers": int(model_config.num_layers),
             "hidden_size": int(model_config.hidden_size),
             "num_heads": int(model_config.num_heads),
+            "num_kv_heads": int(model_config.num_heads),
+            "head_dim": int(model_config.hidden_size) // max(int(model_config.num_heads), 1),
             "vocab_size": 0,
         }
         self.decode_step_sync_window_s = max(0.0, float(cluster_config.decode_step_sync_window_s))

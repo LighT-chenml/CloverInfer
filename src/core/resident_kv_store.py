@@ -1155,6 +1155,13 @@ class UpmemKVSlotStore(ResidentKVStore):
             "qk_softmax_weighted_value_sum_batch_dpu_items": 0,
             "qk_softmax_weighted_value_sum_batch_host_fallback_items": 0,
         }
+        # Optional safety valve: cap the maximum per-group capacity used when allocating
+        # resident KV on DPUs. Large capacities blow up per-DPU MRAM usage quickly under
+        # long-context, multi-request decode. This is a knob for experiments; it does not
+        # change correctness, only increases the chance that groups become "blocked"/segmented.
+        self.max_group_capacity_tokens = int(
+            os.environ.get("CLOVER_KVSLOT_MAX_GROUP_CAPACITY_TOKENS", "0").strip() or "0"
+        )
 
     def _kvslot_dir_candidates(self, repo_root: str) -> list[str]:
         candidates = [os.path.join(repo_root, "src", "pim", "upmem_kvslot")]
@@ -1685,6 +1692,8 @@ class UpmemKVSlotStore(ResidentKVStore):
         started_at = time.perf_counter()
         key = self._slot_key(k_slot, v_slot)
         seq_len, group_heads, head_dim = (int(dim) for dim in initial_k.shape)
+        if self.max_group_capacity_tokens > 0:
+            capacity = min(int(capacity), int(self.max_group_capacity_tokens))
         physical_dpu = self._normalize_preferred_dpu(preferred_dpu) if self.num_dpus > 0 else 0
         elem_count = self._slot_elem_count(capacity, group_heads, head_dim)
         if not force_host_fallback and self._supports_dpu_shape(group_heads, head_dim):
