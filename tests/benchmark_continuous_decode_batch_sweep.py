@@ -54,8 +54,22 @@ def build_ray_runtime_env(*, force_rebuild_kvslot_helper: bool = False) -> Dict[
         "PYTHONPATH": REPO_ROOT,
         "CLOVER_SHARED_REPO_ROOT": REPO_ROOT,
     }
+    # Note: we intentionally do not set CLOVER_KVSLOT_MAX_GROUP_CAPACITY_TOKENS
+    # globally here. Capacity-capping is model/workload dependent and should be
+    # controlled explicitly by the caller to keep baselines comparable.
     if force_rebuild_kvslot_helper:
         env_vars["CLOVER_FORCE_REBUILD_KVSLOT"] = "1"
+    # Allow callers to override kvslot-related policies via the driver env.
+    # This keeps the sweep script generic while still letting experiments opt-in
+    # to escape hatches (e.g., host fallback when blocked groups overflow).
+    passthrough_keys = [
+        "CLOVER_KVSLOT_MAX_GROUP_CAPACITY_TOKENS",
+        "CLOVER_KVSLOT_BLOCKED_OVERFLOW_POLICY",
+    ]
+    for key in passthrough_keys:
+        value = os.environ.get(key)
+        if value is not None and str(value).strip() != "":
+            env_vars[key] = str(value)
     return {
         "working_dir": REPO_ROOT,
         "excludes": excludes,
@@ -121,6 +135,7 @@ def make_cluster_config(args, decode_max_batch_size: int) -> ClusterConfig:
         attention_rpc_cross_key_batch_enabled=True,
         attention_rpc_batch_window_s=float(args.attention_rpc_batch_window_s),
         attention_rpc_batch_max_size=int(args.attention_rpc_batch_max_size),
+        attention_wavefront_cohort_policy=str(getattr(args, "attention_wavefront_cohort_policy", "batch")),
         attention_actor_side_batching_enabled=False,
     )
 
@@ -160,6 +175,7 @@ def summarize_case(records: List[Dict[str, object]]) -> Dict[str, object]:
     fallback_allocations = int(last_store_debug.get("fallback_allocations", 0) or 0)
     dpu_capacity_fallbacks = int(last_store_debug.get("dpu_capacity_fallbacks", 0) or 0)
     engine_last_attention_batch_size = int(last_engine_stats.get("engine_last_attention_batch_size", 0) or 0)
+    engine_avg_attention_batch_size = float(last_engine_stats.get("engine_attention_batch_avg_size", 0.0) or 0.0)
 
     return {
         "num_requests": int(len(records)),
@@ -174,6 +190,7 @@ def summarize_case(records: List[Dict[str, object]]) -> Dict[str, object]:
         if per_token_attention_rpc
         else 0.0,
         "last_engine_last_attention_batch_size": int(engine_last_attention_batch_size),
+        "last_engine_avg_attention_batch_size": float(engine_avg_attention_batch_size),
         "last_store_dpu_allocate_failures": int(dpu_allocate_failures),
         "last_store_dpu_capacity_fallbacks": int(dpu_capacity_fallbacks),
         "last_store_fallback_allocations": int(fallback_allocations),
@@ -276,6 +293,13 @@ def main():
     parser.add_argument("--pim-resident-kv-dtype", default="fp16")
     parser.add_argument("--attention-rpc-batch-window-s", type=float, default=0.001)
     parser.add_argument("--attention-rpc-batch-max-size", type=int, default=8)
+    parser.add_argument(
+        "--attention-wavefront-cohort-policy",
+        default="batch",
+        choices=["batch", "step"],
+        help="Forwarded to ClusterConfig.attention_wavefront_cohort_policy. "
+        "Use 'step' to batch attention by (decode_step, layer) across cohorts.",
+    )
     parser.add_argument("--clover-cpu-shadow-enabled", action="store_true")
     parser.add_argument("--no-clover-cpu-shadow-enabled", action="store_true")
     parser.add_argument("--clover-shadow-checks-enabled", action="store_true")
@@ -325,7 +349,9 @@ def main():
 
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
+    # Qwen models often rely on custom tokenizer code. Since we're running from a
+    # local, pinned model snapshot for experiments, allow local custom code.
+    tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True, trust_remote_code=True)
     prompt, actual_tokens = build_prompt_for_target_tokens(tokenizer, int(args.prompt_token_length))
     args.prompt_token_length = int(actual_tokens)
 

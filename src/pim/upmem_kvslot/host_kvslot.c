@@ -14,7 +14,10 @@
 #define DPU_BINARY "./build/dpu_kvslot"
 #endif
 
-#define KVSLOT_QK_MAX_ACTIVE_DPUS 16U
+// Maximum DPUs/ranks used in a single batched kernel invocation. 16 was an
+// early conservative default; for larger DPU counts (e.g. 32+) we want to allow
+// wider parallelism during QK/AV batches.
+#define KVSLOT_QK_MAX_ACTIVE_DPUS 64U
 
 typedef struct {
     uint32_t capacity;

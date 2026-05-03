@@ -119,6 +119,8 @@ class _KVSlotHelperClient:
         self.cwd = cwd
         self.kv_dtype = str(kv_dtype)
         self.proc: subprocess.Popen | None = None
+        self.stderr_path: str | None = None
+        self._stderr_fh = None
         self.restarts = 0
         self.persistent_state_active = False
         self.helper_env: Dict[str, str] = {}
@@ -132,6 +134,45 @@ class _KVSlotHelperClient:
             "materialize_group_read": 0.0,
         }
         self.host_profile_counts: Dict[str, int] = {key: 0 for key in self.host_profile_totals_s}
+
+    def _stderr_log_dir(self) -> str:
+        # Prefer the helper cwd so logs are co-located with the binary and are
+        # naturally accessible from Ray runtime_resources paths.
+        override = os.environ.get("CLOVER_KVSLOT_HELPER_LOG_DIR", "").strip()
+        if override:
+            return os.path.abspath(override)
+        return os.path.abspath(self.cwd)
+
+    def _ensure_stderr_logfile(self) -> None:
+        if self.stderr_path is not None and self._stderr_fh is not None:
+            return
+        log_dir = self._stderr_log_dir()
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+        except Exception:
+            # Best effort; fall back to cwd.
+            log_dir = os.path.abspath(self.cwd)
+        stamp = int(time.time() * 1000)
+        self.stderr_path = os.path.join(log_dir, f"kvslot_helper_{os.getpid()}_{stamp}.err")
+        # Unbuffered binary append.
+        self._stderr_fh = open(self.stderr_path, "ab", buffering=0)
+
+    def _read_stderr_tail(self, max_bytes: int = 8192) -> str:
+        path = self.stderr_path
+        if not path:
+            return ""
+        try:
+            size = os.path.getsize(path)
+        except Exception:
+            return ""
+        try:
+            with open(path, "rb") as fh:
+                if size > max(0, int(max_bytes)):
+                    fh.seek(size - int(max_bytes))
+                data = fh.read()
+            return data.decode("utf-8", errors="replace")
+        except Exception:
+            return ""
 
     def set_env_flag(self, name: str, enabled: bool) -> None:
         value = "1" if enabled else "0"
@@ -149,27 +190,23 @@ class _KVSlotHelperClient:
         if self.proc is not None and self.proc.poll() is None:
             return self.proc
         if self.proc is not None and self.proc.poll() is not None:
-            stderr_text = ""
-            if self.proc.stderr is not None:
-                try:
-                    stderr_text = self.proc.stderr.read().decode("utf-8", errors="replace")
-                except Exception:
-                    stderr_text = ""
+            stderr_text = self._read_stderr_tail()
             if self.persistent_state_active:
                 # In long-running experiments the helper can crash (e.g. transient
                 # driver issues). Raise, but include a hint to help debugging.
                 raise RuntimeError(
                     "kvslot helper exited while persistent DPU state was active: "
-                    f"{stderr_text.strip()}"
+                    f"{stderr_text.strip()} (stderr_log={self.stderr_path})"
                 )
         env = os.environ.copy()
         env.update(self.helper_env)
+        self._ensure_stderr_logfile()
         self.proc = subprocess.Popen(
             [self.binary_path, "--stdio", "--num-dpus", str(self.num_dpus)],
             cwd=self.cwd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=self._stderr_fh,
             env=env,
         )
         self.restarts += 1
@@ -191,6 +228,12 @@ class _KVSlotHelperClient:
                 proc.kill()
             except Exception:
                 pass
+        try:
+            if self._stderr_fh is not None:
+                self._stderr_fh.close()
+        except Exception:
+            pass
+        self._stderr_fh = None
 
     def _dtype_code(self) -> int:
         return 1 if self.kv_dtype == "fp16" else 0
@@ -216,13 +259,10 @@ class _KVSlotHelperClient:
         assert proc.stdout is not None
         data = proc.stdout.read(n)
         if data is None or len(data) != n:
-            stderr_text = ""
-            if proc.stderr is not None:
-                try:
-                    stderr_text = proc.stderr.read().decode("utf-8", errors="replace")
-                except Exception:
-                    stderr_text = ""
-            raise RuntimeError(f"kvslot helper returned incomplete output: {stderr_text.strip()}")
+            stderr_text = self._read_stderr_tail()
+            raise RuntimeError(
+                f"kvslot helper returned incomplete output: {stderr_text.strip()} (stderr_log={self.stderr_path})"
+            )
         return data
 
     def allocate_group(self, slot_id: int, capacity: int, initial_k: torch.Tensor, initial_v: torch.Tensor) -> Dict[str, int]:
@@ -1162,6 +1202,64 @@ class UpmemKVSlotStore(ResidentKVStore):
         self.max_group_capacity_tokens = int(
             os.environ.get("CLOVER_KVSLOT_MAX_GROUP_CAPACITY_TOKENS", "0").strip() or "0"
         )
+        # What to do when a blocked/segmented DPU KV group runs out of per-DPU pool capacity.
+        # - "error": raise immediately (default, preserves strict behavior)
+        # - "host_fallback": materialize the whole group to host storage, free DPU blocks,
+        #   then continue appending on host.
+        self.blocked_overflow_policy = (
+            os.environ.get("CLOVER_KVSLOT_BLOCKED_OVERFLOW_POLICY", "error").strip().lower() or "error"
+        )
+        if self.blocked_overflow_policy not in {"error", "host_fallback"}:
+            self.blocked_overflow_policy = "error"
+
+    def _migrate_blocked_group_to_host(
+        self,
+        *,
+        key: tuple[str, str],
+        slot_info: Dict[str, object],
+    ) -> None:
+        """Convert a blocked DPU group into a host-backed KV group.
+
+        This is a safety valve for large-model/long-context experiments where per-DPU
+        MRAM capacity may be exceeded. We prioritize forward progress over keeping the
+        group resident on DPUs.
+        """
+        k_slot, v_slot = key
+        seq_len = int(slot_info.get("seq_len", 0))
+        capacity = int(slot_info.get("capacity", max(seq_len, 1)))
+        group_heads = int(slot_info.get("group_heads", 0))
+        head_dim = int(slot_info.get("head_dim", 0))
+
+        # Materialize current contents from DPU blocks (may be empty if seq_len=0).
+        if seq_len > 0:
+            k_cur, v_cur = self.materialize_group(k_slot, v_slot)
+        else:
+            k_cur = torch.empty((0, group_heads, head_dim), dtype=torch.float32)
+            v_cur = torch.empty((0, group_heads, head_dim), dtype=torch.float32)
+
+        # Free DPU blocks and swap mapping to host fallback.
+        try:
+            self._free_block_infos(self._blocked_slot_blocks(slot_info))
+        except Exception:
+            # Best-effort cleanup; continue even if helper free fails.
+            pass
+
+        # Host store keeps float32 today; keep correctness and avoid dtype mismatches.
+        self.host_fallback.allocate_group(
+            k_slot,
+            v_slot,
+            k_cur.contiguous(),
+            v_cur.contiguous(),
+            capacity=capacity,
+            preferred_dpu=None,
+        )
+        self.slot_mapping[key] = {
+            "backend": "host_fallback",
+            "slot_id": self._assign_slot_id(key, preferred_dpu=None),
+            "physical_dpu": int(slot_info.get("base_physical_dpu", 0)),
+            "elem_count": 0,
+            "migrated_from": "dpu_blocked",
+        }
 
     def _kvslot_dir_candidates(self, repo_root: str) -> list[str]:
         candidates = [os.path.join(repo_root, "src", "pim", "upmem_kvslot")]
@@ -1692,8 +1790,13 @@ class UpmemKVSlotStore(ResidentKVStore):
         started_at = time.perf_counter()
         key = self._slot_key(k_slot, v_slot)
         seq_len, group_heads, head_dim = (int(dim) for dim in initial_k.shape)
+        capacity = int(capacity)
         if self.max_group_capacity_tokens > 0:
-            capacity = min(int(capacity), int(self.max_group_capacity_tokens))
+            # Safety: the knob is allowed to reduce over-allocation, but it must not
+            # break correctness. We always need capacity >= current seq_len.
+            capacity = min(capacity, int(self.max_group_capacity_tokens))
+        if capacity < seq_len:
+            capacity = seq_len
         physical_dpu = self._normalize_preferred_dpu(preferred_dpu) if self.num_dpus > 0 else 0
         elem_count = self._slot_elem_count(capacity, group_heads, head_dim)
         if not force_host_fallback and self._supports_dpu_shape(group_heads, head_dim):
@@ -1829,9 +1932,23 @@ class UpmemKVSlotStore(ResidentKVStore):
                     )
                     tail_block["seq_len"] = int(result["seq_len"])
                     tail_block["capacity"] = int(result["capacity"])
-            except Exception:
+            except Exception as exc:
                 if new_blocks:
                     self._free_block_infos(new_blocks)
+                # Optional escape hatch: if blocked allocation fails due to capacity
+                # pressure, migrate the whole group to host and continue there.
+                if self.blocked_overflow_policy == "host_fallback":
+                    self.last_allocate_error_stage = "blocked_append_overflow_migrate"
+                    self.last_allocate_error = repr(exc)
+                    try:
+                        self._migrate_blocked_group_to_host(key=key, slot_info=slot_info)
+                        # Retry append on the now-host-backed slot.
+                        out = self.append_group(k_slot, v_slot, k_new, v_new)
+                        self._record_timing("append_group", started_at)
+                        return out
+                    except Exception:
+                        # If migration fails, fall through to raising original error.
+                        pass
                 raise
 
             if new_blocks:

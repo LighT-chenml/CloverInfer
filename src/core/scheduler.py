@@ -714,6 +714,9 @@ class ContinuousDecodeEngine:
         self._active_rr_cursor: int = 0
         self._task: asyncio.Task | None = None
         self._debug_last_stats: dict[str, object] = {}
+        # Aggregated counters for debugging/analysis (reset when engine starts).
+        self._attention_batch_calls: int = 0
+        self._attention_batch_items: int = 0
         self._shutdown_requested = False
 
     async def enqueue(
@@ -1041,7 +1044,16 @@ class ContinuousDecodeEngine:
                 stage_timing = item["stage_timing"]
                 stage_timing["scheduler"]["attention_decode_rpc_s"] += float(rpc_elapsed) / max(len(step_active), 1)
                 stage_timing["actors"]["attention_decode_compute_s"] += float(per_item_compute)
+            # Track attention batching effectiveness over time. The "last batch size"
+            # can be misleading because the tail of a workload always collapses to 1.
+            self._attention_batch_calls += 1
+            self._attention_batch_items += int(len(payloads))
             self._debug_last_stats["engine_last_attention_batch_size"] = int(len(payloads))
+            self._debug_last_stats["engine_attention_batch_calls"] = int(self._attention_batch_calls)
+            self._debug_last_stats["engine_attention_batch_items"] = int(self._attention_batch_items)
+            self._debug_last_stats["engine_attention_batch_avg_size"] = float(self._attention_batch_items) / float(
+                max(self._attention_batch_calls, 1)
+            )
             contexts = [item_out["context"] for item_out in attention_out]
             context_tensor = torch.cat([ctx for ctx in contexts], dim=0)
             finish = await dense.finish_layer_batch.remote(residual, context_tensor, int(layer_idx))
