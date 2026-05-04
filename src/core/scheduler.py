@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from typing import Dict, List
 
 import ray
+from ray.runtime_context import get_runtime_context
 
 from .config import ClusterConfig, ModelConfig
 from .nodes import AttentionNode, DecodeDenseNode, PrefillNode
@@ -102,6 +104,14 @@ class GlobalScheduler:
         self._attention_wavefront_tasks: dict[tuple[int, int], asyncio.Task] = {}
         self._attention_wavefront_expected_sizes: dict[tuple[int, int], int] = {}
         self._active_decode_requests = 0
+        self.decode_continuous_batch_max_size = max(
+            1, int(getattr(cluster_config, "decode_continuous_batch_max_size", 8))
+        )
+        self.decode_continuous_batch_flushes = 0
+        self.decode_continuous_batch_total_items = 0
+        self.decode_continuous_batch_max_observed = 0
+        self._decode_pending_queue = deque()
+        self._decode_driver_task: asyncio.Task | None = None
 
     def _attention_batch_target_size(self) -> int:
         return max(1, min(self._active_decode_requests, self.attention_batch_max_size))
@@ -111,6 +121,57 @@ class GlobalScheduler:
 
     def _attention_layer_barrier_target_size(self) -> int:
         return max(1, min(self._active_decode_requests, self.attention_layer_barrier_max_size))
+
+    def _new_decode_state(
+        self,
+        *,
+        request_id: str,
+        prompt_len: int,
+        first_token: int,
+        max_tokens: int,
+        request_start: float,
+        return_metrics: bool,
+    ) -> Dict[str, object]:
+        return {
+            "request_id": request_id,
+            "prompt_len": int(prompt_len),
+            "current_token": int(first_token),
+            "generated_ids": [int(first_token)],
+            "max_tokens": int(max_tokens),
+            "step": 1,
+            "request_start": float(request_start),
+            "first_token_time": time.time(),
+            "return_metrics": bool(return_metrics),
+            "stage_timing": _empty_stage_timing(),
+            "pending_free": False,
+            "done": False,
+            "completion_future": None,
+        }
+
+    def _ensure_decode_driver(self):
+        if self._decode_driver_task is None or self._decode_driver_task.done():
+            self._decode_driver_task = asyncio.create_task(self._decode_driver_loop())
+
+    async def _decode_driver_loop(self):
+        try:
+            while self._decode_pending_queue:
+                batch_size = min(len(self._decode_pending_queue), self.decode_continuous_batch_max_size)
+                batch = [self._decode_pending_queue.popleft() for _ in range(batch_size)]
+                self.decode_continuous_batch_flushes += 1
+                self.decode_continuous_batch_total_items += len(batch)
+                self.decode_continuous_batch_max_observed = max(
+                    self.decode_continuous_batch_max_observed,
+                    len(batch),
+                )
+                try:
+                    await self._run_decode_wave(batch)
+                except Exception as exc:
+                    for state in batch:
+                        await self._fail_decode_state(state, exc)
+        finally:
+            self._decode_driver_task = None
+            if self._decode_pending_queue:
+                self._ensure_decode_driver()
 
     async def _flush_decode_step_sync(self, step: int):
         try:
@@ -363,14 +424,250 @@ class GlobalScheduler:
                 task.cancel()
             await self._execute_attention_wavefront_key(key)
         elif key not in self._attention_wavefront_tasks:
-            self._attention_wavefront_tasks[key] = asyncio.create_task(
-                self._flush_attention_wavefront_key(key)
-            )
+                self._attention_wavefront_tasks[key] = asyncio.create_task(
+                    self._flush_attention_wavefront_key(key)
+                )
         return await future
 
+    async def _run_decode_wave(self, batch: List[Dict[str, object]]):
+        if not batch:
+            return
+
+        attention = self.attention_nodes[0]
+        dense = self.decode_dense_nodes[0]
+        positions = [int(state["prompt_len"]) + int(state["step"]) - 1 for state in batch]
+        token_ids = [int(state["current_token"]) for state in batch]
+        request_ids = [str(state["request_id"]) for state in batch]
+
+        rpc_started = time.perf_counter()
+        start_token_result = await dense.start_token_batch.remote(token_ids, positions)
+        start_rpc_s = time.perf_counter() - rpc_started
+        hidden_states = [
+            start_token_result["hidden"][idx : idx + 1]
+            for idx in range(len(batch))
+        ]
+        start_compute_s = float(start_token_result.get("profile", {}).get("compute_s", 0.0))
+        per_item_start_compute_s = start_compute_s / max(len(batch), 1)
+        for state in batch:
+            state["stage_timing"]["counts"]["decode_steps"] += 1
+            state["stage_timing"]["scheduler"]["start_token_rpc_s"] += start_rpc_s / max(len(batch), 1)
+            state["stage_timing"]["actors"]["dense_start_token_compute_s"] += per_item_start_compute_s
+
+        for layer_idx in range(self.runtime_model_spec["num_layers"]):
+            context_lens = [int(state["prompt_len"]) + int(state["step"]) for state in batch]
+
+            rpc_started = time.perf_counter()
+            prepared_items = await dense.prepare_attention_batch.remote(
+                hidden_states,
+                layer_idx,
+                request_ids,
+                context_lens,
+            )
+            prepare_rpc_s = time.perf_counter() - rpc_started
+            for state, prepared in zip(batch, prepared_items):
+                state["stage_timing"]["counts"]["decode_layers"] += 1
+                state["stage_timing"]["scheduler"]["prepare_attention_rpc_s"] += (
+                    prepare_rpc_s / max(len(batch), 1)
+                )
+                state["stage_timing"]["actors"]["dense_prepare_attention_compute_s"] += float(
+                    prepared.get("profile", {}).get("compute_s", 0.0)
+                )
+
+            rpc_started = time.perf_counter()
+            attention_results = await attention.decode_layer_batch.remote(prepared_items)
+            attention_rpc_s = time.perf_counter() - rpc_started
+            contexts = []
+            for state, result in zip(batch, attention_results):
+                state["stage_timing"]["scheduler"]["attention_decode_rpc_s"] += (
+                    attention_rpc_s / max(len(batch), 1)
+                )
+                state["stage_timing"]["actors"]["attention_decode_compute_s"] += float(
+                    result.get("profile", {}).get("compute_s", 0.0)
+                )
+                contexts.append(result["context"])
+
+            residuals = [prepared["residual"] for prepared in prepared_items]
+            rpc_started = time.perf_counter()
+            finish_results = await dense.finish_layer_batch.remote(residuals, contexts, layer_idx)
+            finish_rpc_s = time.perf_counter() - rpc_started
+            next_hidden_states = []
+            for state, result in zip(batch, finish_results):
+                state["stage_timing"]["scheduler"]["finish_layer_rpc_s"] += (
+                    finish_rpc_s / max(len(batch), 1)
+                )
+                state["stage_timing"]["actors"]["dense_finish_layer_compute_s"] += float(
+                    result.get("profile", {}).get("compute_s", 0.0)
+                )
+                next_hidden_states.append(result["hidden"])
+            hidden_states = next_hidden_states
+
+        rpc_started = time.perf_counter()
+        sample_results = await dense.sample_next_token_batch.remote(hidden_states)
+        sample_rpc_s = time.perf_counter() - rpc_started
+
+        for state, result in zip(batch, sample_results):
+            state["stage_timing"]["scheduler"]["sample_next_token_rpc_s"] += (
+                sample_rpc_s / max(len(batch), 1)
+            )
+            state["stage_timing"]["actors"]["dense_sample_next_token_compute_s"] += float(
+                result.get("profile", {}).get("compute_s", 0.0)
+            )
+            next_token = int(result["token_id"])
+            state["generated_ids"].append(next_token)
+            state["current_token"] = next_token
+            state["step"] = int(state["step"]) + 1
+
+        requeue_states = []
+        for state in batch:
+            next_token = int(state["current_token"])
+            max_tokens = int(state["max_tokens"])
+            total_tokens = len(state["generated_ids"])
+            if next_token == 2 or total_tokens >= max_tokens:
+                await self._complete_decode_state(state)
+            else:
+                requeue_states.append(state)
+
+        for state in requeue_states:
+            self._decode_pending_queue.append(state)
+
+    async def _fail_decode_state(self, state: Dict[str, object], exc: Exception):
+        if state.get("pending_free", False):
+            return
+        state["pending_free"] = True
+        try:
+            await self.attention_nodes[0].free_request.remote(str(state["request_id"]))
+        finally:
+            self._inflight_request_count = max(0, self._inflight_request_count - 1)
+            self._active_decode_requests = max(0, self._active_decode_requests - 1)
+            future = state.get("completion_future")
+            if future is not None and not future.done():
+                future.set_exception(exc)
+
+    async def _complete_decode_state(self, state: Dict[str, object]):
+        if state.get("pending_free", False):
+            return
+        state["pending_free"] = True
+
+        attention = self.attention_nodes[0]
+        dense = self.decode_dense_nodes[0]
+        request_id = str(state["request_id"])
+        stage_timing = state["stage_timing"]
+        return_metrics = bool(state["return_metrics"])
+
+        attention_debug_before_free = None
+        if return_metrics:
+            attention_debug_before_free = await attention.get_info.remote()
+
+        rpc_started = time.perf_counter()
+        await attention.free_request.remote(request_id)
+        stage_timing["scheduler"]["free_request_rpc_s"] += time.perf_counter() - rpc_started
+
+        rpc_started = time.perf_counter()
+        decode_result = await dense.decode_tokens.remote(state["generated_ids"])
+        stage_timing["scheduler"]["decode_tokens_rpc_s"] += time.perf_counter() - rpc_started
+        stage_timing["actors"]["dense_decode_tokens_compute_s"] += float(
+            decode_result.get("profile", {}).get("compute_s", 0.0)
+        )
+        generated_text = decode_result["text"]
+
+        self._inflight_request_count = max(0, self._inflight_request_count - 1)
+        self._active_decode_requests = max(0, self._active_decode_requests - 1)
+        await self._maybe_flush_decode_step_syncs()
+        await self._maybe_flush_attention_layer_barriers()
+        await self._maybe_flush_attention_wavefronts()
+
+        future = state.get("completion_future")
+        if future is None or future.done():
+            return
+
+        if return_metrics:
+            request_end = time.time()
+            latency = request_end - float(state["request_start"])
+            total_tokens = len(state["generated_ids"])
+            ttft = float(state["first_token_time"]) - float(state["request_start"])
+            tpot = (latency - ttft) / max(total_tokens - 1, 1)
+            throughput = total_tokens / latency if latency > 0 else 0.0
+            metrics = {
+                "ttft": ttft,
+                "tpot": tpot,
+                "latency": latency,
+                "throughput": throughput,
+                "total_tokens": total_tokens,
+            }
+            scheduler_rpc_total = sum(stage_timing["scheduler"].values())
+            actor_compute_total = sum(stage_timing["actors"].values())
+            metrics["stage_timing"] = stage_timing
+            metrics["stage_timing"]["scheduler"]["total_rpc_s"] = scheduler_rpc_total
+            metrics["stage_timing"]["actors"]["total_compute_s"] = actor_compute_total
+            metrics["stage_timing"]["scheduler_overhead_s"] = max(0.0, float(latency - scheduler_rpc_total))
+            metrics["scheduler_attention_batching"] = {
+                "window_s": float(self.attention_batch_window_s),
+                "max_size": int(self.attention_batch_max_size),
+                "cross_key_batch_enabled": bool(self.attention_rpc_cross_key_batch_enabled),
+                "actor_side_batching_enabled": bool(self.attention_actor_side_batching_enabled),
+                "flushes": int(self.attention_batch_flushes),
+                "total_items": int(self.attention_batch_total_items),
+                "max_observed_size": int(self.attention_batch_max_observed),
+                "multi_key_flushes": int(self.attention_batch_multi_key_flushes),
+                "total_keys": int(self.attention_batch_total_keys),
+                "max_keys_observed": int(self.attention_batch_max_keys_observed),
+                "pending": sum(len(batch) for batch in self._attention_wavefront_batches.values()),
+            }
+            metrics["scheduler_decode_step_sync"] = {
+                "window_s": float(self.decode_step_sync_window_s),
+                "max_size": int(self.decode_step_sync_max_size),
+                "flushes": int(self.decode_step_sync_flushes),
+                "total_items": int(self.decode_step_sync_total_items),
+                "max_observed_size": int(self.decode_step_sync_max_observed),
+                "pending": sum(len(batch) for batch in self._decode_step_sync_batches.values()),
+            }
+            metrics["scheduler_attention_layer_barrier"] = {
+                "window_s": float(self.attention_layer_barrier_window_s),
+                "max_size": int(self.attention_layer_barrier_max_size),
+                "flushes": int(self.attention_layer_barrier_flushes),
+                "total_items": int(self.attention_layer_barrier_total_items),
+                "max_observed_size": int(self.attention_layer_barrier_max_observed),
+                "pending": sum(len(batch) for batch in self._attention_layer_barrier_batches.values()),
+            }
+            metrics["scheduler_dense_continuous_batching"] = {
+                "max_size": int(self.decode_continuous_batch_max_size),
+                "flushes": int(self.decode_continuous_batch_flushes),
+                "total_items": int(self.decode_continuous_batch_total_items),
+                "max_observed_size": int(self.decode_continuous_batch_max_observed),
+                "pending": len(self._decode_pending_queue),
+            }
+            metrics["attention_backend_before_free"] = attention_debug_before_free
+            metrics["attention_backend"] = await attention.get_info.remote()
+            future.set_result((generated_text, metrics))
+            return
+
+        future.set_result(generated_text)
+
     async def initialize_cluster(self):
-        gpu_prefill = 1 if self.cluster_config.use_gpu_for_prefill else 0
-        gpu_dense = 1 if self.cluster_config.use_gpu_for_decode_dense else 0
+        gpu_prefill = (
+            float(self.cluster_config.prefill_gpu_fraction)
+            if self.cluster_config.use_gpu_for_prefill
+            else 0.0
+        )
+        gpu_dense = (
+            float(self.cluster_config.decode_dense_gpu_fraction)
+            if self.cluster_config.use_gpu_for_decode_dense
+            else 0.0
+        )
+        if gpu_prefill < 0 or gpu_dense < 0:
+            raise ValueError("GPU fractions must be non-negative")
+        cluster_resources = ray.cluster_resources()
+        available_gpus = float(cluster_resources.get("GPU", 0.0))
+        requested_gpus = (
+            gpu_prefill * int(self.cluster_config.num_prefill_workers)
+            + gpu_dense * int(self.cluster_config.num_decode_dense_nodes)
+        )
+        if requested_gpus > available_gpus + 1e-6:
+            raise RuntimeError(
+                "Requested GPU actors exceed visible Ray GPU capacity: "
+                f"requested={requested_gpus}, available={available_gpus}. "
+                "Adjust --prefill-gpu-fraction / --decode-dense-gpu-fraction or disable one side's GPU."
+            )
         attention_backend_kwargs = {}
         if self.cluster_config.attention_backend in {"pim_naive", "cloverinfer"}:
             attention_backend_kwargs = {
@@ -455,23 +752,28 @@ class GlobalScheduler:
     async def submit_request(self, prompt: str, return_metrics: bool = False, max_new_tokens: int | None = None):
         self._inflight_request_count += 1
         request_start = time.time()
-        stage_timing = _empty_stage_timing()
         prefill = self.prefill_nodes[0]
         attention = self.attention_nodes[0]
-        dense = self.decode_dense_nodes[0]
 
         rpc_started = time.perf_counter()
         prefill_out = await prefill.process_prompt.remote(prompt)
-        stage_timing["scheduler"]["prefill_rpc_s"] += time.perf_counter() - rpc_started
-        stage_timing["actors"]["prefill_compute_s"] += float(prefill_out.get("profile", {}).get("compute_s", 0.0))
+        prefill_rpc_s = time.perf_counter() - rpc_started
         request_id = prefill_out["request_id"]
         prompt_len = int(prefill_out["prompt_len"])
         first_token = int(prefill_out["first_token_id"])
-        first_token_time = time.time()
-
-        generated_ids: List[int] = [first_token]
-        current_token = first_token
         max_tokens = int(max_new_tokens or self.model_config.max_new_tokens)
+        decode_state = self._new_decode_state(
+            request_id=request_id,
+            prompt_len=prompt_len,
+            first_token=first_token,
+            max_tokens=max_tokens,
+            request_start=request_start,
+            return_metrics=return_metrics,
+        )
+        decode_state["stage_timing"]["scheduler"]["prefill_rpc_s"] += prefill_rpc_s
+        decode_state["stage_timing"]["actors"]["prefill_compute_s"] += float(
+            prefill_out.get("profile", {}).get("compute_s", 0.0)
+        )
 
         rpc_started = time.perf_counter()
         init_result = await attention.init_request.remote(
@@ -480,145 +782,18 @@ class GlobalScheduler:
             max_tokens,
         )
         self._active_decode_requests += 1
-        stage_timing["scheduler"]["attention_init_rpc_s"] += time.perf_counter() - rpc_started
-        stage_timing["actors"]["attention_init_compute_s"] += float(
+        decode_state["stage_timing"]["scheduler"]["attention_init_rpc_s"] += time.perf_counter() - rpc_started
+        decode_state["stage_timing"]["actors"]["attention_init_compute_s"] += float(
             init_result.get("profile", {}).get("compute_s", 0.0)
         )
+        if max_tokens <= 1:
+            completion_future = asyncio.get_running_loop().create_future()
+            decode_state["completion_future"] = completion_future
+            await self._complete_decode_state(decode_state)
+            return await completion_future
 
-        try:
-            for step in range(1, max_tokens):
-                stage_timing["counts"]["decode_steps"] += 1
-                position = prompt_len + step - 1
-                rpc_started = time.perf_counter()
-                decode_wave = await self._synchronize_decode_step(step, request_id)
-                stage_timing["scheduler"].setdefault("decode_step_sync_wait_s", 0.0)
-                stage_timing["scheduler"]["decode_step_sync_wait_s"] += time.perf_counter() - rpc_started
-                rpc_started = time.perf_counter()
-                start_token_result = await dense.start_token.remote(current_token, position)
-                stage_timing["scheduler"]["start_token_rpc_s"] += time.perf_counter() - rpc_started
-                stage_timing["actors"]["dense_start_token_compute_s"] += float(
-                    start_token_result.get("profile", {}).get("compute_s", 0.0)
-                )
-                hidden = start_token_result["hidden"]
-
-                for layer_idx in range(self.runtime_model_spec["num_layers"]):
-                    stage_timing["counts"]["decode_layers"] += 1
-
-                    rpc_started = time.perf_counter()
-                    prepared = await dense.prepare_attention.remote(hidden, layer_idx, request_id, prompt_len + step)
-                    stage_timing["scheduler"]["prepare_attention_rpc_s"] += time.perf_counter() - rpc_started
-                    stage_timing["actors"]["dense_prepare_attention_compute_s"] += float(
-                        prepared.get("profile", {}).get("compute_s", 0.0)
-                    )
-
-                    rpc_started = time.perf_counter()
-                    attention_result = await self._batched_attention_decode(
-                        attention,
-                        prepared,
-                        step,
-                        decode_wave=decode_wave,
-                    )
-                    stage_timing["scheduler"]["attention_decode_rpc_s"] += time.perf_counter() - rpc_started
-                    stage_timing["actors"]["attention_decode_compute_s"] += float(
-                        attention_result.get("profile", {}).get("compute_s", 0.0)
-                    )
-                    context = attention_result["context"]
-
-                    rpc_started = time.perf_counter()
-                    finish_result = await dense.finish_layer.remote(prepared["residual"], context, layer_idx)
-                    stage_timing["scheduler"]["finish_layer_rpc_s"] += time.perf_counter() - rpc_started
-                    stage_timing["actors"]["dense_finish_layer_compute_s"] += float(
-                        finish_result.get("profile", {}).get("compute_s", 0.0)
-                    )
-                    hidden = finish_result["hidden"]
-
-                rpc_started = time.perf_counter()
-                sample_result = await dense.sample_next_token.remote(hidden)
-                stage_timing["scheduler"]["sample_next_token_rpc_s"] += time.perf_counter() - rpc_started
-                stage_timing["actors"]["dense_sample_next_token_compute_s"] += float(
-                    sample_result.get("profile", {}).get("compute_s", 0.0)
-                )
-                next_token = int(sample_result["token_id"])
-                generated_ids.append(next_token)
-                current_token = next_token
-
-                if next_token == 2:
-                    break
-        finally:
-            attention_debug_before_free = None
-            if return_metrics:
-                attention_debug_before_free = await attention.get_info.remote()
-            self._inflight_request_count = max(0, self._inflight_request_count - 1)
-            self._active_decode_requests = max(0, self._active_decode_requests - 1)
-            await self._maybe_flush_decode_step_syncs()
-            await self._maybe_flush_attention_layer_barriers()
-            await self._maybe_flush_attention_wavefronts()
-            rpc_started = time.perf_counter()
-            await attention.free_request.remote(request_id)
-            stage_timing["scheduler"]["free_request_rpc_s"] += time.perf_counter() - rpc_started
-
-        rpc_started = time.perf_counter()
-        decode_result = await dense.decode_tokens.remote(generated_ids)
-        stage_timing["scheduler"]["decode_tokens_rpc_s"] += time.perf_counter() - rpc_started
-        stage_timing["actors"]["dense_decode_tokens_compute_s"] += float(
-            decode_result.get("profile", {}).get("compute_s", 0.0)
-        )
-        generated_text = decode_result["text"]
-
-        if return_metrics:
-            request_end = time.time()
-            latency = request_end - request_start
-            total_tokens = len(generated_ids)
-            ttft = first_token_time - request_start
-            tpot = (latency - ttft) / max(total_tokens - 1, 1)
-            throughput = total_tokens / latency if latency > 0 else 0.0
-            metrics = {
-                "ttft": ttft,
-                "tpot": tpot,
-                "latency": latency,
-                "throughput": throughput,
-                "total_tokens": total_tokens,
-            }
-            scheduler_rpc_total = sum(stage_timing["scheduler"].values())
-            actor_compute_total = sum(stage_timing["actors"].values())
-            metrics["stage_timing"] = stage_timing
-            metrics["stage_timing"]["scheduler"]["total_rpc_s"] = scheduler_rpc_total
-            metrics["stage_timing"]["actors"]["total_compute_s"] = actor_compute_total
-            metrics["stage_timing"]["scheduler_overhead_s"] = max(
-                0.0,
-                float(latency - scheduler_rpc_total),
-            )
-            metrics["scheduler_attention_batching"] = {
-                "window_s": float(self.attention_batch_window_s),
-                "max_size": int(self.attention_batch_max_size),
-                "cross_key_batch_enabled": bool(self.attention_rpc_cross_key_batch_enabled),
-                "actor_side_batching_enabled": bool(self.attention_actor_side_batching_enabled),
-                "flushes": int(self.attention_batch_flushes),
-                "total_items": int(self.attention_batch_total_items),
-                "max_observed_size": int(self.attention_batch_max_observed),
-                "multi_key_flushes": int(self.attention_batch_multi_key_flushes),
-                "total_keys": int(self.attention_batch_total_keys),
-                "max_keys_observed": int(self.attention_batch_max_keys_observed),
-                "pending": sum(len(batch) for batch in self._attention_wavefront_batches.values()),
-            }
-            metrics["scheduler_decode_step_sync"] = {
-                "window_s": float(self.decode_step_sync_window_s),
-                "max_size": int(self.decode_step_sync_max_size),
-                "flushes": int(self.decode_step_sync_flushes),
-                "total_items": int(self.decode_step_sync_total_items),
-                "max_observed_size": int(self.decode_step_sync_max_observed),
-                "pending": sum(len(batch) for batch in self._decode_step_sync_batches.values()),
-            }
-            metrics["scheduler_attention_layer_barrier"] = {
-                "window_s": float(self.attention_layer_barrier_window_s),
-                "max_size": int(self.attention_layer_barrier_max_size),
-                "flushes": int(self.attention_layer_barrier_flushes),
-                "total_items": int(self.attention_layer_barrier_total_items),
-                "max_observed_size": int(self.attention_layer_barrier_max_observed),
-                "pending": sum(len(batch) for batch in self._attention_layer_barrier_batches.values()),
-            }
-            metrics["attention_backend_before_free"] = attention_debug_before_free
-            metrics["attention_backend"] = await attention.get_info.remote()
-            return generated_text, metrics
-
-        return generated_text
+        completion_future = asyncio.get_running_loop().create_future()
+        decode_state["completion_future"] = completion_future
+        self._decode_pending_queue.append(decode_state)
+        self._ensure_decode_driver()
+        return await completion_future

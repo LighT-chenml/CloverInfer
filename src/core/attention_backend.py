@@ -65,7 +65,13 @@ class CpuAttentionBackend:
         self.v_cache: Dict[str, List[torch.Tensor]] = {}
         self.context_lens: Dict[str, int] = {}
 
-    def init_request(self, request_id: str, initial_kv: List[Dict[str, torch.Tensor]]) -> int:
+    def init_request(
+        self,
+        request_id: str,
+        initial_kv: List[Dict[str, torch.Tensor]],
+        decode_reserve_tokens: int = 0,
+    ) -> int:
+        del decode_reserve_tokens
         if request_id in self.k_cache:
             raise ValueError(f"Request {request_id} already exists")
 

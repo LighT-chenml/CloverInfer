@@ -20,6 +20,8 @@ class ClusterConfig(BaseModel):
     attention_resource: Optional[str] = None
     use_gpu_for_prefill: bool = True
     use_gpu_for_decode_dense: bool = True
+    prefill_gpu_fraction: float = 1.0
+    decode_dense_gpu_fraction: float = 1.0
     attention_backend: str = "cpu"
     pim_num_dpus: int = 4
     pim_resident_store_backend: str = "host"
@@ -58,6 +60,7 @@ class ClusterConfig(BaseModel):
     attention_actor_side_batching_enabled: bool = False
     attention_actor_batch_window_s: float = 0.001
     attention_actor_batch_max_size: int = 8
+    decode_continuous_batch_max_size: int = 8
 
 class ModelConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")

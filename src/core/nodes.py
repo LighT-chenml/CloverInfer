@@ -253,6 +253,18 @@ class DecodeDenseNode:
             },
         }
 
+    def start_token_batch(self, token_ids: List[int], positions: List[int]):
+        started_at = time.perf_counter()
+        hidden = self.adapter.start_token_batch(token_ids, positions)
+        finished_at = time.perf_counter()
+        return {
+            "hidden": hidden,
+            "profile": {
+                "compute_s": float(finished_at - started_at),
+                "batch_size": len(token_ids),
+            },
+        }
+
     def prepare_attention(self, hidden_state, layer_idx: int, request_id: str, context_len: int):
         started_at = time.perf_counter()
         prepared = self.adapter.prepare_attention(hidden_state, layer_idx, request_id, context_len)
@@ -270,6 +282,39 @@ class DecodeDenseNode:
             },
         }
 
+    def prepare_attention_batch(
+        self,
+        hidden_states,
+        layer_idx: int,
+        request_ids: List[str],
+        context_lens: List[int],
+    ):
+        started_at = time.perf_counter()
+        prepared_items = self.adapter.prepare_attention_batch(
+            hidden_states,
+            layer_idx,
+            request_ids,
+            context_lens,
+        )
+        finished_at = time.perf_counter()
+        per_item_compute_s = float(finished_at - started_at) / max(len(prepared_items), 1)
+        return [
+            {
+                "request_id": request_id,
+                "layer_idx": int(layer_idx),
+                "residual": prepared["residual"],
+                "query": prepared["query"],
+                "key": prepared["key"],
+                "value": prepared["value"],
+                "score_scale": float(prepared.get("score_scale", 1.0)),
+                "profile": {
+                    "compute_s": per_item_compute_s,
+                    "batch_size": len(prepared_items),
+                },
+            }
+            for request_id, prepared in zip(request_ids, prepared_items)
+        ]
+
     def finish_layer(self, residual, attention_context, layer_idx: int):
         started_at = time.perf_counter()
         hidden = self.adapter.finish_layer(residual, attention_context, layer_idx)
@@ -281,6 +326,22 @@ class DecodeDenseNode:
             },
         }
 
+    def finish_layer_batch(self, residuals, attention_contexts, layer_idx: int):
+        started_at = time.perf_counter()
+        hidden_states = self.adapter.finish_layer_batch(residuals, attention_contexts, layer_idx)
+        finished_at = time.perf_counter()
+        per_item_compute_s = float(finished_at - started_at) / max(len(hidden_states), 1)
+        return [
+            {
+                "hidden": hidden,
+                "profile": {
+                    "compute_s": per_item_compute_s,
+                    "batch_size": len(hidden_states),
+                },
+            }
+            for hidden in hidden_states
+        ]
+
     def sample_next_token(self, hidden_state):
         started_at = time.perf_counter()
         token_id = self.adapter.sample_next_token(hidden_state)
@@ -291,6 +352,22 @@ class DecodeDenseNode:
                 "compute_s": float(finished_at - started_at),
             },
         }
+
+    def sample_next_token_batch(self, hidden_states):
+        started_at = time.perf_counter()
+        token_ids = self.adapter.sample_next_token_batch(hidden_states)
+        finished_at = time.perf_counter()
+        per_item_compute_s = float(finished_at - started_at) / max(len(token_ids), 1)
+        return [
+            {
+                "token_id": int(token_id),
+                "profile": {
+                    "compute_s": per_item_compute_s,
+                    "batch_size": len(token_ids),
+                },
+            }
+            for token_id in token_ids
+        ]
 
     def decode_tokens(self, token_ids: List[int]) -> str:
         started_at = time.perf_counter()

@@ -35,6 +35,8 @@ def main():
     parser.add_argument("--no-gpu-for-prefill", action="store_true")
     parser.add_argument("--use-gpu-for-decode-dense", action="store_true")
     parser.add_argument("--no-gpu-for-decode-dense", action="store_true")
+    parser.add_argument("--prefill-gpu-fraction", type=float, default=1.0)
+    parser.add_argument("--decode-dense-gpu-fraction", type=float, default=1.0)
     parser.add_argument("--max-new-tokens", type=int, default=20)
     parser.add_argument("--dtype", type=str, default="float16")
     parser.add_argument("--pim-num-dpus", type=int, default=4)
@@ -53,6 +55,7 @@ def main():
     parser.add_argument("--clover-shadow-check-layer-interval", type=int, default=4)
     parser.add_argument("--clover-host-qk-mixed-enabled", action="store_true")
     parser.add_argument("--no-clover-host-qk-mixed-enabled", action="store_true")
+    parser.add_argument("--decode-continuous-batch-max-size", type=int, default=8)
     parser.add_argument("--sequential", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
@@ -139,6 +142,8 @@ def main():
         attention_resource=args.attention_resource,
         use_gpu_for_prefill=use_gpu_for_prefill,
         use_gpu_for_decode_dense=use_gpu_for_decode_dense,
+        prefill_gpu_fraction=args.prefill_gpu_fraction,
+        decode_dense_gpu_fraction=args.decode_dense_gpu_fraction,
         attention_backend=args.attention_backend,
         pim_num_dpus=args.pim_num_dpus,
         pim_length=args.pim_length,
@@ -151,6 +156,7 @@ def main():
         clover_shadow_check_token_interval=args.clover_shadow_check_token_interval,
         clover_shadow_check_layer_interval=args.clover_shadow_check_layer_interval,
         clover_host_qk_mixed_enabled=clover_host_qk_mixed_enabled,
+        decode_continuous_batch_max_size=args.decode_continuous_batch_max_size,
     )
     model_conf = ModelConfig(
         model_name=args.model_name,

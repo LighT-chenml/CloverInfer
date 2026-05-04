@@ -78,6 +78,9 @@ class CausalModelAdapter:
         self.model_config = self.model.config
         self.hidden_size = int(self.model.config.hidden_size)
         self.num_heads = int(self.model.config.num_attention_heads)
+        self.num_key_value_heads = int(
+            getattr(self.model.config, "num_key_value_heads", self.num_heads)
+        )
         self.num_layers = int(self.model.config.num_hidden_layers)
         self.vocab_size = int(self.model.config.vocab_size)
         self.head_dim = self.hidden_size // self.num_heads
@@ -90,17 +93,29 @@ class CausalModelAdapter:
             self.layers = self.backbone.h
             self.head_dim = int(self.model.config.kv_channels)
             self.qwen_module = importlib.import_module(type(self.model).__module__)
+        elif self.model_type == "llama":
+            self.backbone = self.model.model
+            self.layers = self.backbone.layers
+            self.llama_module = importlib.import_module(type(self.model).__module__)
         else:
             raise ValueError(f"Unsupported model type for now: {self.model_type}")
 
     def _load_tokenizer(self):
         if self.model_type == "qwen":
             return LocalQwenTokenizer(f"{self.model_path}/qwen.tiktoken")
-        return AutoTokenizer.from_pretrained(
-            self.model_path,
-            local_files_only=True,
-            trust_remote_code=True,
-        )
+        try:
+            return AutoTokenizer.from_pretrained(
+                self.model_path,
+                local_files_only=True,
+                trust_remote_code=True,
+            )
+        except Exception:
+            return AutoTokenizer.from_pretrained(
+                self.model_path,
+                local_files_only=True,
+                trust_remote_code=True,
+                use_fast=False,
+            )
 
     def _load_model(self):
         common_kwargs = {
@@ -139,6 +154,7 @@ class CausalModelAdapter:
             "num_layers": self.num_layers,
             "hidden_size": self.hidden_size,
             "num_heads": self.num_heads,
+            "num_key_value_heads": self.num_key_value_heads,
             "vocab_size": self.vocab_size,
         }
 
@@ -155,8 +171,12 @@ class CausalModelAdapter:
             logits = outputs.logits[:, -1, :]
             first_token_id = int(torch.argmax(logits, dim=-1).item())
 
+        past_key_values = outputs.past_key_values
+        if hasattr(past_key_values, "to_legacy_cache"):
+            past_key_values = past_key_values.to_legacy_cache()
+
         initial_kv: List[Dict[str, torch.Tensor]] = []
-        for layer_kv in outputs.past_key_values:
+        for layer_kv in past_key_values:
             key = layer_kv.key_cache if hasattr(layer_kv, "key_cache") else layer_kv[0]
             value = layer_kv.value_cache if hasattr(layer_kv, "value_cache") else layer_kv[1]
             initial_kv.append(
@@ -192,6 +212,8 @@ class CausalModelAdapter:
             return key[0].permute(1, 0, 2).contiguous().cpu()
         if self.model_type == "qwen":
             return key[0].contiguous().cpu()
+        if self.model_type == "llama":
+            return self._expand_kv_heads(key[0].transpose(0, 1).contiguous()).cpu()
         raise ValueError(f"Unsupported model type for cache normalization: {self.model_type}")
 
     def _normalize_value_cache(self, value: torch.Tensor) -> torch.Tensor:
@@ -199,7 +221,41 @@ class CausalModelAdapter:
             return value[0].permute(1, 0, 2).contiguous().cpu()
         if self.model_type == "qwen":
             return value[0].contiguous().cpu()
+        if self.model_type == "llama":
+            return self._expand_kv_heads(value[0].transpose(0, 1).contiguous()).cpu()
         raise ValueError(f"Unsupported model type for cache normalization: {self.model_type}")
+
+    def _expand_kv_heads(self, tensor: torch.Tensor) -> torch.Tensor:
+        if int(tensor.shape[1]) == self.num_heads:
+            return tensor.contiguous()
+        if int(tensor.shape[1]) != self.num_key_value_heads:
+            raise ValueError(
+                f"Unexpected KV head count {int(tensor.shape[1])}; "
+                f"expected {self.num_key_value_heads} or {self.num_heads}"
+            )
+        if self.num_heads % self.num_key_value_heads != 0:
+            raise ValueError(
+                f"num_heads={self.num_heads} is not divisible by "
+                f"num_key_value_heads={self.num_key_value_heads}"
+            )
+        repeat_factor = self.num_heads // self.num_key_value_heads
+        return tensor.repeat_interleave(repeat_factor, dim=1).contiguous()
+
+    def _contract_kv_heads(self, tensor: torch.Tensor) -> torch.Tensor:
+        if int(tensor.shape[1]) == self.num_key_value_heads:
+            return tensor.contiguous()
+        if int(tensor.shape[1]) != self.num_heads:
+            raise ValueError(
+                f"Unexpected KV head count {int(tensor.shape[1])}; "
+                f"expected {self.num_key_value_heads} or {self.num_heads}"
+            )
+        if self.num_heads % self.num_key_value_heads != 0:
+            raise ValueError(
+                f"num_heads={self.num_heads} is not divisible by "
+                f"num_key_value_heads={self.num_key_value_heads}"
+            )
+        repeat_factor = self.num_heads // self.num_key_value_heads
+        return tensor[:, ::repeat_factor, :].contiguous()
 
     def _denormalize_past_key_values(self, initial_kv: List[Dict[str, torch.Tensor]]):
         past_key_values = []
@@ -212,6 +268,9 @@ class CausalModelAdapter:
             elif self.model_type == "qwen":
                 key = key.unsqueeze(0).contiguous()
                 value = value.unsqueeze(0).contiguous()
+            elif self.model_type == "llama":
+                key = self._contract_kv_heads(key).transpose(0, 1).unsqueeze(0).contiguous()
+                value = self._contract_kv_heads(value).transpose(0, 1).unsqueeze(0).contiguous()
             else:
                 raise ValueError(f"Unsupported model type for cache restore: {self.model_type}")
             past_key_values.append((key, value))
@@ -230,8 +289,32 @@ class CausalModelAdapter:
             hidden = self.backbone.wte(input_ids)
             hidden = self.backbone.drop(hidden)
             return hidden.detach().cpu()
+        if self.model_type == "llama":
+            hidden = self.backbone.embed_tokens(input_ids)
+            return hidden.detach().cpu()
 
         raise ValueError(f"Unsupported model type for start_token: {self.model_type}")
+
+    def start_token_batch(self, token_ids: List[int], positions: List[int]) -> torch.Tensor:
+        if len(token_ids) != len(positions):
+            raise ValueError("token_ids and positions must have the same length")
+        if not token_ids:
+            return torch.empty((0, 1, self.hidden_size), dtype=torch.float32)
+
+        input_ids = torch.tensor(token_ids, dtype=torch.long, device=self.device).view(-1, 1)
+        if self.model_type == "opt":
+            position_ids = torch.tensor(positions, dtype=torch.long, device=self.device).view(-1, 1)
+            attention_mask = torch.ones((len(token_ids), 1), dtype=torch.long, device=self.device)
+            hidden = self.backbone.embed_tokens(input_ids)
+            hidden = hidden + self.backbone.embed_positions(attention_mask, position_ids=position_ids)
+            return hidden.detach().cpu()
+
+        if self.model_type == "qwen":
+            hidden = self.backbone.wte(input_ids)
+            hidden = self.backbone.drop(hidden)
+            return hidden.detach().cpu()
+
+        raise ValueError(f"Unsupported model type for start_token_batch: {self.model_type}")
 
     def prepare_attention(
         self,
@@ -247,7 +330,23 @@ class CausalModelAdapter:
             return self._prepare_opt_attention(hidden, layer_idx)
         if self.model_type == "qwen":
             return self._prepare_qwen_attention(hidden, layer_idx, context_len)
+        if self.model_type == "llama":
+            return self._prepare_llama_attention(hidden, layer_idx, context_len)
         raise ValueError(f"Unsupported model type for prepare_attention: {self.model_type}")
+
+    def prepare_attention_batch(
+        self,
+        hidden_states: List[torch.Tensor],
+        layer_idx: int,
+        request_ids: List[str],
+        context_lens: List[int],
+    ) -> List[Dict[str, object]]:
+        if len(hidden_states) != len(request_ids) or len(hidden_states) != len(context_lens):
+            raise ValueError("hidden_states, request_ids, and context_lens must have the same length")
+        outputs = []
+        for hidden_state, request_id, context_len in zip(hidden_states, request_ids, context_lens):
+            outputs.append(self.prepare_attention(hidden_state, layer_idx, request_id, context_len))
+        return outputs
 
     def _prepare_opt_attention(self, hidden: torch.Tensor, layer_idx: int) -> Dict[str, object]:
         layer = self.layers[layer_idx]
@@ -315,6 +414,48 @@ class CausalModelAdapter:
         rotary_pos_emb = self.backbone.rotary_emb(context_len, ntk_alpha=ntk_alpha)
         return [value[:, -1:, :, :] for value in rotary_pos_emb]
 
+    def _prepare_llama_attention(self, hidden: torch.Tensor, layer_idx: int, context_len: int) -> Dict[str, object]:
+        layer = self.layers[layer_idx]
+        residual = hidden
+        hidden = layer.input_layernorm(hidden)
+        attn = layer.self_attn
+
+        batch, seq_len, _ = hidden.shape
+        if batch != 1 or seq_len != 1:
+            raise ValueError("The first refactor supports batch=1, seq_len=1 decode only")
+
+        query = attn.q_proj(hidden).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+        key = attn.k_proj(hidden).view(
+            batch,
+            seq_len,
+            self.num_key_value_heads,
+            self.head_dim,
+        ).transpose(1, 2).contiguous()
+        value = attn.v_proj(hidden).view(
+            batch,
+            seq_len,
+            self.num_key_value_heads,
+            self.head_dim,
+        ).transpose(1, 2).contiguous()
+
+        position_ids = torch.tensor([[max(0, int(context_len) - 1)]], dtype=torch.long, device=self.device)
+        cos, sin = self.backbone.rotary_emb(hidden, position_ids=position_ids)
+        query, key = self.llama_module.apply_rotary_pos_emb(query, key, cos, sin)
+
+        query = query[:, :, 0, :].contiguous()
+        key = key[:, :, 0, :].contiguous()
+        value = value[:, :, 0, :].contiguous()
+        key = self._expand_kv_heads(key.transpose(0, 1)).transpose(0, 1)
+        value = self._expand_kv_heads(value.transpose(0, 1)).transpose(0, 1)
+
+        return {
+            "residual": residual.detach().cpu(),
+            "query": query.squeeze(0).detach().cpu(),
+            "key": key.squeeze(0).detach().cpu(),
+            "value": value.squeeze(0).detach().cpu(),
+            "score_scale": float(attn.scaling),
+        }
+
     def finish_layer(self, residual: torch.Tensor, attention_context: torch.Tensor, layer_idx: int) -> torch.Tensor:
         residual = residual.to(self.device)
         context = attention_context.to(self.device)
@@ -326,7 +467,22 @@ class CausalModelAdapter:
             return self._finish_opt_layer(residual, attn_output, layer_idx)
         if self.model_type == "qwen":
             return self._finish_qwen_layer(residual, attn_output, layer_idx)
+        if self.model_type == "llama":
+            return self._finish_llama_layer(residual, attn_output, layer_idx)
         raise ValueError(f"Unsupported model type for finish_layer: {self.model_type}")
+
+    def finish_layer_batch(
+        self,
+        residuals: List[torch.Tensor],
+        attention_contexts: List[torch.Tensor],
+        layer_idx: int,
+    ) -> List[torch.Tensor]:
+        if len(residuals) != len(attention_contexts):
+            raise ValueError("residuals and attention_contexts must have the same length")
+        outputs = []
+        for residual, attention_context in zip(residuals, attention_contexts):
+            outputs.append(self.finish_layer(residual, attention_context, layer_idx))
+        return outputs
 
     def _finish_opt_layer(self, residual: torch.Tensor, attn_output: torch.Tensor, layer_idx: int) -> torch.Tensor:
         layer = self.layers[layer_idx]
@@ -362,6 +518,16 @@ class CausalModelAdapter:
         hidden = layernorm_input + layer.mlp(layernorm_output)
         return hidden.detach().cpu()
 
+    def _finish_llama_layer(self, residual: torch.Tensor, attn_output: torch.Tensor, layer_idx: int) -> torch.Tensor:
+        layer = self.layers[layer_idx]
+        hidden = layer.self_attn.o_proj(attn_output)
+        hidden = residual + hidden
+        residual_mlp = hidden
+        hidden = layer.post_attention_layernorm(hidden)
+        hidden = layer.mlp(hidden)
+        hidden = residual_mlp + hidden
+        return hidden.detach().cpu()
+
     def sample_next_token(self, hidden_state: torch.Tensor) -> int:
         hidden = hidden_state.to(self.device)
         if self.model_type == "opt":
@@ -370,11 +536,21 @@ class CausalModelAdapter:
                 hidden = final_norm(hidden)
         elif self.model_type == "qwen":
             hidden = self.backbone.ln_f(hidden)
+        elif self.model_type == "llama":
+            hidden = self.backbone.norm(hidden)
         else:
             raise ValueError(f"Unsupported model type for sample_next_token: {self.model_type}")
 
         logits = self.model.lm_head(hidden)
         return int(torch.argmax(logits[:, -1, :], dim=-1).item())
+
+    def sample_next_token_batch(self, hidden_states: List[torch.Tensor]) -> List[int]:
+        if not hidden_states:
+            return []
+        tokens = []
+        for hidden_state in hidden_states:
+            tokens.append(self.sample_next_token(hidden_state))
+        return tokens
 
     def decode_tokens(self, token_ids: List[int]) -> str:
         return self.tokenizer.decode(token_ids, skip_special_tokens=True)
@@ -399,6 +575,8 @@ class CausalModelAdapter:
             generated_ids = [first_token_id]
             current_token_id = first_token_id
             past_key_values = outputs.past_key_values
+            if hasattr(past_key_values, "to_legacy_cache"):
+                past_key_values = past_key_values.to_legacy_cache()
 
             for step in range(1, max_new_tokens):
                 total_len = prompt_len + step
@@ -411,6 +589,8 @@ class CausalModelAdapter:
                 outputs = self.model(**decode_inputs)
                 current_token_id = int(torch.argmax(outputs.logits[:, -1, :], dim=-1).item())
                 past_key_values = outputs.past_key_values
+                if hasattr(past_key_values, "to_legacy_cache"):
+                    past_key_values = past_key_values.to_legacy_cache()
                 generated_ids.append(current_token_id)
 
         finished_at = time.perf_counter()

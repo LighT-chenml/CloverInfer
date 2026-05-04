@@ -9,6 +9,7 @@ The current correctness-first path uses **Ray** for orchestration and transport.
 ### 1. Disaggregated Architecture
 *   **Prefill-Decoding Separation**: Dedicated `PrefillNode` actors handle prompt processing and initial KV generation.
 *   **Dense-Attention Decode Split**: `DecodeDenseNode` handles embeddings, QKV projection, output projection, FFN, and LM head. `AttentionNode` owns KV cache and attention computation.
+*   **Scheduler-Driven Continuous Decode Batching**: Active decode requests are advanced in shared wavefront batches that move back and forth between Dense and Attention at each layer.
 *   **PIM-Ready Attention Backend**: The attention node currently uses a CPU reference backend. A PIM backend can be added behind the same node interface.
 
 ### 2. High-Performance Kernels
@@ -94,6 +95,39 @@ ray.get(scheduler.initialize_cluster.remote())
 # Submit Request
 ray.get(scheduler.submit_request.remote("Hello, CloverInfer!"))
 ```
+
+## Decode Execution
+
+The decode path is scheduler-driven rather than request-local:
+
+1. prefill computes prompt KV and the first token
+2. the request joins a shared decode queue
+3. the scheduler advances a continuous batch through:
+   - `DecodeDenseNode.start_token_batch`
+   - `DecodeDenseNode.prepare_attention_batch`
+   - `AttentionNode.decode_layer_batch`
+   - `DecodeDenseNode.finish_layer_batch`
+   - `DecodeDenseNode.sample_next_token_batch`
+
+This means a decode iteration now runs as a Dense/Attention wavefront batch,
+instead of batching only the attention hop.
+
+## Metrics
+
+`submit_request(..., return_metrics=True)` returns request metrics including:
+
+*   `ttft`
+*   `tpot`
+*   `latency`
+*   `throughput`
+*   `total_tokens`
+
+The metrics payload also exposes scheduler batch stats such as:
+
+*   `scheduler_dense_continuous_batching`
+*   `scheduler_attention_batching`
+*   `scheduler_decode_step_sync`
+*   `scheduler_attention_layer_barrier`
 
 ## Status ⚠️
 This project is currently in a **Research Preview** state.

@@ -110,12 +110,15 @@ def make_scheduler(args, attention_backend: str, mixed_heads: int) -> ray.actor.
         attention_resource="attention_pim",
         use_gpu_for_prefill=True,
         use_gpu_for_decode_dense=True,
+        prefill_gpu_fraction=args.prefill_gpu_fraction,
+        decode_dense_gpu_fraction=args.decode_dense_gpu_fraction,
         attention_backend=attention_backend,
         pim_num_dpus=args.pim_num_dpus,
         pim_qk_mixed_enabled=args.pim_qk_mixed_enabled,
         pim_qk_mixed_heads=mixed_heads,
         pim_qk_mixed_window=args.pim_qk_mixed_window,
         pim_length=args.pim_length,
+        decode_continuous_batch_max_size=args.decode_continuous_batch_max_size,
     )
     model = ModelConfig(model_path=args.model, max_new_tokens=args.max_new_tokens)
     return GlobalScheduler.remote(cluster, model)
@@ -220,6 +223,9 @@ def main():
     parser.add_argument("--pim-qk-mixed-window", type=int, default=128)
     parser.add_argument("--pim-num-dpus", type=int, default=4)
     parser.add_argument("--pim-length", type=int, default=128)
+    parser.add_argument("--prefill-gpu-fraction", type=float, default=1.0)
+    parser.add_argument("--decode-dense-gpu-fraction", type=float, default=1.0)
+    parser.add_argument("--decode-continuous-batch-max-size", type=int, default=8)
     parser.add_argument(
         "--output",
         default=os.path.join(REPO_ROOT, "artifacts", "attention_sweep.jsonl"),
