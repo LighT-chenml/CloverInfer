@@ -358,3 +358,45 @@ This is the current bridge between:
 - the user requirement that most QK/AV work should live on DPU
 - and the observed reality that naive “spread wider across more DPUs” currently
   hurts throughput
+
+### 2026-05-05 128-DPU Locality Follow-up
+
+The first two `128 DPU` locality experiments established the two failure modes
+we need to avoid:
+
+- too-wide request placement
+  - a request stripe that effectively spans all `128` DPUs keeps per-DPU KV
+    pressure low
+  - but each decode wave touches nearly the whole machine, so helper
+    launch/set-construction overhead dominates
+- too-narrow request placement
+  - aggressively compacting each request down to about `6` active DPUs did cut
+    fan-out sharply and usually stayed inside `1` active rank per AV round
+  - but too many resident groups then stacked onto each active DPU, so
+    `av_rounds_total` jumped from about `135` to about `244`
+
+That means the next placement target is the middle ground:
+
+- prefer a single physical rank when possible
+- use a medium-width stripe inside that rank
+- keep enough width that same-layer groups can still spread across multiple
+  DPUs instead of serializing behind one tiny hot set
+
+The implementation follow-up therefore changes request stripe selection from:
+
+- primarily capacity-driven shrinking
+
+to:
+
+- capacity floor plus a minimum parallel width derived from resident
+  head-group count
+- rank-aware stripe construction using helper topology when available
+- stripe-local rotation so different layers do not all pin their first groups
+  to the same few DPUs
+
+The success criterion for this next round is not “minimum touched DPUs at any
+cost”, but:
+
+- fewer touched DPUs than the old full-width `128 DPU` path
+- fewer helper rounds than the over-compact path
+- recovered or improved throughput with stable TTFT / TPOT

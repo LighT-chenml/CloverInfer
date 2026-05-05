@@ -363,8 +363,7 @@ class PimNaiveAttentionBackend:
         if preferred_dpu_stripe:
             normalized = [int(physical_dpu) % self.num_dpus for physical_dpu in preferred_dpu_stripe]
             if normalized:
-                stripe_rotation = dpu_rotation % len(normalized)
-                return normalized[(group_idx + stripe_rotation) % len(normalized)]
+                return normalized[group_idx % len(normalized)]
         if self.dpu_placement_policy == "rotated":
             return (group_idx + dpu_rotation) % self.num_dpus
         if self.dpu_placement_policy == "rank_spread":
@@ -461,52 +460,27 @@ class PimNaiveAttentionBackend:
             return [0]
         if not initial_kv:
             return [0]
+        total_groups = 0
         total_live_elems = 0
         max_layer_groups = 1
         for layer in initial_kv:
             layer_key = layer["key"]
             seq_len, num_heads, head_dim = (int(dim) for dim in layer_key.shape)
             group_count = self._effective_head_group_count(seq_len, num_heads, head_dim)
+            total_groups += group_count
             max_layer_groups = max(max_layer_groups, group_count)
             total_live_elems += int(seq_len) * int(num_heads) * int(head_dim)
 
+        if total_groups <= 0:
+            total_groups = 1
         request_hash = sum(ord(ch) for ch in request_id)
-        min_dpus_by_capacity = max(
+        base_dpu = request_hash % self.num_dpus
+        approx_dpus_by_capacity = max(
             1,
             math.ceil(float(total_live_elems) / float(max(self.resident_store.POOL_CAPACITY_ELEMS, 1))),
         )
-        # The last compact experiment proved that capacity-only shrinking makes
-        # requests local, but can overload a tiny subset of DPUs and explode the
-        # number of helper rounds. Aim for a medium-width stripe:
-        # - narrow enough to keep batched rounds inside one rank when possible
-        # - wide enough to spread same-layer groups across several DPUs
-        if max_layer_groups <= 2:
-            target_medium_width = 4
-        elif max_layer_groups <= 4:
-            target_medium_width = 8
-        elif max_layer_groups <= 8:
-            target_medium_width = 12
-        else:
-            target_medium_width = 16
-        stripe_width = max(min_dpus_by_capacity, target_medium_width)
+        stripe_width = max(max_layer_groups, approx_dpus_by_capacity)
         stripe_width = min(self.num_dpus, max(1, stripe_width))
-
-        rank_groups: List[List[int]] = []
-        if hasattr(self.resident_store, "get_rank_groups"):
-            rank_groups = self.resident_store.get_rank_groups()
-        if rank_groups:
-            ranked_groups = sorted(rank_groups, key=lambda group: (len(group), group[0] if group else 0))
-            rank_idx = request_hash % len(ranked_groups)
-            target_rank = ranked_groups[rank_idx]
-            if target_rank:
-                stripe_width = min(stripe_width, len(target_rank))
-                base_offset = (request_hash // max(1, len(ranked_groups))) % len(target_rank)
-                return [
-                    int(target_rank[(base_offset + offset) % len(target_rank)])
-                    for offset in range(stripe_width)
-                ]
-
-        base_dpu = request_hash % self.num_dpus
         return [(base_dpu + offset) % self.num_dpus for offset in range(stripe_width)]
 
     def _build_request_state(

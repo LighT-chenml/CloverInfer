@@ -60,6 +60,7 @@ class ClusterConfig(BaseModel):
     attention_actor_side_batching_enabled: bool = False
     attention_actor_batch_window_s: float = 0.001
     attention_actor_batch_max_size: int = 8
+    decode_continuous_batch_window_s: float = 0.0
     decode_continuous_batch_max_size: int = 8
 
 class ModelConfig(BaseModel):

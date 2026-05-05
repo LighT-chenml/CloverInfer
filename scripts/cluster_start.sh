@@ -6,7 +6,12 @@ source "${SCRIPT_DIR}/cluster_env.sh"
 
 echo "Stopping any existing Ray processes..."
 RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL="${RAY_VERSION_MATCH_LEVEL}" bash -lc "${RAY_CMD} stop --force" >/dev/null 2>&1 || true
-ssh_remote "${PREFILL_IP}" "RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=${RAY_VERSION_MATCH_LEVEL} ${PREFILL_RAY_CMD} stop --force >/dev/null 2>&1 || true"
+if [[ "${DECODE_DENSE_IP}" != "${HEAD_IP}" ]]; then
+  ssh_remote "${DECODE_DENSE_IP}" "RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=${RAY_VERSION_MATCH_LEVEL} ${DECODE_DENSE_RAY_CMD} stop --force >/dev/null 2>&1 || true"
+fi
+if [[ "${PREFILL_IP}" != "${HEAD_IP}" && "${PREFILL_IP}" != "${DECODE_DENSE_IP}" ]]; then
+  ssh_remote "${PREFILL_IP}" "RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=${RAY_VERSION_MATCH_LEVEL} ${PREFILL_RAY_CMD} stop --force >/dev/null 2>&1 || true"
+fi
 ssh_remote "${ATTENTION_IP}" "RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=${RAY_VERSION_MATCH_LEVEL} ${ATTENTION_RAY_CMD} stop --force >/dev/null 2>&1 || true"
 
 echo "Starting Ray head on ${HEAD_IP}..."
@@ -16,14 +21,14 @@ RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL="${RAY_VERSION_MATCH_LEVEL}" bash -lc "${
   --dashboard-host=0.0.0.0 \
   --dashboard-port=${DASHBOARD_PORT} \
   --num-gpus=1 \
-  --resources='{\"decode_dense_gpu\": 1}'"
-
-echo "Starting prefill GPU worker on ${PREFILL_IP}..."
-ssh_remote "${PREFILL_IP}" "cd ${PROJECT_DIR} && RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=${RAY_VERSION_MATCH_LEVEL} ${PREFILL_RAY_CMD} start \
-  --address=${RAY_ADDRESS} \
-  --node-ip-address=${PREFILL_IP} \
-  --num-gpus=1 \
   --resources='{\"prefill_gpu\": 1}'"
+
+echo "Starting decode dense GPU worker on ${DECODE_DENSE_IP}..."
+ssh_remote "${DECODE_DENSE_IP}" "cd ${PROJECT_DIR} && RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=${RAY_VERSION_MATCH_LEVEL} ${DECODE_DENSE_RAY_CMD} start \
+  --address=${RAY_ADDRESS} \
+  --node-ip-address=${DECODE_DENSE_IP} \
+  --num-gpus=1 \
+  --resources='{\"decode_dense_gpu\": 1}'"
 
 echo "Starting attention CPU/PIM worker on ${ATTENTION_IP}..."
 ssh_remote "${ATTENTION_IP}" "cd ${PROJECT_DIR} && RAY_DEFAULT_PYTHON_VERSION_MATCH_LEVEL=${RAY_VERSION_MATCH_LEVEL} ${ATTENTION_RAY_CMD} start \

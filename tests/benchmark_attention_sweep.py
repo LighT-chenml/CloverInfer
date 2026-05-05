@@ -112,6 +112,7 @@ def make_scheduler(args, attention_backend: str, mixed_heads: int) -> ray.actor.
         use_gpu_for_decode_dense=True,
         prefill_gpu_fraction=args.prefill_gpu_fraction,
         decode_dense_gpu_fraction=args.decode_dense_gpu_fraction,
+        decode_continuous_batch_window_s=args.decode_continuous_batch_window_ms / 1000.0,
         attention_backend=attention_backend,
         pim_num_dpus=args.pim_num_dpus,
         pim_qk_mixed_enabled=args.pim_qk_mixed_enabled,
@@ -225,6 +226,7 @@ def main():
     parser.add_argument("--pim-length", type=int, default=128)
     parser.add_argument("--prefill-gpu-fraction", type=float, default=1.0)
     parser.add_argument("--decode-dense-gpu-fraction", type=float, default=1.0)
+    parser.add_argument("--decode-continuous-batch-window-ms", type=float, default=0.0)
     parser.add_argument("--decode-continuous-batch-max-size", type=int, default=8)
     parser.add_argument(
         "--output",

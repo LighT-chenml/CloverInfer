@@ -273,7 +273,7 @@ def main():
     parser.add_argument(
         "--pim-dpu-placement-policy",
         default="rotated",
-        choices=["identity", "rotated"],
+        choices=["identity", "rotated", "rank_spread", "load_aware"],
     )
     parser.add_argument("--pim-resident-kv-dtype", default="fp32", choices=["fp32", "fp16"])
     parser.add_argument("--pim-qk-full-enabled", action="store_true")

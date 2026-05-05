@@ -426,7 +426,7 @@ def main():
     parser.add_argument(
         "--pim-dpu-placement-policy",
         default="rotated",
-        choices=["identity", "rotated", "rank_spread"],
+        choices=["identity", "rotated", "rank_spread", "load_aware"],
     )
     parser.add_argument(
         "--clover-pim-rank-spread-alloc-experimental-enabled",

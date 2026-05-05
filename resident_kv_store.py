@@ -92,9 +92,6 @@ class ResidentKVStore:
     ) -> list[torch.Tensor]:
         raise NotImplementedError
 
-    def get_rank_groups(self) -> list[list[int]]:
-        return []
-
 
 class _KVSlotHelperClient:
     MAGIC = 0x4B56534C
@@ -1138,32 +1135,6 @@ class UpmemKVSlotStore(ResidentKVStore):
         if item is None:
             return None
         return int(item.get("rank_id", 0))
-
-    def _ensure_topology_cache(self) -> None:
-        if self._helper_topology_cache:
-            return
-        try:
-            helper_topology = self.helper.get_topology()
-        except Exception:
-            self._helper_topology_cache = {}
-            return
-        self._helper_topology_cache = {
-            int(item["logical_dpu_id"]): {
-                "rank_index": int(item["rank_index"]),
-                "rank_id": int(item["rank_id"]),
-            }
-            for item in helper_topology.get("items", [])
-        }
-
-    def get_rank_groups(self) -> list[list[int]]:
-        self._ensure_topology_cache()
-        if not self._helper_topology_cache:
-            return []
-        by_rank: Dict[int, list[int]] = {}
-        for physical_dpu, item in self._helper_topology_cache.items():
-            rank_index = int(item.get("rank_index", 0))
-            by_rank.setdefault(rank_index, []).append(int(physical_dpu))
-        return [sorted(items) for _, items in sorted(by_rank.items()) if items]
 
     def _record_timing(self, name: str, started_at: float) -> None:
         self.op_timing_totals_s[name] += float(time.perf_counter() - started_at)

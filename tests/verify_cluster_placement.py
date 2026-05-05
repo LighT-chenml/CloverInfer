@@ -55,8 +55,8 @@ def parse_args():
     parser.add_argument("--attention-rpc-batch-max-size", type=int, default=8)
     parser.add_argument("--attention-actor-batch-window-s", type=float, default=0.001)
     parser.add_argument("--attention-actor-batch-max-size", type=int, default=8)
-    parser.add_argument("--expected-prefill-ip", default="192.168.123.3")
-    parser.add_argument("--expected-dense-ip", default="192.168.123.4")
+    parser.add_argument("--expected-prefill-ip", default="192.168.123.4")
+    parser.add_argument("--expected-dense-ip", default="192.168.123.3")
     parser.add_argument("--expected-attention-ip", default="192.168.123.7")
     return parser.parse_args()
 

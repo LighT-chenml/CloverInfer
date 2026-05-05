@@ -41,6 +41,26 @@ def main():
     parser.add_argument("--dtype", type=str, default="float16")
     parser.add_argument("--pim-num-dpus", type=int, default=4)
     parser.add_argument("--pim-length", type=int, default=128)
+    parser.add_argument(
+        "--pim-resident-store-backend",
+        type=str,
+        default="host",
+        choices=["host", "upmem_kvslot"],
+    )
+    parser.add_argument(
+        "--pim-dpu-placement-policy",
+        type=str,
+        default="rotated",
+        choices=["identity", "rotated", "rank_spread", "load_aware"],
+    )
+    parser.add_argument("--pim-qk-full-enabled", action="store_true")
+    parser.add_argument("--no-pim-qk-full-enabled", action="store_true")
+    parser.add_argument("--pim-qk-full-shadow-check", action="store_true")
+    parser.add_argument("--no-pim-qk-full-shadow-check", action="store_true")
+    parser.add_argument("--pim-softmax-av-fused-enabled", action="store_true")
+    parser.add_argument("--no-pim-softmax-av-fused-enabled", action="store_true")
+    parser.add_argument("--pim-softmax-av-shadow-check", action="store_true")
+    parser.add_argument("--no-pim-softmax-av-shadow-check", action="store_true")
     parser.add_argument("--pim-qk-mixed-enabled", action="store_true")
     parser.add_argument("--no-pim-qk-mixed-enabled", action="store_true")
     parser.add_argument("--pim-qk-mixed-heads", type=int, default=2)
@@ -55,6 +75,7 @@ def main():
     parser.add_argument("--clover-shadow-check-layer-interval", type=int, default=4)
     parser.add_argument("--clover-host-qk-mixed-enabled", action="store_true")
     parser.add_argument("--no-clover-host-qk-mixed-enabled", action="store_true")
+    parser.add_argument("--decode-continuous-batch-window-ms", type=float, default=0.0)
     parser.add_argument("--decode-continuous-batch-max-size", type=int, default=8)
     parser.add_argument("--sequential", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
@@ -66,6 +87,18 @@ def main():
         raise ValueError("cannot set both --use-gpu-for-decode-dense and --no-gpu-for-decode-dense")
     if args.pim_qk_mixed_enabled and args.no_pim_qk_mixed_enabled:
         raise ValueError("cannot set both --pim-qk-mixed-enabled and --no-pim-qk-mixed-enabled")
+    if args.pim_qk_full_enabled and args.no_pim_qk_full_enabled:
+        raise ValueError("cannot set both --pim-qk-full-enabled and --no-pim-qk-full-enabled")
+    if args.pim_qk_full_shadow_check and args.no_pim_qk_full_shadow_check:
+        raise ValueError("cannot set both --pim-qk-full-shadow-check and --no-pim-qk-full-shadow-check")
+    if args.pim_softmax_av_fused_enabled and args.no_pim_softmax_av_fused_enabled:
+        raise ValueError(
+            "cannot set both --pim-softmax-av-fused-enabled and --no-pim-softmax-av-fused-enabled"
+        )
+    if args.pim_softmax_av_shadow_check and args.no_pim_softmax_av_shadow_check:
+        raise ValueError(
+            "cannot set both --pim-softmax-av-shadow-check and --no-pim-softmax-av-shadow-check"
+        )
     if args.clover_cpu_shadow_enabled and args.no_clover_cpu_shadow_enabled:
         raise ValueError("cannot set both --clover-cpu-shadow-enabled and --no-clover-cpu-shadow-enabled")
     if args.clover_shadow_checks_enabled and args.no_clover_shadow_checks_enabled:
@@ -87,11 +120,37 @@ def main():
     elif args.use_gpu_for_decode_dense:
         use_gpu_for_decode_dense = True
 
-    pim_qk_mixed_enabled = True
+    # This benchmark is used primarily for throughput comparisons, so keep the
+    # mixed-head QK shadow path opt-in instead of on by default.
+    pim_qk_mixed_enabled = False
     if args.no_pim_qk_mixed_enabled:
         pim_qk_mixed_enabled = False
     elif args.pim_qk_mixed_enabled:
         pim_qk_mixed_enabled = True
+
+    pim_qk_full_enabled = False
+    if args.no_pim_qk_full_enabled:
+        pim_qk_full_enabled = False
+    elif args.pim_qk_full_enabled:
+        pim_qk_full_enabled = True
+
+    pim_qk_full_shadow_check = True
+    if args.no_pim_qk_full_shadow_check:
+        pim_qk_full_shadow_check = False
+    elif args.pim_qk_full_shadow_check:
+        pim_qk_full_shadow_check = True
+
+    pim_softmax_av_fused_enabled = False
+    if args.no_pim_softmax_av_fused_enabled:
+        pim_softmax_av_fused_enabled = False
+    elif args.pim_softmax_av_fused_enabled:
+        pim_softmax_av_fused_enabled = True
+
+    pim_softmax_av_shadow_check = True
+    if args.no_pim_softmax_av_shadow_check:
+        pim_softmax_av_shadow_check = False
+    elif args.pim_softmax_av_shadow_check:
+        pim_softmax_av_shadow_check = True
 
     clover_cpu_shadow_enabled = True
     if args.no_clover_cpu_shadow_enabled:
@@ -147,6 +206,12 @@ def main():
         attention_backend=args.attention_backend,
         pim_num_dpus=args.pim_num_dpus,
         pim_length=args.pim_length,
+        pim_resident_store_backend=args.pim_resident_store_backend,
+        pim_dpu_placement_policy=args.pim_dpu_placement_policy,
+        pim_qk_full_enabled=pim_qk_full_enabled,
+        pim_qk_full_shadow_check=pim_qk_full_shadow_check,
+        pim_softmax_av_fused_enabled=pim_softmax_av_fused_enabled,
+        pim_softmax_av_shadow_check=pim_softmax_av_shadow_check,
         pim_qk_mixed_enabled=pim_qk_mixed_enabled,
         pim_qk_mixed_heads=args.pim_qk_mixed_heads,
         pim_qk_mixed_window=args.pim_qk_mixed_window,
@@ -156,6 +221,7 @@ def main():
         clover_shadow_check_token_interval=args.clover_shadow_check_token_interval,
         clover_shadow_check_layer_interval=args.clover_shadow_check_layer_interval,
         clover_host_qk_mixed_enabled=clover_host_qk_mixed_enabled,
+        decode_continuous_batch_window_s=args.decode_continuous_batch_window_ms / 1000.0,
         decode_continuous_batch_max_size=args.decode_continuous_batch_max_size,
     )
     model_conf = ModelConfig(
@@ -252,12 +318,29 @@ def main():
         avg_tpot = sum(total_metrics["tpot"]) / len(total_metrics["tpot"])
         avg_latency = sum(total_metrics["latency"]) / len(total_metrics["latency"])
         avg_throughput = sum(total_metrics["throughput"]) / len(total_metrics["throughput"])
+        attention_before_free = results[-1]["metrics"].get("attention_backend_before_free", {}) if results else {}
+        backend_debug = attention_before_free.get("backend_debug", {})
+        resident_store_debug = backend_debug.get("resident_store_debug", {})
         
         print("\nBenchmark Results Summary:")
         print(f"Average Latency: {avg_latency:.4f} s")
         print(f"Average TTFT:    {avg_ttft:.4f} s")
         print(f"Average TPOT:    {avg_tpot:.4f} s")
         print(f"Avg Throughput:  {avg_throughput:.2f} tokens/s")
+        if resident_store_debug:
+            print("\nResident Store Summary:")
+            print(
+                json.dumps(
+                    {
+                        "placement_policy": resident_store_debug.get("placement_policy", ""),
+                        "allocator_summary": resident_store_debug.get("allocator_summary", {}),
+                        "dpu_balance_summary": resident_store_debug.get("dpu_balance_summary", {}),
+                        "rank_balance_summary": resident_store_debug.get("rank_balance_summary", {}),
+                        "block_summary": resident_store_debug.get("block_summary", {}),
+                    },
+                    ensure_ascii=False,
+                )
+            )
     else:
         print("\nNo metrics collected.")
 

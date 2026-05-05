@@ -313,8 +313,65 @@ class CausalModelAdapter:
             hidden = self.backbone.wte(input_ids)
             hidden = self.backbone.drop(hidden)
             return hidden.detach().cpu()
+        if self.model_type == "llama":
+            hidden = self.backbone.embed_tokens(input_ids)
+            return hidden.detach().cpu()
 
         raise ValueError(f"Unsupported model type for start_token_batch: {self.model_type}")
+
+    def _normalize_singleton_tensor_container(
+        self,
+        value,
+        *,
+        name: str,
+    ) -> torch.Tensor:
+        while isinstance(value, (list, tuple)):
+            if len(value) != 1:
+                raise TypeError(
+                    f"{name} must be a tensor or singleton container, got {type(value).__name__}"
+                    f" with length {len(value)}"
+                )
+            value = value[0]
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"{name} must resolve to torch.Tensor, got {type(value).__name__}")
+        if value.dim() == 1:
+            value = value.view(1, 1, -1)
+        elif value.dim() == 2:
+            value = value.unsqueeze(1)
+        return value
+
+    def _normalize_hidden_state_batch(
+        self,
+        hidden_states,
+        *,
+        expected_size: int,
+    ) -> List[torch.Tensor]:
+        if isinstance(hidden_states, torch.Tensor):
+            if hidden_states.size(0) != expected_size:
+                raise ValueError(
+                    f"hidden_states batch size mismatch: expected {expected_size},"
+                    f" got tensor batch {hidden_states.size(0)}"
+                )
+            return [
+                self._normalize_singleton_tensor_container(
+                    hidden_states[idx : idx + 1],
+                    name=f"hidden_states[{idx}]",
+                )
+                for idx in range(expected_size)
+            ]
+
+        if len(hidden_states) != expected_size:
+            raise ValueError(
+                f"hidden_states batch size mismatch: expected {expected_size},"
+                f" got {len(hidden_states)}"
+            )
+        return [
+            self._normalize_singleton_tensor_container(
+                hidden_state,
+                name=f"hidden_states[{idx}]",
+            )
+            for idx, hidden_state in enumerate(hidden_states)
+        ]
 
     def prepare_attention(
         self,
@@ -324,7 +381,10 @@ class CausalModelAdapter:
         context_len: int,
     ) -> Dict[str, object]:
         del request_id
-        hidden = hidden_state.to(self.device)
+        hidden = self._normalize_singleton_tensor_container(
+            hidden_state,
+            name=f"prepare_attention(layer={layer_idx}) hidden_state",
+        ).to(self.device)
 
         if self.model_type == "opt":
             return self._prepare_opt_attention(hidden, layer_idx)
@@ -343,8 +403,16 @@ class CausalModelAdapter:
     ) -> List[Dict[str, object]]:
         if len(hidden_states) != len(request_ids) or len(hidden_states) != len(context_lens):
             raise ValueError("hidden_states, request_ids, and context_lens must have the same length")
+        normalized_hidden_states = self._normalize_hidden_state_batch(
+            hidden_states,
+            expected_size=len(request_ids),
+        )
         outputs = []
-        for hidden_state, request_id, context_len in zip(hidden_states, request_ids, context_lens):
+        for hidden_state, request_id, context_len in zip(
+            normalized_hidden_states,
+            request_ids,
+            context_lens,
+        ):
             outputs.append(self.prepare_attention(hidden_state, layer_idx, request_id, context_len))
         return outputs
 
@@ -529,7 +597,10 @@ class CausalModelAdapter:
         return hidden.detach().cpu()
 
     def sample_next_token(self, hidden_state: torch.Tensor) -> int:
-        hidden = hidden_state.to(self.device)
+        hidden = self._normalize_singleton_tensor_container(
+            hidden_state,
+            name="sample_next_token hidden_state",
+        ).to(self.device)
         if self.model_type == "opt":
             final_norm = getattr(self.backbone, "final_layer_norm", None)
             if final_norm is not None:
@@ -547,8 +618,12 @@ class CausalModelAdapter:
     def sample_next_token_batch(self, hidden_states: List[torch.Tensor]) -> List[int]:
         if not hidden_states:
             return []
+        normalized_hidden_states = self._normalize_hidden_state_batch(
+            hidden_states,
+            expected_size=len(hidden_states),
+        )
         tokens = []
-        for hidden_state in hidden_states:
+        for hidden_state in normalized_hidden_states:
             tokens.append(self.sample_next_token(hidden_state))
         return tokens
 

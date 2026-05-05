@@ -6,7 +6,6 @@ from collections import deque
 from typing import Dict, List
 
 import ray
-from ray.runtime_context import get_runtime_context
 
 from .config import ClusterConfig, ModelConfig
 from .nodes import AttentionNode, DecodeDenseNode, PrefillNode
@@ -104,14 +103,22 @@ class GlobalScheduler:
         self._attention_wavefront_tasks: dict[tuple[int, int], asyncio.Task] = {}
         self._attention_wavefront_expected_sizes: dict[tuple[int, int], int] = {}
         self._active_decode_requests = 0
+        self.decode_continuous_batch_window_s = max(
+            0.0, float(getattr(cluster_config, "decode_continuous_batch_window_s", 0.0))
+        )
         self.decode_continuous_batch_max_size = max(
             1, int(getattr(cluster_config, "decode_continuous_batch_max_size", 8))
         )
         self.decode_continuous_batch_flushes = 0
         self.decode_continuous_batch_total_items = 0
         self.decode_continuous_batch_max_observed = 0
+        self.decode_continuous_batch_target_flushes = 0
+        self.decode_continuous_batch_window_flushes = 0
+        self.decode_continuous_batch_immediate_flushes = 0
+        self.decode_continuous_batch_wait_s = 0.0
         self._decode_pending_queue = deque()
         self._decode_driver_task: asyncio.Task | None = None
+        self._background_completion_tasks: set[asyncio.Task] = set()
 
     def _attention_batch_target_size(self) -> int:
         return max(1, min(self._active_decode_requests, self.attention_batch_max_size))
@@ -121,6 +128,25 @@ class GlobalScheduler:
 
     def _attention_layer_barrier_target_size(self) -> int:
         return max(1, min(self._active_decode_requests, self.attention_layer_barrier_max_size))
+
+    def _decode_continuous_batch_target_size(self) -> int:
+        return max(1, min(self._active_decode_requests, self.decode_continuous_batch_max_size))
+
+    def _track_background_completion(self, coro):
+        task = asyncio.create_task(coro)
+        self._background_completion_tasks.add(task)
+
+        def _done_callback(done_task: asyncio.Task):
+            self._background_completion_tasks.discard(done_task)
+            try:
+                done_task.result()
+            except Exception:
+                # The completion coroutine is responsible for surfacing request-level
+                # failures to the waiting future. Swallow here so the decode loop can continue.
+                pass
+
+        task.add_done_callback(_done_callback)
+        return task
 
     def _new_decode_state(
         self,
@@ -155,6 +181,33 @@ class GlobalScheduler:
     async def _decode_driver_loop(self):
         try:
             while self._decode_pending_queue:
+                target_size = self._decode_continuous_batch_target_size()
+                flush_reason = "immediate"
+                waited_s = 0.0
+                if (
+                    self.decode_continuous_batch_window_s > 0
+                    and len(self._decode_pending_queue) < target_size
+                    and self._active_decode_requests > 1
+                ):
+                    wait_started = time.perf_counter()
+                    deadline = wait_started + self.decode_continuous_batch_window_s
+                    while (
+                        len(self._decode_pending_queue) < target_size
+                        and self._active_decode_requests > len(self._decode_pending_queue)
+                    ):
+                        remaining = deadline - time.perf_counter()
+                        if remaining <= 0:
+                            break
+                        await asyncio.sleep(min(remaining, 0.001))
+                    waited_s = time.perf_counter() - wait_started
+                    self.decode_continuous_batch_wait_s += waited_s
+                    if len(self._decode_pending_queue) >= target_size:
+                        flush_reason = "target"
+                    elif waited_s > 0:
+                        flush_reason = "window"
+                elif len(self._decode_pending_queue) >= target_size:
+                    flush_reason = "target"
+
                 batch_size = min(len(self._decode_pending_queue), self.decode_continuous_batch_max_size)
                 batch = [self._decode_pending_queue.popleft() for _ in range(batch_size)]
                 self.decode_continuous_batch_flushes += 1
@@ -163,6 +216,12 @@ class GlobalScheduler:
                     self.decode_continuous_batch_max_observed,
                     len(batch),
                 )
+                if flush_reason == "target":
+                    self.decode_continuous_batch_target_flushes += 1
+                elif flush_reason == "window":
+                    self.decode_continuous_batch_window_flushes += 1
+                else:
+                    self.decode_continuous_batch_immediate_flushes += 1
                 try:
                     await self._run_decode_wave(batch)
                 except Exception as exc:
@@ -498,7 +557,14 @@ class GlobalScheduler:
                 state["stage_timing"]["actors"]["dense_finish_layer_compute_s"] += float(
                     result.get("profile", {}).get("compute_s", 0.0)
                 )
-                next_hidden_states.append(result["hidden"])
+                hidden = result["hidden"]
+                if isinstance(hidden, list):
+                    if len(hidden) != 1:
+                        raise ValueError(
+                            f"finish_layer_batch returned unexpected hidden list length={len(hidden)}"
+                        )
+                    hidden = hidden[0]
+                next_hidden_states.append(hidden)
             hidden_states = next_hidden_states
 
         rpc_started = time.perf_counter()
@@ -523,7 +589,7 @@ class GlobalScheduler:
             max_tokens = int(state["max_tokens"])
             total_tokens = len(state["generated_ids"])
             if next_token == 2 or total_tokens >= max_tokens:
-                await self._complete_decode_state(state)
+                self._track_background_completion(self._complete_decode_state(state))
             else:
                 requeue_states.append(state)
 
@@ -554,17 +620,30 @@ class GlobalScheduler:
         stage_timing = state["stage_timing"]
         return_metrics = bool(state["return_metrics"])
 
-        attention_debug_before_free = None
+        attention_debug_before_free_ref = None
+        attention_debug_after_free_ref = None
+        attention_free_ref = None
         if return_metrics:
-            attention_debug_before_free = await attention.get_info.remote()
+            attention_debug_before_free_ref = attention.get_info.remote()
+            free_started = time.perf_counter()
+            attention_free_ref = attention.free_request.remote(request_id)
+            attention_debug_after_free_ref = attention.get_info.remote()
+        else:
+            free_started = time.perf_counter()
+            attention_free_ref = attention.free_request.remote(request_id)
 
-        rpc_started = time.perf_counter()
-        await attention.free_request.remote(request_id)
-        stage_timing["scheduler"]["free_request_rpc_s"] += time.perf_counter() - rpc_started
+        decode_started = time.perf_counter()
+        decode_result_ref = dense.decode_tokens.remote(state["generated_ids"])
 
-        rpc_started = time.perf_counter()
-        decode_result = await dense.decode_tokens.remote(state["generated_ids"])
-        stage_timing["scheduler"]["decode_tokens_rpc_s"] += time.perf_counter() - rpc_started
+        attention_debug_before_free = None
+        if attention_debug_before_free_ref is not None:
+            attention_debug_before_free = await attention_debug_before_free_ref
+
+        await attention_free_ref
+        stage_timing["scheduler"]["free_request_rpc_s"] += time.perf_counter() - free_started
+
+        decode_result = await decode_result_ref
+        stage_timing["scheduler"]["decode_tokens_rpc_s"] += time.perf_counter() - decode_started
         stage_timing["actors"]["dense_decode_tokens_compute_s"] += float(
             decode_result.get("profile", {}).get("compute_s", 0.0)
         )
@@ -630,14 +709,24 @@ class GlobalScheduler:
                 "pending": sum(len(batch) for batch in self._attention_layer_barrier_batches.values()),
             }
             metrics["scheduler_dense_continuous_batching"] = {
+                "window_s": float(self.decode_continuous_batch_window_s),
                 "max_size": int(self.decode_continuous_batch_max_size),
                 "flushes": int(self.decode_continuous_batch_flushes),
                 "total_items": int(self.decode_continuous_batch_total_items),
                 "max_observed_size": int(self.decode_continuous_batch_max_observed),
+                "target_flushes": int(self.decode_continuous_batch_target_flushes),
+                "window_flushes": int(self.decode_continuous_batch_window_flushes),
+                "immediate_flushes": int(self.decode_continuous_batch_immediate_flushes),
+                "wait_s": float(self.decode_continuous_batch_wait_s),
+                "target_size": int(self._decode_continuous_batch_target_size()),
                 "pending": len(self._decode_pending_queue),
             }
             metrics["attention_backend_before_free"] = attention_debug_before_free
-            metrics["attention_backend"] = await attention.get_info.remote()
+            metrics["attention_backend"] = (
+                await attention_debug_after_free_ref
+                if attention_debug_after_free_ref is not None
+                else await attention.get_info.remote()
+            )
             future.set_result((generated_text, metrics))
             return
 

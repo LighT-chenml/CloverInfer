@@ -122,7 +122,10 @@ def build_trace_row(
         "fallback_allocations": int(resident_store_debug.get("fallback_allocations", 0)),
         "dpu_allocate_failures": int(resident_store_debug.get("dpu_allocate_failures", 0)),
         "dpu_capacity_fallbacks": int(resident_store_debug.get("dpu_capacity_fallbacks", 0)),
-        "allocator_summary": summarize_allocator_stats(allocator_stats),
+        "allocator_summary": resident_store_debug.get("allocator_summary", summarize_allocator_stats(allocator_stats)),
+        "dpu_balance_summary": resident_store_debug.get("dpu_balance_summary", {}),
+        "rank_balance_summary": resident_store_debug.get("rank_balance_summary", {}),
+        "block_summary": resident_store_debug.get("block_summary", {}),
         "allocator_stats": allocator_stats,
     }
 
@@ -146,7 +149,11 @@ def main():
         default="balanced",
         choices=["legacy", "balanced", "coarse", "segment_aware"],
     )
-    parser.add_argument("--pim-dpu-placement-policy", default="rotated", choices=["identity", "rotated"])
+    parser.add_argument(
+        "--pim-dpu-placement-policy",
+        default="rotated",
+        choices=["identity", "rotated", "rank_spread", "load_aware"],
+    )
     parser.add_argument("--pim-resident-kv-dtype", default="fp32", choices=["fp32", "fp16"])
     parser.add_argument("--pim-resident-store-backend", default="upmem_kvslot", choices=["host", "upmem_kvslot"])
     parser.add_argument("--pim-qk-full-enabled", action="store_true")
@@ -387,6 +394,11 @@ def main():
                     "completion_index": completion_index,
                     "inflight_at_submit": meta["inflight_at_submit"],
                     **row["allocator_summary"],
+                    **{
+                        f"dpu_{key}": value
+                        for key, value in row.get("dpu_balance_summary", {}).items()
+                        if isinstance(value, (int, float))
+                    },
                 },
                 ensure_ascii=False,
             )
