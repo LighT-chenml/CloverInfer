@@ -52,6 +52,10 @@ class RequestState:
     num_layers: int
     layer_states: List[LayerState]
     preferred_dpu_stripe: List[int]
+    stripe_version: int = 0
+    stripe_expand_count: int = 0
+    last_stripe_update_reason: str = ""
+    last_stripe_width: int = 0
 
 
 class CpuAttentionBackend:
@@ -304,6 +308,12 @@ class PimNaiveAttentionBackend:
             "request_id": request_state.request_id,
             "context_len": int(request_state.context_len),
             "num_layers": int(request_state.num_layers),
+            "preferred_dpu_stripe": [int(physical_dpu) for physical_dpu in request_state.preferred_dpu_stripe],
+            "stripe_width": len(request_state.preferred_dpu_stripe),
+            "stripe_version": int(request_state.stripe_version),
+            "stripe_expand_count": int(request_state.stripe_expand_count),
+            "last_stripe_update_reason": request_state.last_stripe_update_reason,
+            "last_stripe_width": int(request_state.last_stripe_width),
             "live_elems": int(live_elems),
             "capacity_elems": int(capacity_elems),
             "per_dpu_live_elems": per_dpu_live_elems,
@@ -509,6 +519,76 @@ class PimNaiveAttentionBackend:
         base_dpu = request_hash % self.num_dpus
         return [(base_dpu + offset) % self.num_dpus for offset in range(stripe_width)]
 
+    def _medium_stripe_target_width(self, max_layer_groups: int) -> int:
+        if max_layer_groups <= 2:
+            return 4
+        if max_layer_groups <= 4:
+            return 8
+        if max_layer_groups <= 8:
+            return 12
+        return 16
+
+    def _max_layer_group_count_for_request(self, request_state: RequestState) -> int:
+        if not request_state.layer_states:
+            return 1
+        return max(1, max(len(layer_state.head_groups) for layer_state in request_state.layer_states))
+
+    def _rank_local_stripe_for_request(
+        self,
+        request_id: str,
+        stripe_width: int,
+    ) -> List[int]:
+        stripe_width = min(self.num_dpus, max(1, int(stripe_width)))
+        request_hash = sum(ord(ch) for ch in request_id)
+        rank_groups: List[List[int]] = []
+        if hasattr(self.resident_store, "get_rank_groups"):
+            rank_groups = self.resident_store.get_rank_groups()
+        if rank_groups:
+            ranked_groups = sorted(rank_groups, key=lambda group: (len(group), group[0] if group else 0))
+            rank_idx = request_hash % len(ranked_groups)
+            target_rank = ranked_groups[rank_idx]
+            if target_rank:
+                width = min(stripe_width, len(target_rank))
+                base_offset = (request_hash // max(1, len(ranked_groups))) % len(target_rank)
+                return [
+                    int(target_rank[(base_offset + offset) % len(target_rank)])
+                    for offset in range(width)
+                ]
+        base_dpu = request_hash % self.num_dpus
+        return [(base_dpu + offset) % self.num_dpus for offset in range(stripe_width)]
+
+    def _maybe_expand_request_stripe(self, request_state: RequestState) -> None:
+        if self.num_dpus <= 0 or not request_state.layer_states:
+            return
+        current_width = len(request_state.preferred_dpu_stripe)
+        if current_width <= 0:
+            return
+        max_layer_groups = self._max_layer_group_count_for_request(request_state)
+        target_width = self._medium_stripe_target_width(max_layer_groups)
+        growth_blocks = max(0, (int(request_state.context_len) - int(self.length)) // max(1, self.block_tokens))
+        if growth_blocks > 0:
+            target_width += min(8, growth_blocks * 2)
+        target_width = min(self.num_dpus, max(current_width, target_width))
+        if target_width <= current_width:
+            return
+        new_stripe = self._rank_local_stripe_for_request(request_state.request_id, target_width)
+        if len(new_stripe) <= current_width:
+            return
+        request_state.preferred_dpu_stripe = list(new_stripe)
+        request_state.stripe_version += 1
+        request_state.stripe_expand_count += 1
+        request_state.last_stripe_update_reason = (
+            f"context_len={request_state.context_len},max_layer_groups={max_layer_groups}"
+        )
+        request_state.last_stripe_width = len(new_stripe)
+        for layer_state in request_state.layer_states:
+            for group in layer_state.head_groups:
+                self.resident_store.update_group_allowed_dpus(
+                    group.k_slot,
+                    group.v_slot,
+                    request_state.preferred_dpu_stripe,
+                )
+
     def _build_request_state(
         self,
         request_id: str,
@@ -552,6 +632,10 @@ class PimNaiveAttentionBackend:
             num_layers=len(layer_states),
             layer_states=layer_states,
             preferred_dpu_stripe=preferred_dpu_stripe,
+            stripe_version=0,
+            stripe_expand_count=0,
+            last_stripe_update_reason="init",
+            last_stripe_width=len(preferred_dpu_stripe),
         )
 
     def _append_resident_kv(
@@ -561,6 +645,8 @@ class PimNaiveAttentionBackend:
         k_new: torch.Tensor,
         v_new: torch.Tensor,
     ) -> None:
+        if layer_idx == 0:
+            self._maybe_expand_request_stripe(request_state)
         layer_state = request_state.layer_states[layer_idx]
         expected_seq_len = request_state.context_len + 1
         for group in layer_state.head_groups:
@@ -1337,6 +1423,12 @@ class PimNaiveAttentionBackend:
                         "request_id": request_state.request_id,
                         "context_len": int(request_state.context_len),
                         "num_layers": int(request_state.num_layers),
+                        "preferred_dpu_stripe": [int(physical_dpu) for physical_dpu in request_state.preferred_dpu_stripe],
+                        "stripe_width": len(request_state.preferred_dpu_stripe),
+                        "stripe_version": int(request_state.stripe_version),
+                        "stripe_expand_count": int(request_state.stripe_expand_count),
+                        "last_stripe_update_reason": request_state.last_stripe_update_reason,
+                        "last_stripe_width": int(request_state.last_stripe_width),
                         "live_elems": int(footprint["live_elems"]),
                         "capacity_elems": int(footprint["capacity_elems"]),
                         "per_dpu_live_elems": footprint["per_dpu_live_elems"],

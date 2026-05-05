@@ -400,3 +400,40 @@ cost”, but:
 - fewer touched DPUs than the old full-width `128 DPU` path
 - fewer helper rounds than the over-compact path
 - recovered or improved throughput with stable TTFT / TPOT
+
+### 2026-05-05 Dynamic KV Placement Follow-up
+
+Static request placement helped find a better locality point, but it still has
+an obvious limitation:
+
+- stripe width is chosen only once at request init
+- later decode growth can make that stripe too narrow for the request's real
+  runtime footprint
+- widening every request up front hurts locality for shorter or colder requests
+
+The next implementation step therefore adds a first dynamic-KV mechanism:
+
+- append-time stripe expansion
+- no migration of existing KV blocks yet
+- only future block allocations can use the widened stripe
+
+This stage is intentionally conservative:
+
+1. keep old blocks in place
+   - avoids background migration complexity and correctness risk
+2. widen only when request growth justifies it
+   - use request context growth and resident group structure as the trigger
+3. apply widening through existing `allowed_dpus` control
+   - each resident group updates its allowed stripe
+   - later blocked appends can place new blocks on the wider stripe
+
+This gives us a usable intermediate point between:
+
+- purely static locality-aware placement
+- and full dynamic KV migration
+
+The expected benefit is:
+
+- short requests stay local
+- longer-running requests gain more DPU parallel headroom over time
+- continuous batching can react better to changing active-request pressure

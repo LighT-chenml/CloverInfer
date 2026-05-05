@@ -95,6 +95,17 @@ class ResidentKVStore:
     def get_rank_groups(self) -> list[list[int]]:
         return []
 
+    def update_group_allowed_dpus(
+        self,
+        k_slot: str,
+        v_slot: str,
+        allowed_dpus: list[int] | None,
+    ) -> Dict[str, object]:
+        return {
+            "updated": False,
+            "allowed_dpus": [] if allowed_dpus is None else [int(dpu) for dpu in allowed_dpus],
+        }
+
 
 class _KVSlotHelperClient:
     MAGIC = 0x4B56534C
@@ -909,6 +920,18 @@ class HostResidentKVStore(ResidentKVStore):
             "batch_item_totals": dict(self.batch_item_totals),
         }
 
+    def update_group_allowed_dpus(
+        self,
+        k_slot: str,
+        v_slot: str,
+        allowed_dpus: list[int] | None,
+    ) -> Dict[str, object]:
+        del k_slot, v_slot
+        return {
+            "updated": False,
+            "allowed_dpus": [] if allowed_dpus is None else [int(dpu) for dpu in allowed_dpus],
+        }
+
     def qk_scores_batch(self, queries: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
         q = queries.detach().cpu().to(torch.int32).contiguous()
         k = keys.detach().cpu().to(torch.int32).contiguous()
@@ -1164,6 +1187,35 @@ class UpmemKVSlotStore(ResidentKVStore):
             rank_index = int(item.get("rank_index", 0))
             by_rank.setdefault(rank_index, []).append(int(physical_dpu))
         return [sorted(items) for _, items in sorted(by_rank.items()) if items]
+
+    def update_group_allowed_dpus(
+        self,
+        k_slot: str,
+        v_slot: str,
+        allowed_dpus: list[int] | None,
+    ) -> Dict[str, object]:
+        key = self._slot_key(k_slot, v_slot)
+        slot_info = self.slot_mapping[key]
+        normalized = []
+        if allowed_dpus and self.num_dpus > 0:
+            normalized = sorted(
+                {
+                    int(physical_dpu) % self.num_dpus
+                    for physical_dpu in allowed_dpus
+                }
+            )
+        if slot_info["backend"] in {"dpu_segmented", "dpu_blocked"}:
+            slot_info["allowed_physical_dpus"] = list(normalized)
+            if normalized:
+                slot_info["base_physical_dpu"] = int(normalized[0])
+            return {
+                "updated": True,
+                "allowed_dpus": list(normalized),
+            }
+        return {
+            "updated": False,
+            "allowed_dpus": list(normalized),
+        }
 
     def _record_timing(self, name: str, started_at: float) -> None:
         self.op_timing_totals_s[name] += float(time.perf_counter() - started_at)
@@ -1950,6 +2002,11 @@ class UpmemKVSlotStore(ResidentKVStore):
                 "group_heads": int(slot_info["group_heads"]),
                 "head_dim": int(slot_info["head_dim"]),
                 "block_tokens": int(slot_info.get("block_tokens", self.block_tokens)),
+                "allowed_physical_dpus": [
+                    int(physical_dpu)
+                    for physical_dpu in slot_info.get("allowed_physical_dpus", [])
+                ],
+                "base_physical_dpu": int(slot_info.get("base_physical_dpu", slot_info.get("physical_dpu", 0))),
                 "block_count": len(blocks),
                 "blocks": [
                     {
