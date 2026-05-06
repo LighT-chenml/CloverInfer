@@ -10,4 +10,5 @@ python -m ray.scripts.scripts start \
   --address=192.168.123.4:26379 \
   --node-ip-address=192.168.123.3 \
   --num-gpus=1 \
-  --resources='{"decode_dense_gpu": 1}'
+  --resources='{"decode_dense_gpu": 1}' \
+  --block

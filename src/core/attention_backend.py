@@ -262,6 +262,9 @@ class PimNaiveAttentionBackend:
         self.resident_av_ops = 0
         self.resident_av_batch_calls = 0
         self.resident_av_shadow_max_abs_diff = 0.0
+        self.init_rank_locality_reuse_count = 0
+        self.init_rank_hash_fallback_count = 0
+        self.init_rank_last_reason = ""
         self._run_dot_smoke_test()
 
     def _shares_persistent_dpu_owner(self) -> bool:
@@ -320,6 +323,155 @@ class PimNaiveAttentionBackend:
             "per_dpu_capacity_elems": per_dpu_capacity_elems,
             "layers": layer_summaries,
         }
+
+    def _request_packing_hint(self, request_state: RequestState) -> Dict[str, object]:
+        stripe = [int(physical_dpu) for physical_dpu in request_state.preferred_dpu_stripe]
+        rank_index = None
+        if stripe and hasattr(self.resident_store, "_ensure_topology_cache") and hasattr(self.resident_store, "_topology_rank_index"):
+            try:
+                self.resident_store._ensure_topology_cache()
+                rank_index = self.resident_store._topology_rank_index(int(stripe[0]))
+            except Exception:
+                rank_index = None
+        return {
+            "context_len": int(request_state.context_len),
+            "preferred_dpu_stripe": stripe,
+            "stripe_width": len(stripe),
+            "rank_index": None if rank_index is None else int(rank_index),
+        }
+
+    def _request_hash(self, request_id: str) -> int:
+        return sum(ord(ch) for ch in str(request_id))
+
+    def _stripe_rank_index(self, stripe: List[int]) -> int | None:
+        if (
+            not stripe
+            or not hasattr(self.resident_store, "_ensure_topology_cache")
+            or not hasattr(self.resident_store, "_topology_rank_index")
+        ):
+            return None
+        try:
+            self.resident_store._ensure_topology_cache()
+            return self.resident_store._topology_rank_index(int(stripe[0]))
+        except Exception:
+            return None
+
+    def _active_request_rank_counts(self) -> Dict[int, int]:
+        counts: Dict[int, int] = {}
+        for request_state in self.request_states.values():
+            rank_index = self._stripe_rank_index(request_state.preferred_dpu_stripe)
+            if rank_index is None:
+                continue
+            counts[int(rank_index)] = counts.get(int(rank_index), 0) + 1
+        return counts
+
+    def _rank_groups_with_indices(self) -> List[tuple[int, List[int]]]:
+        if not hasattr(self.resident_store, "get_rank_groups"):
+            return []
+        rank_groups = self.resident_store.get_rank_groups()
+        rank_groups_with_indices: List[tuple[int, List[int]]] = []
+        for group in sorted(rank_groups, key=lambda item: (len(item), item[0] if item else 0)):
+            if not group:
+                continue
+            rank_index = self._stripe_rank_index([int(group[0])])
+            if rank_index is None:
+                continue
+            rank_groups_with_indices.append(
+                (
+                    int(rank_index),
+                    [int(physical_dpu) for physical_dpu in group],
+                )
+            )
+        return rank_groups_with_indices
+
+    def _active_request_rank_stripes(self, target_rank_index: int) -> List[List[int]]:
+        stripes: List[List[int]] = []
+        for request_state in self.request_states.values():
+            rank_index = self._stripe_rank_index(request_state.preferred_dpu_stripe)
+            if rank_index is None or int(rank_index) != int(target_rank_index):
+                continue
+            stripe = [int(physical_dpu) for physical_dpu in request_state.preferred_dpu_stripe]
+            if stripe:
+                stripes.append(stripe)
+        return stripes
+
+    def _request_shape_targets(
+        self,
+        initial_kv: List[Dict[str, torch.Tensor]],
+        decode_reserve_tokens: int = 0,
+    ) -> tuple[int, int, int]:
+        total_live_elems = 0
+        total_capacity_elems = 0
+        max_layer_groups = 1
+        reserve_tokens = max(0, int(decode_reserve_tokens))
+        base_rollover_tokens = int(getattr(self.resident_store, "base_block_rollover_tokens", 0))
+        growth_block_tokens = int(getattr(self.resident_store, "growth_block_tokens", 0))
+        block_tokens = max(1, int(getattr(self, "block_tokens", 1)))
+        for layer in initial_kv:
+            layer_key = layer["key"]
+            seq_len, num_heads, head_dim = (int(dim) for dim in layer_key.shape)
+            group_count = self._effective_head_group_count(seq_len, num_heads, head_dim)
+            max_layer_groups = max(max_layer_groups, group_count)
+            total_live_elems += int(seq_len) * int(num_heads) * int(head_dim)
+            logical_capacity = max(int(self.length), int(seq_len) + reserve_tokens)
+            base_capacity = int(block_tokens * math.ceil(float(logical_capacity) / float(block_tokens)))
+            effective_capacity = base_capacity
+            tail_available = max(0, base_capacity - logical_capacity)
+            # Mirror the blocked-store rollover behavior roughly enough for
+            # stripe sizing: when decode reserve is non-zero and the tail block
+            # is already close to full, appends will spill into an extra growth
+            # block instead of consuming the small remaining tail in place.
+            if reserve_tokens > 0 and growth_block_tokens > 0 and tail_available <= base_rollover_tokens:
+                effective_capacity += growth_block_tokens
+            total_capacity_elems += effective_capacity * int(num_heads) * int(head_dim)
+        min_dpus_by_capacity = max(
+            1,
+            math.ceil(float(total_capacity_elems) / float(max(self.resident_store.POOL_CAPACITY_ELEMS, 1))),
+        )
+        return int(total_live_elems), int(max_layer_groups), int(min_dpus_by_capacity)
+
+    def _choose_active_rank_for_request(
+        self,
+        request_id: str,
+        stripe_width: int,
+    ) -> tuple[int | None, str]:
+        rank_groups = self._rank_groups_with_indices()
+        if not rank_groups:
+            return (None, "no_rank_groups")
+
+        active_rank_counts = self._active_request_rank_counts()
+        if not active_rank_counts:
+            return (None, "no_active_rank")
+
+        rank_live_elems: Dict[int, int] = {}
+        dpu_live_elems = getattr(self.resident_store, "dpu_live_elems_by_dpu", None)
+        if isinstance(dpu_live_elems, list):
+            for rank_index, group in rank_groups:
+                rank_live_elems[int(rank_index)] = sum(
+                    int(dpu_live_elems[int(physical_dpu) % max(self.num_dpus, 1)])
+                    for physical_dpu in group
+                )
+
+        request_hash = self._request_hash(request_id)
+        candidate_scores = []
+        for ordinal, (rank_index, group) in enumerate(rank_groups):
+            active_count = int(active_rank_counts.get(int(rank_index), 0))
+            if active_count <= 0:
+                continue
+            candidate_scores.append(
+                (
+                    -active_count,
+                    int(rank_live_elems.get(int(rank_index), 0)),
+                    abs(len(group) - int(stripe_width)),
+                    (request_hash + ordinal) % max(len(rank_groups), 1),
+                    int(rank_index),
+                )
+            )
+        if not candidate_scores:
+            return (None, "no_nonempty_active_rank")
+
+        best_rank_index = min(candidate_scores)[-1]
+        return (int(best_rank_index), "active_rank_reuse")
 
     def _effective_head_group_count(self, seq_len: int, num_heads: int, head_dim: int) -> int:
         max_groups = max(1, min(self.num_dpus, num_heads))
@@ -466,25 +618,21 @@ class PimNaiveAttentionBackend:
         self,
         request_id: str,
         initial_kv: List[Dict[str, torch.Tensor]],
+        decode_reserve_tokens: int = 0,
     ) -> List[int]:
         if self.num_dpus <= 0:
+            self.init_rank_last_reason = "no_dpus"
             return [0]
         if not initial_kv:
+            self.init_rank_last_reason = "empty_initial_kv"
             return [0]
-        total_live_elems = 0
-        max_layer_groups = 1
-        for layer in initial_kv:
-            layer_key = layer["key"]
-            seq_len, num_heads, head_dim = (int(dim) for dim in layer_key.shape)
-            group_count = self._effective_head_group_count(seq_len, num_heads, head_dim)
-            max_layer_groups = max(max_layer_groups, group_count)
-            total_live_elems += int(seq_len) * int(num_heads) * int(head_dim)
-
-        request_hash = sum(ord(ch) for ch in request_id)
-        min_dpus_by_capacity = max(
-            1,
-            math.ceil(float(total_live_elems) / float(max(self.resident_store.POOL_CAPACITY_ELEMS, 1))),
+        _total_live_elems, max_layer_groups, min_dpus_by_capacity = self._request_shape_targets(
+            initial_kv,
+            decode_reserve_tokens=decode_reserve_tokens,
         )
+        initial_context_len = int(initial_kv[0]["key"].shape[0]) if initial_kv else 0
+
+        request_hash = self._request_hash(request_id)
         # The last compact experiment proved that capacity-only shrinking makes
         # requests local, but can overload a tiny subset of DPUs and explode the
         # number of helper rounds. Aim for a medium-width stripe:
@@ -498,24 +646,49 @@ class PimNaiveAttentionBackend:
             target_medium_width = 12
         else:
             target_medium_width = 16
+        # If the prompt is already beyond the base resident length, delaying
+        # stripe growth leaves most base groups pinned onto the narrower
+        # initial subset. Front-load a moderate width increase so more same-rank
+        # DPUs participate from request initialization without giving up
+        # single-rank locality.
+        if max_layer_groups <= 4 and initial_context_len >= int(self.length):
+            target_medium_width = max(target_medium_width, 12)
+            prompt_overshoot = max(0, initial_context_len - int(self.length))
+            # Once the prompt is already beyond the base resident length, a
+            # slightly wider initial stripe can activate more same-rank DPUs
+            # before growth blocks appear. Keep this opt-in for small-group
+            # requests where the wider stripe is still cheap.
+            if prompt_overshoot >= max(8, self.block_tokens // 32):
+                target_medium_width = max(target_medium_width, 16)
+        elif max_layer_groups > 4 and initial_context_len >= int(self.length) + max(96, self.block_tokens // 2):
+            target_medium_width = max(target_medium_width, 16)
         stripe_width = max(min_dpus_by_capacity, target_medium_width)
         stripe_width = min(self.num_dpus, max(1, stripe_width))
 
-        rank_groups: List[List[int]] = []
-        if hasattr(self.resident_store, "get_rank_groups"):
-            rank_groups = self.resident_store.get_rank_groups()
-        if rank_groups:
-            ranked_groups = sorted(rank_groups, key=lambda group: (len(group), group[0] if group else 0))
-            rank_idx = request_hash % len(ranked_groups)
-            target_rank = ranked_groups[rank_idx]
-            if target_rank:
-                stripe_width = min(stripe_width, len(target_rank))
-                base_offset = (request_hash // max(1, len(ranked_groups))) % len(target_rank)
-                return [
-                    int(target_rank[(base_offset + offset) % len(target_rank)])
-                    for offset in range(stripe_width)
-                ]
+        target_rank_index, target_reason = self._choose_active_rank_for_request(
+            request_id,
+            stripe_width,
+        )
+        stripe = self._rank_local_stripe_for_request(
+            request_id,
+            stripe_width,
+            target_rank_index=target_rank_index,
+        )
+        if target_rank_index is not None:
+            self.init_rank_locality_reuse_count += 1
+            self.init_rank_last_reason = target_reason
+            return stripe
 
+        self.init_rank_hash_fallback_count += 1
+        self.init_rank_last_reason = target_reason
+        rank_groups = self._rank_groups_with_indices()
+        if rank_groups:
+            fallback_rank_index = int(rank_groups[request_hash % len(rank_groups)][0])
+            return self._rank_local_stripe_for_request(
+                request_id,
+                stripe_width,
+                target_rank_index=fallback_rank_index,
+            )
         base_dpu = request_hash % self.num_dpus
         return [(base_dpu + offset) % self.num_dpus for offset in range(stripe_width)]
 
@@ -537,23 +710,119 @@ class PimNaiveAttentionBackend:
         self,
         request_id: str,
         stripe_width: int,
+        target_rank_index: int | None = None,
+        preferred_anchor_dpu: int | None = None,
+        required_dpus: List[int] | None = None,
     ) -> List[int]:
         stripe_width = min(self.num_dpus, max(1, int(stripe_width)))
-        request_hash = sum(ord(ch) for ch in request_id)
-        rank_groups: List[List[int]] = []
-        if hasattr(self.resident_store, "get_rank_groups"):
-            rank_groups = self.resident_store.get_rank_groups()
+        request_hash = self._request_hash(request_id)
+        rank_groups = self._rank_groups_with_indices()
         if rank_groups:
-            ranked_groups = sorted(rank_groups, key=lambda group: (len(group), group[0] if group else 0))
-            rank_idx = request_hash % len(ranked_groups)
-            target_rank = ranked_groups[rank_idx]
-            if target_rank:
-                width = min(stripe_width, len(target_rank))
-                base_offset = (request_hash // max(1, len(ranked_groups))) % len(target_rank)
-                return [
-                    int(target_rank[(base_offset + offset) % len(target_rank)])
-                    for offset in range(width)
-                ]
+            chosen_group: List[int] | None = None
+            for rank_index, group in rank_groups:
+                if target_rank_index is not None and int(rank_index) == int(target_rank_index):
+                    chosen_group = group
+                    break
+            if chosen_group is None and preferred_anchor_dpu is not None:
+                anchor_rank = self._stripe_rank_index([int(preferred_anchor_dpu)])
+                for rank_index, group in rank_groups:
+                    if anchor_rank is not None and int(rank_index) == int(anchor_rank):
+                        chosen_group = group
+                        break
+            if chosen_group is None:
+                chosen_group = rank_groups[request_hash % len(rank_groups)][1]
+            if chosen_group:
+                width = min(stripe_width, len(chosen_group))
+                if width >= len(chosen_group):
+                    return [int(physical_dpu) for physical_dpu in chosen_group]
+
+                group_index = {
+                    int(physical_dpu): idx for idx, physical_dpu in enumerate(chosen_group)
+                }
+                max_start = len(chosen_group) - width
+                hash_start = (request_hash // max(1, len(rank_groups))) % max(1, max_start + 1)
+                existing_stripes = []
+                if target_rank_index is not None:
+                    existing_stripes = self._active_request_rank_stripes(int(target_rank_index))
+                dpu_live_elems = getattr(self.resident_store, "dpu_live_elems_by_dpu", None)
+
+                required_positions = []
+                if required_dpus:
+                    required_positions = sorted(
+                        {
+                            int(group_index[int(physical_dpu)])
+                            for physical_dpu in required_dpus
+                            if int(physical_dpu) in group_index
+                        }
+                    )
+
+                start_min = 0
+                start_max = max_start
+                if required_positions:
+                    req_lo = min(required_positions)
+                    req_hi = max(required_positions)
+                    if req_hi - req_lo + 1 > width:
+                        required_positions = []
+                    else:
+                        start_min = max(0, req_hi - width + 1)
+                        start_max = min(max_start, req_lo)
+
+                candidate_scores = []
+                for start_idx in range(start_min, start_max + 1):
+                    candidate = [int(physical_dpu) for physical_dpu in chosen_group[start_idx : start_idx + width]]
+                    candidate_set = set(candidate)
+                    overlap = 0
+                    min_center_distance = 0.0
+                    if existing_stripes:
+                        overlap = sum(
+                            len(candidate_set.intersection({int(physical_dpu) for physical_dpu in existing}))
+                            for existing in existing_stripes
+                        )
+                        candidate_center = float(start_idx) + (float(width - 1) / 2.0)
+                        existing_centers = []
+                        for existing in existing_stripes:
+                            positions = sorted(
+                                int(group_index[int(physical_dpu)])
+                                for physical_dpu in existing
+                                if int(physical_dpu) in group_index
+                            )
+                            if positions:
+                                existing_centers.append(
+                                    float(positions[0] + positions[-1]) / 2.0
+                                )
+                        if existing_centers:
+                            min_center_distance = min(
+                                abs(candidate_center - existing_center)
+                                for existing_center in existing_centers
+                            )
+                    live_load = 0
+                    if isinstance(dpu_live_elems, list):
+                        live_load = sum(
+                            int(dpu_live_elems[int(physical_dpu) % max(self.num_dpus, 1)])
+                            for physical_dpu in candidate
+                        )
+                    anchor_distance = 0
+                    if preferred_anchor_dpu is not None and int(preferred_anchor_dpu) in group_index:
+                        anchor_idx = int(group_index[int(preferred_anchor_dpu)])
+                        if anchor_idx < start_idx:
+                            anchor_distance = start_idx - anchor_idx
+                        elif anchor_idx >= start_idx + width:
+                            anchor_distance = anchor_idx - (start_idx + width - 1)
+                    edge_distance = min(start_idx, max_start - start_idx)
+                    candidate_scores.append(
+                        (
+                            overlap,
+                            live_load,
+                            -float(min_center_distance),
+                            anchor_distance,
+                            -edge_distance,
+                            abs(start_idx - hash_start),
+                            start_idx,
+                            candidate,
+                        )
+                    )
+                if candidate_scores:
+                    return min(candidate_scores)[-1]
         base_dpu = request_hash % self.num_dpus
         return [(base_dpu + offset) % self.num_dpus for offset in range(stripe_width)]
 
@@ -564,21 +833,41 @@ class PimNaiveAttentionBackend:
         if current_width <= 0:
             return
         max_layer_groups = self._max_layer_group_count_for_request(request_state)
-        target_width = self._medium_stripe_target_width(max_layer_groups)
-        growth_blocks = max(0, (int(request_state.context_len) - int(self.length)) // max(1, self.block_tokens))
-        if growth_blocks > 0:
-            target_width += min(8, growth_blocks * 2)
+        target_width = current_width
+        base_medium_width = self._medium_stripe_target_width(max_layer_groups)
+        context_len = int(request_state.context_len)
+        short_growth_threshold = int(self.length) + max(16, self.block_tokens // 8)
+        medium_growth_threshold = int(self.length) + max(48, self.block_tokens // 4)
+        long_growth_threshold = int(self.length) + max(96, self.block_tokens // 2)
+
+        if current_width < base_medium_width and context_len >= short_growth_threshold:
+            target_width = max(target_width, base_medium_width)
+        if max_layer_groups <= 4:
+            if context_len >= medium_growth_threshold:
+                target_width = max(target_width, 12)
+            if context_len >= long_growth_threshold:
+                target_width = max(target_width, 16)
+        else:
+            growth_blocks = max(0, (context_len - int(self.length)) // max(1, self.block_tokens // 2))
+            if growth_blocks > 0:
+                target_width = max(target_width, base_medium_width + min(8, growth_blocks * 2))
         target_width = min(self.num_dpus, max(current_width, target_width))
         if target_width <= current_width:
             return
-        new_stripe = self._rank_local_stripe_for_request(request_state.request_id, target_width)
+        new_stripe = self._rank_local_stripe_for_request(
+            request_state.request_id,
+            target_width,
+            target_rank_index=self._stripe_rank_index(request_state.preferred_dpu_stripe),
+            preferred_anchor_dpu=int(request_state.preferred_dpu_stripe[0]),
+            required_dpus=[int(physical_dpu) for physical_dpu in request_state.preferred_dpu_stripe],
+        )
         if len(new_stripe) <= current_width:
             return
         request_state.preferred_dpu_stripe = list(new_stripe)
         request_state.stripe_version += 1
         request_state.stripe_expand_count += 1
         request_state.last_stripe_update_reason = (
-            f"context_len={request_state.context_len},max_layer_groups={max_layer_groups}"
+            f"context_len={context_len},max_layer_groups={max_layer_groups},from={current_width},to={len(new_stripe)}"
         )
         request_state.last_stripe_width = len(new_stripe)
         for layer_state in request_state.layer_states:
@@ -600,7 +889,11 @@ class PimNaiveAttentionBackend:
             raise ValueError("initial_kv must contain at least one layer")
 
         context_len = int(initial_kv[0]["key"].shape[0])
-        preferred_dpu_stripe = self._preferred_dpu_stripe_for_request(request_id, initial_kv)
+        preferred_dpu_stripe = self._preferred_dpu_stripe_for_request(
+            request_id,
+            initial_kv,
+            decode_reserve_tokens=decode_reserve_tokens,
+        )
         for layer_idx, layer in enumerate(initial_kv):
             layer_key = layer["key"].detach().cpu().contiguous()
             if layer_key.dim() != 3:
@@ -953,6 +1246,12 @@ class PimNaiveAttentionBackend:
             decode_reserve_tokens,
         )
         return seq_len
+
+    def get_request_packing_hint(self, request_id: str) -> Dict[str, object]:
+        request_state = self.request_states.get(str(request_id))
+        if request_state is None:
+            return {}
+        return self._request_packing_hint(request_state)
 
     def _normalize_decode_tensors(
         self,
@@ -1491,6 +1790,9 @@ class PimNaiveAttentionBackend:
             "resident_av_ops": self.resident_av_ops,
             "resident_av_batch_calls": self.resident_av_batch_calls,
             "resident_av_shadow_max_abs_diff": self.resident_av_shadow_max_abs_diff,
+            "init_rank_locality_reuse_count": self.init_rank_locality_reuse_count,
+            "init_rank_hash_fallback_count": self.init_rank_hash_fallback_count,
+            "init_rank_last_reason": self.init_rank_last_reason,
             "resident_total_live_elems": total_live_elems,
             "resident_total_capacity_elems": total_capacity_elems,
             "resident_request_footprints": request_footprints,

@@ -116,6 +116,10 @@ class GlobalScheduler:
         self.decode_continuous_batch_window_flushes = 0
         self.decode_continuous_batch_immediate_flushes = 0
         self.decode_continuous_batch_wait_s = 0.0
+        self.decode_continuous_batch_reordered_flushes = 0
+        self.decode_continuous_batch_same_rank_flushes = 0
+        self.decode_continuous_batch_mixed_rank_flushes = 0
+        self.decode_continuous_batch_total_context_span = 0
         self._decode_pending_queue = deque()
         self._decode_driver_task: asyncio.Task | None = None
         self._background_completion_tasks: set[asyncio.Task] = set()
@@ -154,10 +158,17 @@ class GlobalScheduler:
         request_id: str,
         prompt_len: int,
         first_token: int,
+        first_token_time: float,
         max_tokens: int,
         request_start: float,
         return_metrics: bool,
+        packing_hint: Dict[str, object] | None = None,
     ) -> Dict[str, object]:
+        packing_hint = packing_hint or {}
+        preferred_stripe = [
+            int(physical_dpu)
+            for physical_dpu in packing_hint.get("preferred_dpu_stripe", []) or []
+        ]
         return {
             "request_id": request_id,
             "prompt_len": int(prompt_len),
@@ -166,13 +177,113 @@ class GlobalScheduler:
             "max_tokens": int(max_tokens),
             "step": 1,
             "request_start": float(request_start),
-            "first_token_time": time.time(),
+            "first_token_time": float(first_token_time),
             "return_metrics": bool(return_metrics),
             "stage_timing": _empty_stage_timing(),
             "pending_free": False,
             "done": False,
             "completion_future": None,
+            "packing_rank_hint": packing_hint.get("rank_index"),
+            "packing_stripe_width": int(packing_hint.get("stripe_width", len(preferred_stripe) or 0)),
+            "packing_preferred_dpu_stripe": preferred_stripe,
         }
+
+    def _decode_state_context_len(self, state: Dict[str, object]) -> int:
+        return int(state["prompt_len"]) + int(state["step"])
+
+    def _decode_state_rank_hint(self, state: Dict[str, object]) -> int | None:
+        rank_hint = state.get("packing_rank_hint")
+        if rank_hint is None:
+            return None
+        return int(rank_hint)
+
+    def _decode_state_stripe(self, state: Dict[str, object]) -> tuple[int, ...]:
+        stripe = state.get("packing_preferred_dpu_stripe", [])
+        return tuple(int(physical_dpu) for physical_dpu in stripe)
+
+    def _decode_batch_candidate_score(
+        self,
+        seed_state: Dict[str, object],
+        candidate_state: Dict[str, object],
+        queue_index: int,
+    ) -> tuple[int, int, int, int, int]:
+        seed_rank = self._decode_state_rank_hint(seed_state)
+        candidate_rank = self._decode_state_rank_hint(candidate_state)
+        rank_penalty = 1
+        if seed_rank is not None and candidate_rank is not None:
+            rank_penalty = 0 if seed_rank == candidate_rank else 2
+
+        seed_stripe = set(self._decode_state_stripe(seed_state))
+        candidate_stripe = set(self._decode_state_stripe(candidate_state))
+        stripe_penalty = 1
+        if seed_stripe and candidate_stripe:
+            stripe_penalty = 0 if seed_stripe.intersection(candidate_stripe) else 2
+
+        context_gap = abs(self._decode_state_context_len(seed_state) - self._decode_state_context_len(candidate_state))
+        width_gap = abs(int(seed_state.get("packing_stripe_width", 0)) - int(candidate_state.get("packing_stripe_width", 0)))
+        return (rank_penalty, stripe_penalty, context_gap, width_gap, int(queue_index))
+
+    def _take_decode_batch(self, batch_size: int) -> List[Dict[str, object]]:
+        if batch_size <= 0 or not self._decode_pending_queue:
+            return []
+        if batch_size >= len(self._decode_pending_queue):
+            batch = list(self._decode_pending_queue)
+            self._decode_pending_queue.clear()
+            context_lens = [self._decode_state_context_len(state) for state in batch]
+            if context_lens:
+                self.decode_continuous_batch_total_context_span += max(context_lens) - min(context_lens)
+            known_rank_hints = [
+                rank_hint
+                for rank_hint in (self._decode_state_rank_hint(state) for state in batch)
+                if rank_hint is not None
+            ]
+            if len(known_rank_hints) >= 2:
+                if len(set(known_rank_hints)) == 1:
+                    self.decode_continuous_batch_same_rank_flushes += 1
+                else:
+                    self.decode_continuous_batch_mixed_rank_flushes += 1
+            return batch
+
+        queue_items = list(self._decode_pending_queue)
+        seed_state = queue_items[0]
+        selected_indices = [0]
+        scored_candidates = sorted(
+            [
+                (
+                    self._decode_batch_candidate_score(seed_state, candidate_state, queue_index),
+                    queue_index,
+                )
+                for queue_index, candidate_state in enumerate(queue_items[1:], start=1)
+            ],
+            key=lambda item: item[0],
+        )
+        for _, queue_index in scored_candidates[: max(0, batch_size - 1)]:
+            selected_indices.append(int(queue_index))
+
+        selected_index_set = set(selected_indices)
+        batch = [queue_items[idx] for idx in selected_indices]
+        self._decode_pending_queue = deque(
+            item
+            for idx, item in enumerate(queue_items)
+            if idx not in selected_index_set
+        )
+
+        if any(idx != expected for expected, idx in enumerate(selected_indices)):
+            self.decode_continuous_batch_reordered_flushes += 1
+        context_lens = [self._decode_state_context_len(state) for state in batch]
+        if context_lens:
+            self.decode_continuous_batch_total_context_span += max(context_lens) - min(context_lens)
+        known_rank_hints = [
+            rank_hint
+            for rank_hint in (self._decode_state_rank_hint(state) for state in batch)
+            if rank_hint is not None
+        ]
+        if len(known_rank_hints) >= 2:
+            if len(set(known_rank_hints)) == 1:
+                self.decode_continuous_batch_same_rank_flushes += 1
+            else:
+                self.decode_continuous_batch_mixed_rank_flushes += 1
+        return batch
 
     def _ensure_decode_driver(self):
         if self._decode_driver_task is None or self._decode_driver_task.done():
@@ -209,7 +320,7 @@ class GlobalScheduler:
                     flush_reason = "target"
 
                 batch_size = min(len(self._decode_pending_queue), self.decode_continuous_batch_max_size)
-                batch = [self._decode_pending_queue.popleft() for _ in range(batch_size)]
+                batch = self._take_decode_batch(batch_size)
                 self.decode_continuous_batch_flushes += 1
                 self.decode_continuous_batch_total_items += len(batch)
                 self.decode_continuous_batch_max_observed = max(
@@ -718,6 +829,14 @@ class GlobalScheduler:
                 "window_flushes": int(self.decode_continuous_batch_window_flushes),
                 "immediate_flushes": int(self.decode_continuous_batch_immediate_flushes),
                 "wait_s": float(self.decode_continuous_batch_wait_s),
+                "reordered_flushes": int(self.decode_continuous_batch_reordered_flushes),
+                "same_rank_flushes": int(self.decode_continuous_batch_same_rank_flushes),
+                "mixed_rank_flushes": int(self.decode_continuous_batch_mixed_rank_flushes),
+                "avg_context_span": (
+                    float(self.decode_continuous_batch_total_context_span) / float(self.decode_continuous_batch_flushes)
+                    if self.decode_continuous_batch_flushes > 0
+                    else 0.0
+                ),
                 "target_size": int(self._decode_continuous_batch_target_size()),
                 "pending": len(self._decode_pending_queue),
             }
@@ -847,28 +966,30 @@ class GlobalScheduler:
         rpc_started = time.perf_counter()
         prefill_out = await prefill.process_prompt.remote(prompt)
         prefill_rpc_s = time.perf_counter() - rpc_started
+        first_token_time = time.time()
         request_id = prefill_out["request_id"]
         prompt_len = int(prefill_out["prompt_len"])
         first_token = int(prefill_out["first_token_id"])
         max_tokens = int(max_new_tokens or self.model_config.max_new_tokens)
-        decode_state = self._new_decode_state(
-            request_id=request_id,
-            prompt_len=prompt_len,
-            first_token=first_token,
-            max_tokens=max_tokens,
-            request_start=request_start,
-            return_metrics=return_metrics,
-        )
-        decode_state["stage_timing"]["scheduler"]["prefill_rpc_s"] += prefill_rpc_s
-        decode_state["stage_timing"]["actors"]["prefill_compute_s"] += float(
-            prefill_out.get("profile", {}).get("compute_s", 0.0)
-        )
-
         rpc_started = time.perf_counter()
         init_result = await attention.init_request.remote(
             request_id,
             prefill_out["initial_kv"],
             max_tokens,
+        )
+        decode_state = self._new_decode_state(
+            request_id=request_id,
+            prompt_len=prompt_len,
+            first_token=first_token,
+            first_token_time=first_token_time,
+            max_tokens=max_tokens,
+            request_start=request_start,
+            return_metrics=return_metrics,
+            packing_hint=dict(init_result.get("packing_hint", {}) or {}),
+        )
+        decode_state["stage_timing"]["scheduler"]["prefill_rpc_s"] += prefill_rpc_s
+        decode_state["stage_timing"]["actors"]["prefill_compute_s"] += float(
+            prefill_out.get("profile", {}).get("compute_s", 0.0)
         )
         self._active_decode_requests += 1
         decode_state["stage_timing"]["scheduler"]["attention_init_rpc_s"] += time.perf_counter() - rpc_started

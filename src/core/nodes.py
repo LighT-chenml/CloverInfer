@@ -129,9 +129,13 @@ class AttentionNode:
             initial_kv,
             decode_reserve_tokens=int(decode_reserve_tokens),
         )
+        packing_hint = {}
+        if hasattr(self.backend, "get_request_packing_hint"):
+            packing_hint = dict(self.backend.get_request_packing_hint(request_id) or {})
         finished_at = time.perf_counter()
         return {
             "context_len": int(context_len),
+            "packing_hint": packing_hint,
             "profile": {
                 "compute_s": float(finished_at - started_at),
             },

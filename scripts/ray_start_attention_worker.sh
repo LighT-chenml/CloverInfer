@@ -10,4 +10,5 @@ python -m ray.scripts.scripts start \
   --address=192.168.123.4:26379 \
   --node-ip-address=192.168.123.7 \
   --num-gpus=0 \
-  --resources='{"attention_pim": 1}'
+  --resources='{"attention_pim": 1}' \
+  --block

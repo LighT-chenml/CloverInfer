@@ -48,10 +48,15 @@ typedef struct {
 typedef struct {
     struct dpu_set_t target_dpu;
     host_slot_t *slot;
+    host_slot_t *segment_slots[KVSLOT_MAX_GROUP_SEGMENTS];
     kvslot_slot_args_t out;
     kvslot_runtime_slot_args_t runtime_args;
+    kvslot_runtime_slot_args_t segment_runtime_args[KVSLOT_MAX_GROUP_SEGMENTS];
     uint32_t slot_id;
     uint32_t physical_dpu_id;
+    uint32_t segment_slot_ids[KVSLOT_MAX_GROUP_SEGMENTS];
+    uint32_t segment_lengths[KVSLOT_MAX_GROUP_SEGMENTS];
+    uint32_t segment_count;
     size_t weight_bytes;
     size_t context_bytes;
     size_t padded_weight_bytes;
@@ -67,7 +72,9 @@ typedef struct {
 typedef struct {
     struct dpu_set_t target_dpu;
     host_slot_t *slot;
+    host_slot_t *segment_slots[KVSLOT_MAX_GROUP_SEGMENTS];
     kvslot_runtime_slot_args_t runtime_args;
+    kvslot_runtime_slot_args_t segment_runtime_args[KVSLOT_MAX_GROUP_SEGMENTS];
     kvslot_qk_slot_args_t slot_args;
     uint32_t slot_id;
     uint32_t physical_dpu_id;
@@ -80,6 +87,9 @@ typedef struct {
     uint32_t *raw_scores;
     uint32_t *raw_row_max_bits;
     uint32_t *raw_row_sum_bits;
+    uint32_t segment_slot_ids[KVSLOT_MAX_GROUP_SEGMENTS];
+    uint32_t segment_lengths[KVSLOT_MAX_GROUP_SEGMENTS];
+    uint32_t segment_count;
     int ready;
 } qk_slot_item_t;
 
@@ -87,6 +97,10 @@ static int launch_qk_slot_item_async(const qk_slot_item_t *item, kvslot_profile_
 static int finish_qk_slot_item(qk_slot_item_t *item, kvslot_profile_stats_t *profile);
 static int can_use_batched_qk_round(
     kvslot_runner_t *runner,
+    qk_slot_item_t *items,
+    const uint32_t *round_indices,
+    uint32_t round_count);
+static uint32_t batched_qk_round_max_window(
     qk_slot_item_t *items,
     const uint32_t *round_indices,
     uint32_t round_count);
@@ -119,11 +133,24 @@ static av_item_t *find_av_round_item_for_dpu(
     av_item_t **items_by_dpu,
     struct dpu_set_t dpu);
 static int prepare_av_item_header(kvslot_runner_t *runner, uint32_t slot_id, av_item_t *item);
+static int prepare_grouped_av_item_header(
+    kvslot_runner_t *runner,
+    const uint32_t *slot_ids,
+    const uint32_t *segment_lengths,
+    uint32_t segment_count,
+    av_item_t *item);
 static int read_av_item_weights(av_item_t *item);
 static int softmax_av_item_scores_inplace(av_item_t *item);
 static int prepare_qk_slot_item_header(
     kvslot_runner_t *runner,
     uint32_t slot_id,
+    const kvslot_qk_softmax_av_batch_item_args_t *item_args,
+    qk_slot_item_t *item);
+static int prepare_grouped_qk_slot_item_header(
+    kvslot_runner_t *runner,
+    const uint32_t *slot_ids,
+    const uint32_t *segment_lengths,
+    uint32_t segment_count,
     const kvslot_qk_softmax_av_batch_item_args_t *item_args,
     qk_slot_item_t *item);
 static int read_qk_slot_item_payload(FILE *file, qk_slot_item_t *item);
@@ -402,10 +429,21 @@ static int av_items_round_compatible(const av_item_t *seed, const av_item_t *ite
     if (seed == NULL || item == NULL || !seed->ready || !item->ready) {
         return 0;
     }
-    if (item->padded_weight_bytes != seed->padded_weight_bytes || item->padded_context_bytes != seed->padded_context_bytes) {
+    if (item->runtime_args.group_heads != seed->runtime_args.group_heads
+        || item->runtime_args.head_dim != seed->runtime_args.head_dim
+        || item->runtime_args.dtype_code != seed->runtime_args.dtype_code) {
+        return 0;
+    }
+    if (item->padded_context_bytes != seed->padded_context_bytes) {
         return 0;
     }
     if (item->weights_resident_on_dpu != seed->weights_resident_on_dpu) {
+        return 0;
+    }
+    if (item->context_from_qk_kernel != seed->context_from_qk_kernel) {
+        return 0;
+    }
+    if ((item->segment_count > 1) != (seed->segment_count > 1)) {
         return 0;
     }
     return 1;
@@ -1714,6 +1752,197 @@ cleanup:
     return rc;
 }
 
+static int handle_qk_slot_grouped_batch(kvslot_runner_t *runner)
+{
+    kvslot_av_batch_args_t args;
+    qk_slot_item_t *items = NULL;
+    uint8_t *processed = NULL;
+    uint8_t *used_dpus = NULL;
+    uint32_t processed_count = 0;
+    int rc = 0;
+
+    if (read_exact(stdin, &args, sizeof(args)) != 0) {
+        fprintf(stderr, "Failed to read grouped qk slot batch args\n");
+        return 1;
+    }
+    if (args.num_slots == 0 || args.num_slots > KVSLOT_MAX_HEADS) {
+        fprintf(stderr, "Invalid grouped qk slot batch num_slots=%u\n", args.num_slots);
+        return 1;
+    }
+
+    if (write_exact(stdout, &args, sizeof(args)) != 0) {
+        fprintf(stderr, "Failed to write grouped qk slot batch response header\n");
+        return 1;
+    }
+
+    items = calloc(args.num_slots, sizeof(*items));
+    processed = calloc(args.num_slots, sizeof(*processed));
+    used_dpus = calloc(runner->nr_dpus, sizeof(*used_dpus));
+    if (items == NULL || processed == NULL || used_dpus == NULL) {
+        fprintf(stderr, "Failed to allocate grouped qk slot batch state\n");
+        free(used_dpus);
+        free(processed);
+        free(items);
+        return 1;
+    }
+
+    for (uint32_t idx = 0; idx < args.num_slots; ++idx) {
+        uint32_t segment_count = 0;
+        uint32_t slot_ids[KVSLOT_MAX_GROUP_SEGMENTS];
+        uint32_t segment_lengths[KVSLOT_MAX_GROUP_SEGMENTS];
+        kvslot_qk_slot_batch_item_args_t first_item_args;
+        int have_first = 0;
+        if (read_exact(stdin, &segment_count, sizeof(segment_count)) != 0) {
+            fprintf(stderr, "Failed to read grouped qk segment count %u\n", idx);
+            rc = 1;
+            goto cleanup;
+        }
+        if (segment_count == 0 || segment_count > KVSLOT_MAX_GROUP_SEGMENTS) {
+            fprintf(stderr, "Invalid grouped qk segment_count=%u at item %u\n", segment_count, idx);
+            rc = 1;
+            goto cleanup;
+        }
+        memset(&first_item_args, 0, sizeof(first_item_args));
+        for (uint32_t seg_idx = 0; seg_idx < segment_count; ++seg_idx) {
+            kvslot_io_header_t header;
+            kvslot_qk_slot_batch_item_args_t item_args;
+            if (read_exact(stdin, &header, sizeof(header)) != 0) {
+                fprintf(stderr, "Failed to read grouped qk item header %u/%u\n", idx, seg_idx);
+                rc = 1;
+                goto cleanup;
+            }
+            if (header.magic != KVSLOT_MAGIC || header.command != KVSLOT_CMD_QK_SLOT_GROUPED_BATCH) {
+                fprintf(stderr, "Invalid grouped qk item header %u/%u\n", idx, seg_idx);
+                rc = 1;
+                goto cleanup;
+            }
+            if (read_exact(stdin, &item_args, sizeof(item_args)) != 0) {
+                fprintf(stderr, "Failed to read grouped qk item args %u/%u\n", idx, seg_idx);
+                rc = 1;
+                goto cleanup;
+            }
+            if (!have_first) {
+                first_item_args = item_args;
+                have_first = 1;
+            } else if (item_args.num_heads != first_item_args.num_heads || item_args.head_dim != first_item_args.head_dim) {
+                fprintf(stderr, "Grouped qk item shape mismatch at %u/%u\n", idx, seg_idx);
+                rc = 1;
+                goto cleanup;
+            }
+            slot_ids[seg_idx] = header.slot_id;
+            segment_lengths[seg_idx] = item_args.window;
+        }
+        {
+            kvslot_qk_softmax_av_batch_item_args_t fused_args;
+            fused_args.num_heads = first_item_args.num_heads;
+            fused_args.window = 0;
+            fused_args.head_dim = first_item_args.head_dim;
+            fused_args.score_scale = 1.0f;
+            if (prepare_grouped_qk_slot_item_header(runner, slot_ids, segment_lengths, segment_count, &fused_args, &items[idx]) != 0) {
+                fprintf(stderr, "Failed to prepare grouped qk item %u\n", idx);
+                rc = 1;
+                goto cleanup;
+            }
+            if (read_qk_slot_item_payload(stdin, &items[idx]) != 0) {
+                fprintf(stderr, "Failed to read grouped qk payload %u\n", idx);
+                rc = 1;
+                goto cleanup;
+            }
+        }
+    }
+
+    while (processed_count < args.num_slots && rc == 0) {
+        uint32_t round_indices[KVSLOT_MAX_HEADS];
+        uint32_t round_count = build_qk_launch_round(
+            runner,
+            items,
+            args.num_slots,
+            processed,
+            used_dpus,
+            round_indices);
+        if (round_count == 0) {
+            fprintf(stderr, "Failed to build grouped qk slot batch launch round\n");
+            rc = 1;
+            break;
+        }
+
+        if (can_use_batched_qk_round(runner, items, round_indices, round_count)) {
+            record_qk_round_profile(runner, items, round_indices, round_count, 1);
+            if (execute_batched_qk_round(runner, items, round_indices, round_count) != 0) {
+                fprintf(stderr, "Failed to execute batched grouped qk round\n");
+                rc = 1;
+            }
+        } else {
+            uint64_t round_start_ns = monotonic_time_ns();
+            record_qk_round_profile(runner, items, round_indices, round_count, 0);
+            for (uint32_t pos = 0; pos < round_count; ++pos) {
+                if (launch_qk_slot_item_async(&items[round_indices[pos]], &runner->profile) != 0) {
+                    fprintf(stderr, "Failed to launch grouped qk item %u\n", round_indices[pos]);
+                    rc = 1;
+                    break;
+                }
+            }
+            for (uint32_t pos = 0; pos < round_count && rc == 0; ++pos) {
+                if (finish_qk_slot_item(&items[round_indices[pos]], &runner->profile) != 0) {
+                    fprintf(stderr, "Failed to finish grouped qk item %u\n", round_indices[pos]);
+                    rc = 1;
+                    break;
+                }
+            }
+            record_qk_round_timing(
+                runner,
+                0,
+                elapsed_ns_since(round_start_ns),
+                0,
+                0,
+                0,
+                0);
+        }
+        for (uint32_t pos = 0; pos < round_count && rc == 0; ++pos) {
+            processed[round_indices[pos]] = 1;
+            processed_count += 1;
+        }
+    }
+
+    for (uint32_t idx = 0; idx < args.num_slots && rc == 0; ++idx) {
+        qk_slot_item_t *item = &items[idx];
+        uint32_t item_header[4] = {item->num_heads, item->window, 0, 0};
+        if (write_exact(stdout, item_header, sizeof(item_header)) != 0) {
+            fprintf(stderr, "Failed to write grouped qk item header %u\n", idx);
+            rc = 1;
+            break;
+        }
+        for (uint32_t head_idx = 0; head_idx < item->num_heads && rc == 0; ++head_idx) {
+            for (uint32_t pos = 0; pos < item->window; ++pos) {
+                union {
+                    uint32_t u;
+                    float f;
+                } bits = {.u = item->raw_scores[(size_t)head_idx * item->score_stride + pos]};
+                if (write_exact(stdout, &bits.f, sizeof(bits.f)) != 0) {
+                    fprintf(stderr, "Failed to write grouped qk score %u:%u:%u\n", idx, head_idx, pos);
+                    rc = 1;
+                    break;
+                }
+            }
+        }
+    }
+
+cleanup:
+    if (items != NULL) {
+        for (uint32_t idx = 0; idx < args.num_slots; ++idx) {
+            cleanup_qk_slot_item(&items[idx]);
+        }
+    }
+    free(used_dpus);
+    free(processed);
+    free(items);
+    if (rc == 0 && flush_exact(stdout) != 0) {
+        fprintf(stderr, "Failed to flush grouped qk slot batch response\n");
+        rc = 1;
+    }
+    return rc;
+}
+
 static int prepare_qk_slot_item_header(
     kvslot_runner_t *runner,
     uint32_t slot_id,
@@ -1793,6 +2022,127 @@ static int prepare_qk_slot_item_header(
     return 0;
 }
 
+static int prepare_grouped_qk_slot_item_header(
+    kvslot_runner_t *runner,
+    const uint32_t *slot_ids,
+    const uint32_t *segment_lengths,
+    uint32_t segment_count,
+    const kvslot_qk_softmax_av_batch_item_args_t *item_args,
+    qk_slot_item_t *item)
+{
+    uint32_t total_window = 0;
+    host_slot_t *first_slot = NULL;
+    struct dpu_set_t first_target_dpu;
+    uint32_t first_physical_dpu_id = 0;
+    uint32_t num_heads;
+    uint32_t head_dim;
+
+    if (runner == NULL || slot_ids == NULL || segment_lengths == NULL || item_args == NULL || item == NULL) {
+        return 1;
+    }
+    if (segment_count == 0 || segment_count > KVSLOT_MAX_GROUP_SEGMENTS) {
+        return 1;
+    }
+    memset(item, 0, sizeof(*item));
+
+    num_heads = item_args->num_heads;
+    head_dim = item_args->head_dim;
+    for (uint32_t seg_idx = 0; seg_idx < segment_count; ++seg_idx) {
+        struct dpu_set_t target_dpu;
+        host_slot_t *slot = NULL;
+        uint32_t slot_id = slot_ids[seg_idx];
+        uint32_t physical_dpu_id;
+        if (slot_id >= runner->nr_dpus * KVSLOT_MAX_SLOTS_PER_DPU) {
+            fprintf(stderr, "Invalid grouped qk slot id %u\n", slot_id);
+            return 1;
+        }
+        if (runner_get_dpu_and_slot(runner, slot_id, &target_dpu, &slot) != 0 || slot == NULL || slot->capacity == 0) {
+            fprintf(stderr, "Failed to locate grouped qk slot %u\n", slot_id);
+            return 1;
+        }
+        physical_dpu_id = slot_id % runner->nr_dpus;
+        if (seg_idx == 0) {
+            first_slot = slot;
+            first_target_dpu = target_dpu;
+            first_physical_dpu_id = physical_dpu_id;
+            item->slot = slot;
+            item->target_dpu = target_dpu;
+            item->slot_id = slot_id;
+            item->physical_dpu_id = physical_dpu_id;
+        } else {
+            if (physical_dpu_id != first_physical_dpu_id) {
+                fprintf(stderr, "Grouped qk item spans multiple physical DPUs\n");
+                return 1;
+            }
+            if (slot->group_heads != first_slot->group_heads || slot->head_dim != first_slot->head_dim || slot->dtype_code != first_slot->dtype_code) {
+                fprintf(stderr, "Grouped qk item shape mismatch across segments\n");
+                return 1;
+            }
+            item->target_dpu = first_target_dpu;
+        }
+        if (segment_lengths[seg_idx] > slot->seq_len) {
+            fprintf(stderr, "Grouped qk segment length exceeds slot seq len\n");
+            return 1;
+        }
+        item->segment_slots[seg_idx] = slot;
+        item->segment_slot_ids[seg_idx] = slot_id;
+        item->segment_lengths[seg_idx] = segment_lengths[seg_idx];
+        item->segment_runtime_args[seg_idx].seq_len = segment_lengths[seg_idx];
+        item->segment_runtime_args[seg_idx].group_heads = slot->group_heads;
+        item->segment_runtime_args[seg_idx].head_dim = slot->head_dim;
+        item->segment_runtime_args[seg_idx].dtype_code = slot->dtype_code;
+        item->segment_runtime_args[seg_idx].elem_offset = slot->elem_offset + ((slot->seq_len - segment_lengths[seg_idx]) * slot->group_heads * slot->head_dim);
+        item->segment_runtime_args[seg_idx].reserved[0] = 0;
+        item->segment_runtime_args[seg_idx].reserved[1] = 0;
+        item->segment_runtime_args[seg_idx].reserved[2] = 0;
+        total_window += segment_lengths[seg_idx];
+    }
+
+    if (num_heads == 0 || num_heads > first_slot->group_heads || num_heads > KVSLOT_MAX_HEADS) {
+        fprintf(stderr, "Invalid grouped qk num_heads=%u for slot %u\n", num_heads, item->slot_id);
+        return 1;
+    }
+    if (head_dim == 0 || head_dim > first_slot->head_dim || head_dim > KVSLOT_MAX_HEAD_DIM) {
+        fprintf(stderr, "Invalid grouped qk head_dim=%u for slot %u\n", head_dim, item->slot_id);
+        return 1;
+    }
+
+    item->num_heads = num_heads;
+    item->window = total_window;
+    item->score_stride = (total_window + 1u) & ~1u;
+    item->head_dim = head_dim;
+    item->segment_count = segment_count;
+    item->local_head_indices = calloc(num_heads, sizeof(*item->local_head_indices));
+    item->queries = calloc((size_t)num_heads * head_dim, sizeof(*item->queries));
+    item->raw_scores = calloc(
+        (size_t)(item->score_stride > 0 ? item->score_stride : 1u) * num_heads,
+        sizeof(*item->raw_scores)
+    );
+    item->raw_row_max_bits = calloc(num_heads > 0 ? num_heads : 1u, sizeof(*item->raw_row_max_bits));
+    item->raw_row_sum_bits = calloc(num_heads > 0 ? num_heads : 1u, sizeof(*item->raw_row_sum_bits));
+    if (item->local_head_indices == NULL || item->queries == NULL || item->raw_scores == NULL || item->raw_row_max_bits == NULL || item->raw_row_sum_bits == NULL) {
+        fprintf(stderr, "Failed to allocate grouped qk slot buffers\n");
+        return 1;
+    }
+
+    item->runtime_args.seq_len = total_window;
+    item->runtime_args.group_heads = first_slot->group_heads;
+    item->runtime_args.head_dim = first_slot->head_dim;
+    item->runtime_args.dtype_code = first_slot->dtype_code;
+    item->runtime_args.elem_offset = 0;
+    item->runtime_args.reserved[0] = 0;
+    item->runtime_args.reserved[1] = 0;
+    item->runtime_args.reserved[2] = 0;
+
+    item->slot_args.num_heads = num_heads;
+    item->slot_args.window = total_window;
+    item->slot_args.head_dim = head_dim;
+    item->slot_args.mode = KVSLOT_QK_SLOT_MODE_RAW_SCORES;
+    item->slot_args.score_scale = item_args->score_scale;
+    item->ready = 1;
+    return 0;
+}
+
 static int read_qk_slot_item_payload(FILE *file, qk_slot_item_t *item)
 {
     if (file == NULL || item == NULL || !item->ready) {
@@ -1827,7 +2177,7 @@ static void cleanup_qk_slot_item(qk_slot_item_t *item)
 
 static int launch_qk_slot_item_async(const qk_slot_item_t *item, kvslot_profile_stats_t *profile)
 {
-    uint32_t kernel_command = KVSLOT_KERNEL_QK_SLOT;
+    uint32_t kernel_command = item != NULL && item->segment_count > 1 ? (KVSLOT_KERNEL_QK_SLOT + 100u) : KVSLOT_KERNEL_QK_SLOT;
     uint64_t start_ns;
     uint64_t launch_start_ns;
 
@@ -1838,6 +2188,29 @@ static int launch_qk_slot_item_async(const qk_slot_item_t *item, kvslot_profile_
     DPU_ASSERT(dpu_copy_to(item->target_dpu, "kvslot_kernel_command", 0, &kernel_command, sizeof(kernel_command)));
     DPU_ASSERT(dpu_copy_to(item->target_dpu, "runtime_slot_args", 0, &item->runtime_args, sizeof(item->runtime_args)));
     DPU_ASSERT(dpu_copy_to(item->target_dpu, "qk_slot_args", 0, &item->slot_args, sizeof(item->slot_args)));
+    if (item->segment_count > 1) {
+        DPU_ASSERT(dpu_copy_to(
+            item->target_dpu,
+            "grouped_runtime_slot_args",
+            0,
+            item->segment_runtime_args,
+            (size_t)item->segment_count * sizeof(*item->segment_runtime_args)
+        ));
+        DPU_ASSERT(dpu_copy_to(
+            item->target_dpu,
+            "grouped_segment_lengths",
+            0,
+            item->segment_lengths,
+            (size_t)item->segment_count * sizeof(*item->segment_lengths)
+        ));
+        DPU_ASSERT(dpu_copy_to(
+            item->target_dpu,
+            "grouped_segment_count",
+            0,
+            &item->segment_count,
+            sizeof(item->segment_count)
+        ));
+    }
     DPU_ASSERT(dpu_copy_to(
         item->target_dpu,
         "qk_slot_head_indices",
@@ -1971,7 +2344,7 @@ static int can_use_batched_qk_round(
     uint32_t round_count)
 {
     uint32_t num_heads;
-    uint32_t window;
+    uint32_t max_window;
     uint32_t head_dim;
     uint32_t mode;
     uint32_t active_rank_count = 0;
@@ -1987,11 +2360,11 @@ static int can_use_batched_qk_round(
     }
 
     num_heads = items[round_indices[0]].num_heads;
-    window = items[round_indices[0]].window;
+    max_window = batched_qk_round_max_window(items, round_indices, round_count);
     head_dim = items[round_indices[0]].head_dim;
     mode = items[round_indices[0]].slot_args.mode;
     query_bytes = (size_t)num_heads * head_dim * sizeof(float);
-    score_bytes = (size_t)num_heads * items[round_indices[0]].score_stride * sizeof(uint32_t);
+    score_bytes = (size_t)num_heads * (((size_t)max_window + 1u) & ~1u) * sizeof(uint32_t);
 
     if ((query_bytes % 8u) != 0 || (score_bytes % 8u) != 0) {
         return 0;
@@ -2003,11 +2376,15 @@ static int can_use_batched_qk_round(
     }
     for (uint32_t pos = 1; pos < round_count; ++pos) {
         qk_slot_item_t *item = &items[round_indices[pos]];
-        if (!item->ready || item->num_heads != num_heads || item->window != window || item->head_dim != head_dim) {
+        if (!item->ready || item->num_heads != num_heads || item->head_dim != head_dim) {
             free(rank_used);
             return 0;
         }
         if (item->slot_args.mode != mode) {
+            free(rank_used);
+            return 0;
+        }
+        if ((item->segment_count > 1) != (items[round_indices[0]].segment_count > 1)) {
             free(rank_used);
             return 0;
         }
@@ -2046,6 +2423,25 @@ static int can_use_batched_qk_round(
     return 1;
 }
 
+static uint32_t batched_qk_round_max_window(
+    qk_slot_item_t *items,
+    const uint32_t *round_indices,
+    uint32_t round_count)
+{
+    uint32_t max_window = 0;
+
+    if (items == NULL || round_indices == NULL) {
+        return 0;
+    }
+    for (uint32_t pos = 0; pos < round_count; ++pos) {
+        qk_slot_item_t *item = &items[round_indices[pos]];
+        if (item->window > max_window) {
+            max_window = item->window;
+        }
+    }
+    return max_window;
+}
+
 static int execute_batched_qk_round(
     kvslot_runner_t *runner,
     qk_slot_item_t *items,
@@ -2058,12 +2454,18 @@ static int execute_batched_qk_round(
     uint32_t *dummy_scores = NULL;
     uint32_t *dummy_row_max_bits = NULL;
     uint32_t *dummy_row_sum_bits = NULL;
+    kvslot_runtime_slot_args_t *dummy_segment_runtime_args = NULL;
+    uint32_t *dummy_segment_lengths = NULL;
+    void **score_xfer_buffers = NULL;
     kvslot_runtime_slot_args_t zero_runtime_args;
     kvslot_qk_slot_args_t zero_slot_args;
     uint32_t kernel_command = KVSLOT_KERNEL_QK_SLOT;
     uint32_t num_heads;
-    uint32_t window;
+    uint32_t max_window;
     uint32_t head_dim;
+    uint32_t max_segment_count = 0;
+    uint32_t zero_segment_count = 0;
+    int grouped_round = 0;
     uint32_t active_rank_count = 0;
     size_t head_index_bytes;
     size_t query_bytes;
@@ -2094,12 +2496,12 @@ static int execute_batched_qk_round(
     memset(&zero_runtime_args, 0, sizeof(zero_runtime_args));
     memset(&zero_slot_args, 0, sizeof(zero_slot_args));
     num_heads = items[round_indices[0]].num_heads;
-    window = items[round_indices[0]].window;
+    max_window = batched_qk_round_max_window(items, round_indices, round_count);
     head_dim = items[round_indices[0]].head_dim;
     head_index_bytes = (size_t)num_heads * sizeof(uint32_t);
     query_bytes = (size_t)num_heads * head_dim * sizeof(float);
-    score_bytes = (size_t)num_heads * window * sizeof(uint32_t);
-    score_bytes = (size_t)num_heads * items[round_indices[0]].score_stride * sizeof(uint32_t);
+    score_bytes = (size_t)num_heads * (((size_t)max_window + 1u) & ~1u) * sizeof(uint32_t);
+    grouped_round = items[round_indices[0]].segment_count > 1;
     memset(&launch_set, 0, sizeof(launch_set));
 
     for (uint32_t pos = 0; pos < round_count; ++pos) {
@@ -2109,7 +2511,15 @@ static int execute_batched_qk_round(
             free(items_by_dpu);
             return 1;
         }
+        if ((item->segment_count > 1) != grouped_round) {
+            fprintf(stderr, "Mixed grouped/regular qk items in a batched round\n");
+            free(items_by_dpu);
+            return 1;
+        }
         items_by_dpu[item->physical_dpu_id] = item;
+        if (item->segment_count > max_segment_count) {
+            max_segment_count = item->segment_count;
+        }
     }
     rank_used = calloc(runner->nr_ranks, sizeof(*rank_used));
     if (rank_used == NULL) {
@@ -2177,11 +2587,23 @@ static int execute_batched_qk_round(
             free(items_by_dpu);
             return 1;
         }
+        score_xfer_buffers = calloc(runner->nr_dpus, sizeof(*score_xfer_buffers));
+        if (score_xfer_buffers == NULL) {
+            fprintf(stderr, "Failed to allocate batched qk padded score buffers\n");
+            free(dummy_scores);
+            free(dummy_queries);
+            free(dummy_head_indices);
+            free(active_ranks);
+            free(rank_used);
+            free(items_by_dpu);
+            return 1;
+        }
     }
     if (num_heads > 0) {
         dummy_row_max_bits = calloc(num_heads, sizeof(*dummy_row_max_bits));
         if (dummy_row_max_bits == NULL) {
             fprintf(stderr, "Failed to allocate batched qk dummy row maxes\n");
+            free(score_xfer_buffers);
             free(dummy_scores);
             free(dummy_queries);
             free(dummy_head_indices);
@@ -2194,6 +2616,27 @@ static int execute_batched_qk_round(
         if (dummy_row_sum_bits == NULL) {
             fprintf(stderr, "Failed to allocate batched qk dummy row sums\n");
             free(dummy_row_max_bits);
+            free(score_xfer_buffers);
+            free(dummy_scores);
+            free(dummy_queries);
+            free(dummy_head_indices);
+            free(active_ranks);
+            free(rank_used);
+            free(items_by_dpu);
+            return 1;
+        }
+    }
+    if (grouped_round && max_segment_count > 0) {
+        kernel_command = KVSLOT_KERNEL_QK_SLOT + 100u;
+        dummy_segment_runtime_args = calloc(max_segment_count, sizeof(*dummy_segment_runtime_args));
+        dummy_segment_lengths = calloc(max_segment_count, sizeof(*dummy_segment_lengths));
+        if (dummy_segment_runtime_args == NULL || dummy_segment_lengths == NULL) {
+            fprintf(stderr, "Failed to allocate grouped qk dummy metadata\n");
+            free(dummy_segment_lengths);
+            free(dummy_segment_runtime_args);
+            free(dummy_row_sum_bits);
+            free(dummy_row_max_bits);
+            free(score_xfer_buffers);
             free(dummy_scores);
             free(dummy_queries);
             free(dummy_head_indices);
@@ -2230,6 +2673,50 @@ static int execute_batched_qk_round(
         0,
         sizeof(zero_slot_args),
         DPU_XFER_DEFAULT));
+
+    if (grouped_round && max_segment_count > 0) {
+        DPU_FOREACH(launch_set, dpu) {
+            qk_slot_item_t *item = find_qk_round_item_for_dpu(runner, items_by_dpu, dpu);
+            DPU_ASSERT(dpu_prepare_xfer(
+                dpu,
+                item != NULL ? (void *)item->segment_runtime_args : (void *)dummy_segment_runtime_args));
+        }
+        DPU_ASSERT(dpu_push_xfer(
+            launch_set,
+            DPU_XFER_TO_DPU,
+            "grouped_runtime_slot_args",
+            0,
+            (size_t)max_segment_count * sizeof(*dummy_segment_runtime_args),
+            DPU_XFER_DEFAULT));
+
+        DPU_FOREACH(launch_set, dpu) {
+            qk_slot_item_t *item = find_qk_round_item_for_dpu(runner, items_by_dpu, dpu);
+            DPU_ASSERT(dpu_prepare_xfer(
+                dpu,
+                item != NULL ? (void *)item->segment_lengths : (void *)dummy_segment_lengths));
+        }
+        DPU_ASSERT(dpu_push_xfer(
+            launch_set,
+            DPU_XFER_TO_DPU,
+            "grouped_segment_lengths",
+            0,
+            (size_t)max_segment_count * sizeof(*dummy_segment_lengths),
+            DPU_XFER_DEFAULT));
+
+        DPU_FOREACH(launch_set, dpu) {
+            qk_slot_item_t *item = find_qk_round_item_for_dpu(runner, items_by_dpu, dpu);
+            DPU_ASSERT(dpu_prepare_xfer(
+                dpu,
+                item != NULL ? (void *)&item->segment_count : (void *)&zero_segment_count));
+        }
+        DPU_ASSERT(dpu_push_xfer(
+            launch_set,
+            DPU_XFER_TO_DPU,
+            "grouped_segment_count",
+            0,
+            sizeof(zero_segment_count),
+            DPU_XFER_DEFAULT));
+    }
 
     if (head_index_bytes > 0) {
         DPU_FOREACH(launch_set, dpu) {
@@ -2268,7 +2755,37 @@ static int execute_batched_qk_round(
     if (score_bytes > 0 && items[round_indices[0]].slot_args.mode == KVSLOT_QK_SLOT_MODE_RAW_SCORES) {
         DPU_FOREACH(launch_set, dpu) {
             qk_slot_item_t *item = find_qk_round_item_for_dpu(runner, items_by_dpu, dpu);
-            DPU_ASSERT(dpu_prepare_xfer(dpu, item != NULL ? (void *)item->raw_scores : (void *)dummy_scores));
+            void *score_ptr = (void *)dummy_scores;
+            if (item != NULL) {
+                if ((size_t)item->num_heads * item->score_stride * sizeof(*item->raw_scores) == score_bytes) {
+                    score_ptr = (void *)item->raw_scores;
+                } else {
+                    void *padded_scores = calloc(1, score_bytes);
+                    if (padded_scores == NULL) {
+                        fprintf(stderr, "Failed to allocate padded batched qk scores\n");
+                        free(dummy_segment_lengths);
+                        free(dummy_segment_runtime_args);
+                        free(dummy_row_sum_bits);
+                        free(dummy_row_max_bits);
+                        if (score_xfer_buffers != NULL) {
+                            for (uint32_t physical_dpu_id = 0; physical_dpu_id < runner->nr_dpus; ++physical_dpu_id) {
+                                free(score_xfer_buffers[physical_dpu_id]);
+                            }
+                        }
+                        free(score_xfer_buffers);
+                        free(dummy_scores);
+                        free(dummy_queries);
+                        free(dummy_head_indices);
+                        free(active_ranks);
+                        free(rank_used);
+                        free(items_by_dpu);
+                        return 1;
+                    }
+                    score_xfer_buffers[item->physical_dpu_id] = padded_scores;
+                    score_ptr = padded_scores;
+                }
+            }
+            DPU_ASSERT(dpu_prepare_xfer(dpu, score_ptr));
         }
         DPU_ASSERT(dpu_push_xfer(
             launch_set,
@@ -2305,6 +2822,17 @@ static int execute_batched_qk_round(
             DPU_XFER_DEFAULT));
     }
     xfer_from_ns += elapsed_ns_since(xfer_from_start_ns);
+
+    if (score_bytes > 0 && items[round_indices[0]].slot_args.mode == KVSLOT_QK_SLOT_MODE_RAW_SCORES) {
+        for (uint32_t pos = 0; pos < round_count; ++pos) {
+            qk_slot_item_t *item = &items[round_indices[pos]];
+            void *buffer = score_xfer_buffers != NULL ? score_xfer_buffers[item->physical_dpu_id] : NULL;
+            size_t item_score_bytes = (size_t)item->num_heads * item->score_stride * sizeof(*item->raw_scores);
+            if (buffer != NULL && item_score_bytes > 0) {
+                memcpy(item->raw_scores, buffer, item_score_bytes);
+            }
+        }
+    }
     record_qk_round_timing(
         runner,
         1,
@@ -2314,10 +2842,18 @@ static int execute_batched_qk_round(
         xfer_from_ns,
         0);
 
+    free(dummy_segment_lengths);
+    free(dummy_segment_runtime_args);
     free(dummy_row_sum_bits);
     free(active_ranks);
     free(rank_used);
     free(dummy_row_max_bits);
+    if (score_xfer_buffers != NULL) {
+        for (uint32_t physical_dpu_id = 0; physical_dpu_id < runner->nr_dpus; ++physical_dpu_id) {
+            free(score_xfer_buffers[physical_dpu_id]);
+        }
+    }
+    free(score_xfer_buffers);
     free(dummy_scores);
     free(dummy_queries);
     free(dummy_head_indices);
@@ -2419,6 +2955,115 @@ static int prepare_av_item_header(kvslot_runner_t *runner, uint32_t slot_id, av_
     item->out.group_heads = slot->group_heads;
     item->out.head_dim = slot->head_dim;
     item->out.dtype_code = slot->dtype_code;
+    item->context_prefetched = 0;
+    item->ready = 1;
+    return 0;
+}
+
+static int prepare_grouped_av_item_header(
+    kvslot_runner_t *runner,
+    const uint32_t *slot_ids,
+    const uint32_t *segment_lengths,
+    uint32_t segment_count,
+    av_item_t *item)
+{
+    uint32_t total_seq_len = 0;
+    host_slot_t *first_slot = NULL;
+    struct dpu_set_t first_target_dpu;
+    uint32_t first_physical_dpu_id = 0;
+
+    if (runner == NULL || slot_ids == NULL || segment_lengths == NULL || item == NULL) {
+        return 1;
+    }
+    if (segment_count == 0 || segment_count > KVSLOT_MAX_GROUP_SEGMENTS) {
+        return 1;
+    }
+    memset(item, 0, sizeof(*item));
+
+    for (uint32_t seg_idx = 0; seg_idx < segment_count; ++seg_idx) {
+        struct dpu_set_t target_dpu;
+        host_slot_t *slot = NULL;
+        uint32_t slot_id = slot_ids[seg_idx];
+        uint32_t physical_dpu_id;
+        if (slot_id >= runner->nr_dpus * KVSLOT_MAX_SLOTS_PER_DPU) {
+            fprintf(stderr, "Invalid grouped av slot id %u\n", slot_id);
+            return 1;
+        }
+        if (runner_get_dpu_and_slot(runner, slot_id, &target_dpu, &slot) != 0 || slot == NULL || slot->capacity == 0) {
+            fprintf(stderr, "Failed to locate grouped av slot %u\n", slot_id);
+            return 1;
+        }
+        physical_dpu_id = slot_id % runner->nr_dpus;
+        if (seg_idx == 0) {
+            first_slot = slot;
+            first_target_dpu = target_dpu;
+            first_physical_dpu_id = physical_dpu_id;
+            item->slot = slot;
+            item->target_dpu = target_dpu;
+            item->slot_id = slot_id;
+            item->physical_dpu_id = physical_dpu_id;
+            item->out.capacity = 0;
+            item->out.group_heads = slot->group_heads;
+            item->out.head_dim = slot->head_dim;
+            item->out.dtype_code = slot->dtype_code;
+        } else {
+            if (physical_dpu_id != first_physical_dpu_id) {
+                fprintf(stderr, "Grouped av item spans multiple physical DPUs\n");
+                return 1;
+            }
+            if (slot->group_heads != first_slot->group_heads || slot->head_dim != first_slot->head_dim || slot->dtype_code != first_slot->dtype_code) {
+                fprintf(stderr, "Grouped av item shape mismatch across segments\n");
+                return 1;
+            }
+            item->target_dpu = first_target_dpu;
+        }
+        if (segment_lengths[seg_idx] > slot->seq_len) {
+            fprintf(stderr, "Grouped av segment length exceeds slot seq len\n");
+            return 1;
+        }
+        item->segment_slots[seg_idx] = slot;
+        item->segment_slot_ids[seg_idx] = slot_id;
+        item->segment_lengths[seg_idx] = segment_lengths[seg_idx];
+        item->segment_runtime_args[seg_idx].seq_len = segment_lengths[seg_idx];
+        item->segment_runtime_args[seg_idx].group_heads = slot->group_heads;
+        item->segment_runtime_args[seg_idx].head_dim = slot->head_dim;
+        item->segment_runtime_args[seg_idx].dtype_code = slot->dtype_code;
+        item->segment_runtime_args[seg_idx].elem_offset = slot->elem_offset + ((slot->seq_len - segment_lengths[seg_idx]) * slot->group_heads * slot->head_dim);
+        item->segment_runtime_args[seg_idx].reserved[0] = 0;
+        item->segment_runtime_args[seg_idx].reserved[1] = 0;
+        item->segment_runtime_args[seg_idx].reserved[2] = 0;
+        total_seq_len += segment_lengths[seg_idx];
+        item->out.capacity += slot->capacity;
+    }
+
+    item->segment_count = segment_count;
+    item->runtime_args.seq_len = total_seq_len;
+    item->runtime_args.group_heads = first_slot->group_heads;
+    item->runtime_args.head_dim = first_slot->head_dim;
+    item->runtime_args.dtype_code = first_slot->dtype_code;
+    item->runtime_args.elem_offset = 0;
+    item->runtime_args.reserved[0] = 0;
+    item->runtime_args.reserved[1] = 0;
+    item->runtime_args.reserved[2] = 0;
+    item->out.seq_len = total_seq_len;
+    item->weight_bytes = (size_t)total_seq_len * first_slot->group_heads * sizeof(float);
+    item->context_bytes = (size_t)first_slot->group_heads * first_slot->head_dim * sizeof(float);
+    item->padded_weight_bytes = ((item->weight_bytes + 7u) / 8u) * 8u;
+    item->padded_context_bytes = ((item->context_bytes + 7u) / 8u) * 8u;
+    if (item->weight_bytes > 0) {
+        item->weights = calloc(1, item->padded_weight_bytes);
+        if (item->weights == NULL) {
+            fprintf(stderr, "Failed to allocate grouped av weights buffer\n");
+            return 1;
+        }
+    }
+    if (item->context_bytes > 0) {
+        item->context = calloc(1, item->padded_context_bytes);
+        if (item->context == NULL) {
+            fprintf(stderr, "Failed to allocate grouped av context buffer\n");
+            return 1;
+        }
+    }
     item->context_prefetched = 0;
     item->ready = 1;
     return 0;
@@ -2556,7 +3201,7 @@ static int prepare_av_item(kvslot_runner_t *runner, uint32_t slot_id, av_item_t 
 
 static int launch_av_item_async(const av_item_t *item, kvslot_profile_stats_t *profile)
 {
-    uint32_t kernel_command = KVSLOT_KERNEL_AV;
+    uint32_t kernel_command = item != NULL && item->segment_count > 1 ? (KVSLOT_KERNEL_AV + 100u) : KVSLOT_KERNEL_AV;
     uint64_t start_ns;
     uint64_t launch_start_ns;
 
@@ -2566,6 +3211,29 @@ static int launch_av_item_async(const av_item_t *item, kvslot_profile_stats_t *p
     start_ns = monotonic_time_ns();
     DPU_ASSERT(dpu_copy_to(item->target_dpu, "kvslot_kernel_command", 0, &kernel_command, sizeof(kernel_command)));
     DPU_ASSERT(dpu_copy_to(item->target_dpu, "runtime_slot_args", 0, &item->runtime_args, sizeof(item->runtime_args)));
+    if (item->segment_count > 1) {
+        DPU_ASSERT(dpu_copy_to(
+            item->target_dpu,
+            "grouped_runtime_slot_args",
+            0,
+            item->segment_runtime_args,
+            (size_t)item->segment_count * sizeof(*item->segment_runtime_args)
+        ));
+        DPU_ASSERT(dpu_copy_to(
+            item->target_dpu,
+            "grouped_segment_lengths",
+            0,
+            item->segment_lengths,
+            (size_t)item->segment_count * sizeof(*item->segment_lengths)
+        ));
+        DPU_ASSERT(dpu_copy_to(
+            item->target_dpu,
+            "grouped_segment_count",
+            0,
+            &item->segment_count,
+            sizeof(item->segment_count)
+        ));
+    }
     if (item->weight_bytes > 0 && !item->weights_resident_on_dpu) {
         DPU_ASSERT(dpu_copy_to(item->target_dpu, "av_weights_bits", 0, item->weights, item->padded_weight_bytes));
     }
@@ -2586,7 +3254,6 @@ static int can_use_batched_av_round(
     const uint32_t *round_indices,
     uint32_t round_count)
 {
-    size_t padded_weight_bytes;
     size_t padded_context_bytes;
     uint32_t active_rank_count = 0;
     uint8_t *rank_used = NULL;
@@ -2598,14 +3265,19 @@ static int can_use_batched_av_round(
         return 0;
     }
 
-    padded_weight_bytes = items[round_indices[0]].padded_weight_bytes;
     padded_context_bytes = items[round_indices[0]].padded_context_bytes;
     for (uint32_t pos = 1; pos < round_count; ++pos) {
         av_item_t *item = &items[round_indices[pos]];
-        if (!item->ready || item->padded_weight_bytes != padded_weight_bytes || item->padded_context_bytes != padded_context_bytes) {
+        if (!item->ready) {
             return 0;
         }
-        if (item->weights_resident_on_dpu != items[round_indices[0]].weights_resident_on_dpu) {
+        if (item->runtime_args.group_heads != items[round_indices[0]].runtime_args.group_heads
+            || item->runtime_args.head_dim != items[round_indices[0]].runtime_args.head_dim
+            || item->runtime_args.dtype_code != items[round_indices[0]].runtime_args.dtype_code
+            || item->padded_context_bytes != padded_context_bytes
+            || item->weights_resident_on_dpu != items[round_indices[0]].weights_resident_on_dpu
+            || item->context_from_qk_kernel != items[round_indices[0]].context_from_qk_kernel
+            || ((item->segment_count > 1) != (items[round_indices[0]].segment_count > 1))) {
             return 0;
         }
     }
@@ -2648,12 +3320,18 @@ static int execute_batched_av_round(
     uint32_t round_count)
 {
     av_item_t **items_by_dpu = NULL;
+    void **weight_xfer_buffers = NULL;
     float *dummy_weights = NULL;
     float *dummy_context = NULL;
     kvslot_runtime_slot_args_t zero_runtime_args;
+    kvslot_runtime_slot_args_t *dummy_segment_runtime_args = NULL;
+    uint32_t *dummy_segment_lengths = NULL;
     size_t padded_weight_bytes;
     size_t padded_context_bytes;
+    uint32_t max_segment_count = 0;
+    uint32_t zero_segment_count = 0;
     uint32_t kernel_command = KVSLOT_KERNEL_AV;
+    int grouped_round = 0;
     uint32_t active_rank_count = 0;
     uint8_t *rank_used = NULL;
     struct dpu_rank_t **active_ranks = NULL;
@@ -2678,8 +3356,9 @@ static int execute_batched_av_round(
         return 1;
     }
     memset(&zero_runtime_args, 0, sizeof(zero_runtime_args));
-    padded_weight_bytes = items[round_indices[0]].padded_weight_bytes;
-    padded_context_bytes = items[round_indices[0]].padded_context_bytes;
+    padded_weight_bytes = 0;
+    padded_context_bytes = 0;
+    grouped_round = items[round_indices[0]].segment_count > 1;
     memset(&launch_set, 0, sizeof(launch_set));
 
     for (uint32_t pos = 0; pos < round_count; ++pos) {
@@ -2689,7 +3368,21 @@ static int execute_batched_av_round(
             free(items_by_dpu);
             return 1;
         }
+        if ((item->segment_count > 1) != grouped_round) {
+            fprintf(stderr, "Mixed grouped/regular av items in a batched round\n");
+            free(items_by_dpu);
+            return 1;
+        }
         items_by_dpu[item->physical_dpu_id] = item;
+        if (item->padded_weight_bytes > padded_weight_bytes) {
+            padded_weight_bytes = item->padded_weight_bytes;
+        }
+        if (item->padded_context_bytes > padded_context_bytes) {
+            padded_context_bytes = item->padded_context_bytes;
+        }
+        if (item->segment_count > max_segment_count) {
+            max_segment_count = item->segment_count;
+        }
     }
 
     rank_used = calloc(runner->nr_ranks, sizeof(*rank_used));
@@ -2735,11 +3428,38 @@ static int execute_batched_av_round(
             free(items_by_dpu);
             return 1;
         }
+        weight_xfer_buffers = calloc(runner->nr_dpus, sizeof(*weight_xfer_buffers));
+        if (weight_xfer_buffers == NULL) {
+            fprintf(stderr, "Failed to allocate batched av weight transfer buffers\n");
+            free(dummy_weights);
+            free(active_ranks);
+            free(rank_used);
+            free(items_by_dpu);
+            return 1;
+        }
     }
     if (padded_context_bytes > 0) {
         dummy_context = calloc(1, padded_context_bytes);
         if (dummy_context == NULL) {
             fprintf(stderr, "Failed to allocate batched av dummy context\n");
+            free(weight_xfer_buffers);
+            free(active_ranks);
+            free(rank_used);
+            free(dummy_weights);
+            free(items_by_dpu);
+            return 1;
+        }
+    }
+    if (grouped_round && max_segment_count > 0) {
+        kernel_command = KVSLOT_KERNEL_AV + 100u;
+        dummy_segment_runtime_args = calloc(max_segment_count, sizeof(*dummy_segment_runtime_args));
+        dummy_segment_lengths = calloc(max_segment_count, sizeof(*dummy_segment_lengths));
+        if (dummy_segment_runtime_args == NULL || dummy_segment_lengths == NULL) {
+            fprintf(stderr, "Failed to allocate grouped av dummy metadata\n");
+            free(dummy_segment_lengths);
+            free(dummy_segment_runtime_args);
+            free(dummy_context);
+            free(weight_xfer_buffers);
             free(active_ranks);
             free(rank_used);
             free(dummy_weights);
@@ -2763,10 +3483,82 @@ static int execute_batched_av_round(
         sizeof(zero_runtime_args),
         DPU_XFER_DEFAULT));
 
+    if (grouped_round && max_segment_count > 0) {
+        DPU_FOREACH(launch_set, dpu) {
+            av_item_t *item = find_av_round_item_for_dpu(runner, items_by_dpu, dpu);
+            DPU_ASSERT(dpu_prepare_xfer(
+                dpu,
+                item != NULL ? (void *)item->segment_runtime_args : (void *)dummy_segment_runtime_args));
+        }
+        DPU_ASSERT(dpu_push_xfer(
+            launch_set,
+            DPU_XFER_TO_DPU,
+            "grouped_runtime_slot_args",
+            0,
+            (size_t)max_segment_count * sizeof(*dummy_segment_runtime_args),
+            DPU_XFER_DEFAULT));
+
+        DPU_FOREACH(launch_set, dpu) {
+            av_item_t *item = find_av_round_item_for_dpu(runner, items_by_dpu, dpu);
+            DPU_ASSERT(dpu_prepare_xfer(
+                dpu,
+                item != NULL ? (void *)item->segment_lengths : (void *)dummy_segment_lengths));
+        }
+        DPU_ASSERT(dpu_push_xfer(
+            launch_set,
+            DPU_XFER_TO_DPU,
+            "grouped_segment_lengths",
+            0,
+            (size_t)max_segment_count * sizeof(*dummy_segment_lengths),
+            DPU_XFER_DEFAULT));
+
+        DPU_FOREACH(launch_set, dpu) {
+            av_item_t *item = find_av_round_item_for_dpu(runner, items_by_dpu, dpu);
+            DPU_ASSERT(dpu_prepare_xfer(
+                dpu,
+                item != NULL ? (void *)&item->segment_count : (void *)&zero_segment_count));
+        }
+        DPU_ASSERT(dpu_push_xfer(
+            launch_set,
+            DPU_XFER_TO_DPU,
+            "grouped_segment_count",
+            0,
+            sizeof(zero_segment_count),
+            DPU_XFER_DEFAULT));
+    }
+
     if (padded_weight_bytes > 0 && !items[round_indices[0]].weights_resident_on_dpu) {
         DPU_FOREACH(launch_set, dpu) {
             av_item_t *item = find_av_round_item_for_dpu(runner, items_by_dpu, dpu);
-            DPU_ASSERT(dpu_prepare_xfer(dpu, item != NULL ? (void *)item->weights : (void *)dummy_weights));
+            void *weight_ptr = dummy_weights;
+            if (item != NULL) {
+                if (item->padded_weight_bytes == padded_weight_bytes) {
+                    weight_ptr = (void *)item->weights;
+                } else {
+                    void *padded_weights = calloc(1, padded_weight_bytes);
+                    if (padded_weights == NULL) {
+                        fprintf(stderr, "Failed to allocate padded batched av weights\n");
+                        free(dummy_segment_lengths);
+                        free(dummy_segment_runtime_args);
+                        free(dummy_context);
+                        if (weight_xfer_buffers != NULL) {
+                            for (uint32_t physical_dpu_id = 0; physical_dpu_id < runner->nr_dpus; ++physical_dpu_id) {
+                                free(weight_xfer_buffers[physical_dpu_id]);
+                            }
+                        }
+                        free(weight_xfer_buffers);
+                        free(active_ranks);
+                        free(rank_used);
+                        free(dummy_weights);
+                        free(items_by_dpu);
+                        return 1;
+                    }
+                    memcpy(padded_weights, item->weights, item->padded_weight_bytes);
+                    weight_xfer_buffers[item->physical_dpu_id] = padded_weights;
+                    weight_ptr = padded_weights;
+                }
+            }
+            DPU_ASSERT(dpu_prepare_xfer(dpu, weight_ptr));
         }
         DPU_ASSERT(dpu_push_xfer(
             launch_set,
@@ -2808,7 +3600,15 @@ static int execute_batched_av_round(
 
     free(active_ranks);
     free(rank_used);
+    free(dummy_segment_lengths);
+    free(dummy_segment_runtime_args);
     free(dummy_context);
+    if (weight_xfer_buffers != NULL) {
+        for (uint32_t physical_dpu_id = 0; physical_dpu_id < runner->nr_dpus; ++physical_dpu_id) {
+            free(weight_xfer_buffers[physical_dpu_id]);
+        }
+    }
+    free(weight_xfer_buffers);
     free(dummy_weights);
     free(items_by_dpu);
     return 0;
@@ -3251,6 +4051,163 @@ static int handle_softmax_av_batch(kvslot_runner_t *runner)
     }
     if (rc == 0 && flush_exact(stdout) != 0) {
         fprintf(stderr, "Failed to flush softmax av batch response\n");
+        rc = 1;
+    }
+
+cleanup:
+    if (items != NULL) {
+        for (uint32_t idx = 0; idx < args.num_slots; ++idx) {
+            cleanup_av_item(&items[idx]);
+        }
+    }
+    free(items);
+    free(processed);
+    free(used_dpus);
+    return rc;
+}
+
+static int handle_av_grouped_batch(kvslot_runner_t *runner)
+{
+    kvslot_av_batch_args_t args;
+    av_item_t *items = NULL;
+    uint8_t *processed = NULL;
+    uint8_t *used_dpus = NULL;
+    uint32_t processed_count = 0;
+    int rc = 0;
+
+    if (read_exact(stdin, &args, sizeof(args)) != 0) {
+        fprintf(stderr, "Failed to read grouped av batch args\n");
+        return 1;
+    }
+    if (args.num_slots == 0 || args.num_slots > KVSLOT_MAX_HEADS) {
+        fprintf(stderr, "Invalid grouped av batch num_slots=%u\n", args.num_slots);
+        return 1;
+    }
+
+    items = calloc(args.num_slots, sizeof(*items));
+    processed = calloc(args.num_slots, sizeof(*processed));
+    used_dpus = calloc(runner->nr_dpus, sizeof(*used_dpus));
+    if (items == NULL || processed == NULL || used_dpus == NULL) {
+        fprintf(stderr, "Failed to allocate grouped av batch state\n");
+        free(used_dpus);
+        free(processed);
+        free(items);
+        return 1;
+    }
+
+    for (uint32_t idx = 0; idx < args.num_slots; ++idx) {
+        uint32_t segment_count = 0;
+        uint32_t slot_ids[KVSLOT_MAX_GROUP_SEGMENTS];
+        uint32_t segment_lengths[KVSLOT_MAX_GROUP_SEGMENTS];
+        uint32_t total_seq_len = 0;
+        if (read_exact(stdin, &segment_count, sizeof(segment_count)) != 0) {
+            fprintf(stderr, "Failed to read grouped av segment count %u\n", idx);
+            rc = 1;
+            goto cleanup;
+        }
+        if (segment_count == 0 || segment_count > KVSLOT_MAX_GROUP_SEGMENTS) {
+            fprintf(stderr, "Invalid grouped av segment_count=%u at item %u\n", segment_count, idx);
+            rc = 1;
+            goto cleanup;
+        }
+        for (uint32_t seg_idx = 0; seg_idx < segment_count; ++seg_idx) {
+            kvslot_io_header_t header;
+            if (read_exact(stdin, &header, sizeof(header)) != 0) {
+                fprintf(stderr, "Failed to read grouped av item header %u/%u\n", idx, seg_idx);
+                rc = 1;
+                goto cleanup;
+            }
+            if (header.magic != KVSLOT_MAGIC || header.command != KVSLOT_CMD_AV_GROUPED_BATCH) {
+                fprintf(stderr, "Invalid grouped av item header %u/%u\n", idx, seg_idx);
+                rc = 1;
+                goto cleanup;
+            }
+            slot_ids[seg_idx] = header.slot_id;
+            if (read_exact(stdin, &segment_lengths[seg_idx], sizeof(segment_lengths[seg_idx])) != 0) {
+                fprintf(stderr, "Failed to read grouped av segment len %u/%u\n", idx, seg_idx);
+                rc = 1;
+                goto cleanup;
+            }
+            total_seq_len += segment_lengths[seg_idx];
+        }
+        if (prepare_grouped_av_item_header(runner, slot_ids, segment_lengths, segment_count, &items[idx]) != 0) {
+            fprintf(stderr, "Failed to prepare grouped av item %u\n", idx);
+            rc = 1;
+            goto cleanup;
+        }
+        if (items[idx].weight_bytes > 0 && read_exact(stdin, items[idx].weights, items[idx].weight_bytes) != 0) {
+            fprintf(stderr, "Failed to read grouped av weights %u\n", idx);
+            rc = 1;
+            goto cleanup;
+        }
+    }
+
+    while (processed_count < args.num_slots && rc == 0) {
+        uint32_t round_indices[KVSLOT_MAX_HEADS];
+        uint32_t round_count = build_av_launch_round(
+            runner,
+            items,
+            args.num_slots,
+            processed,
+            used_dpus,
+            round_indices);
+        if (round_count == 0) {
+            fprintf(stderr, "Failed to build grouped av launch round\n");
+            rc = 1;
+            break;
+        }
+
+        if (can_use_batched_av_round(runner, items, round_indices, round_count)) {
+            record_av_round_profile(runner, items, round_indices, round_count, 1);
+            if (execute_batched_av_round(runner, items, round_indices, round_count) != 0) {
+                fprintf(stderr, "Failed to execute batched grouped av round\n");
+                rc = 1;
+            }
+        } else {
+            uint64_t round_start_ns = monotonic_time_ns();
+            record_av_round_profile(runner, items, round_indices, round_count, 0);
+            for (uint32_t pos = 0; pos < round_count; ++pos) {
+                if (launch_av_item_async(&items[round_indices[pos]], &runner->profile) != 0) {
+                    fprintf(stderr, "Failed to launch grouped av item %u\n", round_indices[pos]);
+                    rc = 1;
+                    break;
+                }
+            }
+            for (uint32_t pos = 0; pos < round_count && rc == 0; ++pos) {
+                if (finish_av_item(&items[round_indices[pos]], &runner->profile) != 0) {
+                    fprintf(stderr, "Failed to finish grouped av item %u\n", round_indices[pos]);
+                    rc = 1;
+                    break;
+                }
+            }
+            record_av_round_timing(
+                runner,
+                0,
+                elapsed_ns_since(round_start_ns),
+                0,
+                0,
+                0,
+                0);
+        }
+        for (uint32_t pos = 0; pos < round_count && rc == 0; ++pos) {
+            processed[round_indices[pos]] = 1;
+            processed_count += 1;
+        }
+    }
+
+    if (rc == 0 && write_exact(stdout, &args, sizeof(args)) != 0) {
+        fprintf(stderr, "Failed to write grouped av batch response header\n");
+        rc = 1;
+    }
+    for (uint32_t idx = 0; idx < args.num_slots && rc == 0; ++idx) {
+        if (write_av_item_response(&items[idx]) != 0) {
+            fprintf(stderr, "Failed to write grouped av batch item %u\n", idx);
+            rc = 1;
+            break;
+        }
+    }
+    if (rc == 0 && flush_exact(stdout) != 0) {
+        fprintf(stderr, "Failed to flush grouped av batch response\n");
         rc = 1;
     }
 
@@ -3744,8 +4701,12 @@ static int run_stdio_mode(uint32_t requested_dpus)
             rc = handle_av(&runner, header.slot_id);
         } else if (header.command == KVSLOT_CMD_AV_BATCH) {
             rc = handle_av_batch(&runner);
+        } else if (header.command == KVSLOT_CMD_AV_GROUPED_BATCH) {
+            rc = handle_av_grouped_batch(&runner);
         } else if (header.command == KVSLOT_CMD_QK_SLOT_BATCH) {
             rc = handle_qk_slot_batch(&runner);
+        } else if (header.command == KVSLOT_CMD_QK_SLOT_GROUPED_BATCH) {
+            rc = handle_qk_slot_grouped_batch(&runner);
         } else if (header.command == KVSLOT_CMD_SOFTMAX_AV_BATCH) {
             rc = handle_softmax_av_batch(&runner);
         } else if (header.command == KVSLOT_CMD_QK_SOFTMAX_AV_BATCH) {
