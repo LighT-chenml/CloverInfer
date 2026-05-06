@@ -10,7 +10,7 @@ import ray
 import torch
 from transformers.utils import logging
 
-from .attention_backend import CpuAttentionBackend, PimNaiveAttentionBackend
+from .attention_backend import CpuAttentionBackend, GpuAttentionBackend, PimNaiveAttentionBackend
 from .config import ModelConfig
 from .model_adapter import CausalModelAdapter
 
@@ -75,24 +75,31 @@ class AttentionNode:
         config: ModelConfig,
         backend: str = "cpu",
         backend_kwargs: Dict[str, object] | None = None,
+        prefer_gpu: bool = False,
         decode_batch_window_s: float = 0.001,
         decode_batch_max_size: int = 8,
     ):
         self.node_id = node_id
         self.config = config
         self.backend_name = backend
-        self.device = "cpu"
+        self.device = _select_device(prefer_gpu)
         backend_kwargs = backend_kwargs or {}
         decode_batch_window_s = float(backend_kwargs.pop("decode_batch_window_s", decode_batch_window_s))
         decode_batch_max_size = int(backend_kwargs.pop("decode_batch_max_size", decode_batch_max_size))
         if backend == "cpu":
+            self.device = "cpu"
             self.backend = CpuAttentionBackend()
+        elif backend == "gpu":
+            self.device = _select_device(True)
+            self.backend = GpuAttentionBackend()
         elif backend == "pim_naive":
+            self.device = "cpu"
             self.backend = PimNaiveAttentionBackend(**backend_kwargs)
         elif backend == "cloverinfer":
             importlib.invalidate_caches()
             from .clover_attention_backend import CloverInferAttentionBackend
 
+            self.device = "cpu"
             self.backend = CloverInferAttentionBackend(**backend_kwargs)
         else:
             raise ValueError(f"Unsupported attention backend for now: {backend}")

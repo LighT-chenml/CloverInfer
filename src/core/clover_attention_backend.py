@@ -75,6 +75,8 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         self.op_timing_counts: Dict[str, int] = {key: 0 for key in self.op_timing_totals}
         self.shadow_check_invocations = 0
         self.shadow_check_skips = 0
+        self.resident_runtime_fallbacks = 0
+        self.resident_runtime_fallback_reason = ""
         if self.pim_attention_enabled:
             self.qk_full_enabled = True
             self.softmax_av_fused_enabled = True
@@ -242,8 +244,15 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                     f"with {request_state.num_layers} layers"
                 )
 
-            with self._timed("resident_append_s"):
-                self._append_resident_kv(request_state, layer_idx, k_new, v_new)
+            if self.resident_compute_enabled:
+                try:
+                    with self._timed("resident_append_s"):
+                        self._append_resident_kv(request_state, layer_idx, k_new, v_new)
+                except RuntimeError as exc:
+                    self.resident_compute_enabled = False
+                    self.resident_av_enabled = False
+                    self.resident_runtime_fallbacks += 1
+                    self.resident_runtime_fallback_reason = str(exc)
 
             if self.cpu_shadow_enabled:
                 with self._timed("cpu_shadow_append_s"):
@@ -430,6 +439,15 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
             self.qk_mixed_last_diag_path = ""
             self._apply_qk_context_fused_batch(records)
             return self._finalize_ready_context_records(records)
+        if not self.resident_compute_enabled:
+            self.qk_mixed_last_head_diffs = []
+            self.qk_mixed_last_max_abs_diff = 0.0
+            self.qk_mixed_last_diag = {
+                "skipped": True,
+                "reason": "resident_runtime_fallback_disabled_resident_compute",
+            }
+            self.qk_mixed_last_diag_path = ""
+            return self._finalize_decode_records(records)
         if self.qk_full_enabled and self.resident_compute_enabled:
             self.qk_mixed_last_head_diffs = []
             self.qk_mixed_last_max_abs_diff = 0.0
@@ -476,13 +494,27 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                     slot_query_refs.append((record, group.k_slot, group.v_slot))
 
             if flat_slot_queries:
-                with self._timed("resident_qk_batch_s"):
-                    slot_score_mats = self.resident_store.qk_slot_scores_batch(flat_slot_queries)
-                self.qk_batch_calls += 1
-                self.qk_full_batch_calls += 1
-                for (record, k_slot, v_slot), score_mat in zip(slot_query_refs, slot_score_mats):
-                    scaled_scores = score_mat.to(torch.float32) * float(record["score_scale"])
-                    record["resident_slot_scores"].append((k_slot, v_slot, scaled_scores))
+                try:
+                    with self._timed("resident_qk_batch_s"):
+                        slot_score_mats = self.resident_store.qk_slot_scores_batch(flat_slot_queries)
+                    self.qk_batch_calls += 1
+                    self.qk_full_batch_calls += 1
+                    for (record, k_slot, v_slot), score_mat in zip(slot_query_refs, slot_score_mats):
+                        scaled_scores = score_mat.to(torch.float32) * float(record["score_scale"])
+                        record["resident_slot_scores"].append((k_slot, v_slot, scaled_scores))
+                except RuntimeError:
+                    for record in records:
+                        if record["keys"] is None or record["values"] is None:
+                            with self._timed("resident_materialize_s"):
+                                record["keys"], record["values"] = self._materialize_layer_kv(
+                                    record["request_state"],
+                                    record["layer_idx"],
+                                )
+                        record["use_resident_av"] = False
+                        record["resident_slot_scores"] = []
+                        record["scores"] = self._compute_host_scores(record)
+                    self.qk_full_shadow_last_max_abs_diff = 0.0
+                    return
 
             self.qk_full_shadow_last_max_abs_diff = 0.0
             for record in records:
@@ -809,6 +841,8 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         debug["clover_pim_context_fused_experimental_enabled"] = self.pim_context_fused_experimental_enabled
         debug["clover_shadow_check_invocations"] = self.shadow_check_invocations
         debug["clover_shadow_check_skips"] = self.shadow_check_skips
+        debug["resident_runtime_fallbacks"] = int(self.resident_runtime_fallbacks)
+        debug["resident_runtime_fallback_reason"] = str(self.resident_runtime_fallback_reason)
         debug["clover_op_timing_totals_s"] = dict(self.op_timing_totals)
         debug["clover_op_timing_counts"] = dict(self.op_timing_counts)
         return debug

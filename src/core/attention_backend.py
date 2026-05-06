@@ -155,6 +155,82 @@ class CpuAttentionBackend:
         self.context_lens.pop(request_id, None)
 
 
+class GpuAttentionBackend(CpuAttentionBackend):
+    """GPU attention backend for AFD-style disaggregated execution.
+
+    This keeps the RPC/workflow separation of the attention node, but executes
+    the attention math on CUDA so it can share the decode GPU on the dense node
+    machine.
+    """
+
+    def __init__(self):
+        if not torch.cuda.is_available():
+            raise RuntimeError("GpuAttentionBackend requires CUDA, but no GPU is available")
+        super().__init__()
+        self.device = torch.device("cuda")
+
+    def init_request(
+        self,
+        request_id: str,
+        initial_kv: List[Dict[str, torch.Tensor]],
+        decode_reserve_tokens: int = 0,
+    ) -> int:
+        del decode_reserve_tokens
+        if request_id in self.k_cache:
+            raise ValueError(f"Request {request_id} already exists")
+
+        self.k_cache[request_id] = [layer["key"].detach().to(self.device).contiguous() for layer in initial_kv]
+        self.v_cache[request_id] = [layer["value"].detach().to(self.device).contiguous() for layer in initial_kv]
+
+        if not self.k_cache[request_id]:
+            raise ValueError("initial_kv must contain at least one layer")
+
+        seq_len = int(self.k_cache[request_id][0].shape[0])
+        self.context_lens[request_id] = seq_len
+        return seq_len
+
+    def decode_layer(
+        self,
+        request_id: str,
+        layer_idx: int,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        score_scale: float = 1.0,
+    ) -> torch.Tensor:
+        if request_id not in self.k_cache:
+            raise KeyError(f"Unknown request {request_id}")
+
+        q = query.detach().to(self.device).contiguous()
+        k_new = key.detach().to(self.device).contiguous()
+        v_new = value.detach().to(self.device).contiguous()
+
+        if q.dim() == 3:
+            q = q.squeeze(0)
+        if k_new.dim() == 3:
+            k_new = k_new.squeeze(0)
+        if v_new.dim() == 3:
+            v_new = v_new.squeeze(0)
+
+        self.k_cache[request_id][layer_idx] = torch.cat(
+            [self.k_cache[request_id][layer_idx], k_new.unsqueeze(0)], dim=0
+        )
+        self.v_cache[request_id][layer_idx] = torch.cat(
+            [self.v_cache[request_id][layer_idx], v_new.unsqueeze(0)], dim=0
+        )
+
+        keys = self.k_cache[request_id][layer_idx]
+        values = self.v_cache[request_id][layer_idx]
+        scores = torch.einsum("hd,lhd->hl", q.float(), keys.float()) * float(score_scale)
+        weights = torch.softmax(scores, dim=-1)
+        context = torch.einsum("hl,lhd->hd", weights, values.float()).to(query.dtype)
+
+        if layer_idx == len(self.k_cache[request_id]) - 1:
+            self.context_lens[request_id] += 1
+
+        return context.unsqueeze(0).cpu()
+
+
 class PimNaiveAttentionBackend:
     """UPMEM-backed backend skeleton.
 

@@ -20,7 +20,7 @@ def parse_args():
     parser.add_argument("--prompt", default="Hello CloverInfer")
     parser.add_argument("--max-new-tokens", type=int, default=2)
     parser.add_argument("--skip-generation", action="store_true")
-    parser.add_argument("--attention-backend", default="cpu", choices=["cpu", "pim_naive", "cloverinfer"])
+    parser.add_argument("--attention-backend", default="cpu", choices=["cpu", "gpu", "pim_naive", "cloverinfer"])
     parser.add_argument("--pim-num-dpus", type=int, default=4)
     parser.add_argument("--pim-resident-store-backend", default="host", choices=["host", "upmem_kvslot"])
     parser.add_argument("--pim-qk-full-enabled", action="store_true")
@@ -120,15 +120,23 @@ def main():
         runtime_env={"env_vars": {"PYTHONPATH": REPO_ROOT}},
     )
 
+    use_gpu_for_attention = args.attention_backend == "gpu"
+    attention_resource = "decode_dense_gpu" if use_gpu_for_attention else "attention_pim"
+    decode_dense_gpu_fraction = 0.5 if use_gpu_for_attention else 1.0
+    attention_gpu_fraction = 0.5 if use_gpu_for_attention else 0.0
+
     cluster = ClusterConfig(
         num_prefill_workers=1,
         num_attention_nodes=1,
         num_decode_dense_nodes=1,
         prefill_resource="prefill_gpu",
         decode_dense_resource="decode_dense_gpu",
-        attention_resource="attention_pim",
+        attention_resource=attention_resource,
         use_gpu_for_prefill=True,
         use_gpu_for_decode_dense=True,
+        use_gpu_for_attention=use_gpu_for_attention,
+        decode_dense_gpu_fraction=decode_dense_gpu_fraction,
+        attention_gpu_fraction=attention_gpu_fraction,
         attention_backend=args.attention_backend,
         pim_num_dpus=args.pim_num_dpus,
         pim_resident_store_backend=args.pim_resident_store_backend,
@@ -167,7 +175,8 @@ def main():
     assert info["attention"]["ip"] == args.expected_attention_ip, info
     assert info["prefill"]["device"] == "cuda", info
     assert info["decode_dense"]["device"] == "cuda", info
-    assert info["attention"]["device"] == "cpu", info
+    expected_attention_device = "cuda" if args.attention_backend == "gpu" else "cpu"
+    assert info["attention"]["device"] == expected_attention_device, info
     assert info["attention"]["backend"] == args.attention_backend, info
     if args.attention_backend in {"pim_naive", "cloverinfer"}:
         debug = info["attention"]["backend_debug"]

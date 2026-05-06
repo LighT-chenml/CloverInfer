@@ -862,13 +862,19 @@ class GlobalScheduler:
             if self.cluster_config.use_gpu_for_decode_dense
             else 0.0
         )
-        if gpu_prefill < 0 or gpu_dense < 0:
+        gpu_attention = (
+            float(getattr(self.cluster_config, "attention_gpu_fraction", 0.0))
+            if getattr(self.cluster_config, "use_gpu_for_attention", False)
+            else 0.0
+        )
+        if gpu_prefill < 0 or gpu_dense < 0 or gpu_attention < 0:
             raise ValueError("GPU fractions must be non-negative")
         cluster_resources = ray.cluster_resources()
         available_gpus = float(cluster_resources.get("GPU", 0.0))
         requested_gpus = (
             gpu_prefill * int(self.cluster_config.num_prefill_workers)
             + gpu_dense * int(self.cluster_config.num_decode_dense_nodes)
+            + gpu_attention * int(self.cluster_config.num_attention_nodes)
         )
         if requested_gpus > available_gpus + 1e-6:
             raise RuntimeError(
@@ -931,12 +937,13 @@ class GlobalScheduler:
 
         self.attention_nodes = [
             AttentionNode.options(
-                **_actor_options(self.cluster_config.attention_resource, 0)
+                **_actor_options(self.cluster_config.attention_resource, gpu_attention)
             ).remote(
                 i,
                 self.model_config,
                 self.cluster_config.attention_backend,
                 attention_backend_kwargs,
+                bool(getattr(self.cluster_config, "use_gpu_for_attention", False)),
             )
             for i in range(self.cluster_config.num_attention_nodes)
         ]

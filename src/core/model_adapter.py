@@ -266,8 +266,8 @@ class CausalModelAdapter:
     def _build_legacy_past_key_values(self, initial_kv: List[Dict[str, torch.Tensor]]):
         past_key_values = []
         for layer_kv in initial_kv:
-            key = layer_kv["key"].to(self.device)
-            value = layer_kv["value"].to(self.device)
+            key = layer_kv["key"].to(device=self.device, dtype=self.dtype)
+            value = layer_kv["value"].to(device=self.device, dtype=self.dtype)
             if self.model_type == "opt":
                 key = key.permute(1, 0, 2).unsqueeze(0).contiguous()
                 value = value.permute(1, 0, 2).unsqueeze(0).contiguous()

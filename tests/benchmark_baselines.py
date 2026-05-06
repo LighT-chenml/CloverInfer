@@ -56,18 +56,29 @@ BASELINE_ALIAS_GROUPS = [
         ],
     },
     {
-        "canonical_key": "cpu_attention",
-        "canonical_name": "CPU-Attention",
-        "internal_baseline": "disagg_cpu",
+        "canonical_key": "afd",
+        "canonical_name": "AFD",
+        "internal_baseline": "disagg_afd",
         "alias_note": (
-            "The current repo does not yet expose a standalone GPU-attention AFD path, "
-            "so both AFD and CPU-Attention resolve to the disagg_cpu implementation."
+            "AFD resolves to a disaggregated GPU-attention path where attention and dense decode "
+            "share the decode GPU while preserving the split workflow."
         ),
         "aliases": [
             "afd",
             "afd-baseline",
             "af-split",
             "af_split",
+            "gpu-attention",
+            "gpu_attention",
+            "disagg_afd",
+        ],
+    },
+    {
+        "canonical_key": "cpu_attention",
+        "canonical_name": "CPU-Attention",
+        "internal_baseline": "disagg_cpu",
+        "alias_note": "CPU-Attention resolves to the disagg_cpu implementation.",
+        "aliases": [
             "cpu-attention",
             "cpu_attention",
             "cpu",
@@ -109,9 +120,9 @@ for group in BASELINE_ALIAS_GROUPS:
 
 BASELINE_HELP_TEXT = (
     "Comma-separated baseline list. Accepts legacy names "
-    "(monolithic_gpu, split_gpu_full_decode, disagg_cpu, disagg_pim_naive, disagg_cloverinfer) "
+    "(monolithic_gpu, split_gpu_full_decode, disagg_afd, disagg_cpu, disagg_pim_naive, disagg_cloverinfer) "
     "and paper aliases (PD, AFD, CPU-Attention, Naive PIM, CloverInfer). "
-    "AFD currently normalizes to the same implementation as CPU-Attention."
+    "AFD uses a standalone GPU-attention path; CPU-Attention remains the CPU attention baseline."
 )
 
 
@@ -311,6 +322,25 @@ def make_cluster_config(args, attention_backend: str) -> ClusterConfig:
     if attention_backend == "cloverinfer":
         qk_full_enabled = True
         softmax_av_fused_enabled = True
+    use_gpu_for_attention = attention_backend == "gpu"
+    decode_dense_gpu_fraction = float(args.decode_dense_gpu_fraction)
+    attention_gpu_fraction = float(args.attention_gpu_fraction) if use_gpu_for_attention else 0.0
+    attention_resource = str(args.attention_resource)
+    if attention_backend == "gpu":
+        attention_resource = str(args.decode_dense_resource)
+        if abs(decode_dense_gpu_fraction - 1.0) < 1e-9 and attention_gpu_fraction <= 0.0:
+            decode_dense_gpu_fraction = 0.5
+            attention_gpu_fraction = 0.5
+        elif decode_dense_gpu_fraction <= 0.0:
+            decode_dense_gpu_fraction = 0.5
+        if attention_gpu_fraction <= 0.0:
+            attention_gpu_fraction = 0.5
+        if decode_dense_gpu_fraction + attention_gpu_fraction > 1.0 + 1e-6:
+            raise ValueError(
+                "AFD shared decode/attention GPU fractions must sum to at most 1.0. "
+                f"Got decode_dense_gpu_fraction={decode_dense_gpu_fraction}, "
+                f"attention_gpu_fraction={attention_gpu_fraction}."
+            )
 
     return ClusterConfig(
         num_prefill_workers=1,
@@ -318,9 +348,12 @@ def make_cluster_config(args, attention_backend: str) -> ClusterConfig:
         num_decode_dense_nodes=1,
         prefill_resource=args.prefill_resource,
         decode_dense_resource=args.decode_dense_resource,
-        attention_resource=args.attention_resource,
+        attention_resource=attention_resource,
         use_gpu_for_prefill=True,
         use_gpu_for_decode_dense=True,
+        use_gpu_for_attention=use_gpu_for_attention,
+        decode_dense_gpu_fraction=decode_dense_gpu_fraction,
+        attention_gpu_fraction=attention_gpu_fraction,
         attention_backend=attention_backend,
         pim_num_dpus=args.pim_num_dpus,
         pim_resident_store_backend=resident_store_backend,
@@ -526,6 +559,8 @@ def main():
     parser.add_argument("--prefill-resource", default="prefill_gpu")
     parser.add_argument("--decode-dense-resource", default="decode_dense_gpu")
     parser.add_argument("--attention-resource", default="attention_pim")
+    parser.add_argument("--decode-dense-gpu-fraction", type=float, default=1.0)
+    parser.add_argument("--attention-gpu-fraction", type=float, default=0.0)
     parser.add_argument("--pim-num-dpus", type=int, default=4)
     parser.add_argument(
         "--pim-resident-store-backend",
@@ -698,6 +733,8 @@ def main():
             result = run_monolithic_gpu(args, problems)
         elif internal_baseline == "split_gpu_full_decode":
             result = run_split_gpu(args, problems)
+        elif internal_baseline == "disagg_afd":
+            result = run_disaggregated(args, problems, "gpu")
         elif internal_baseline == "disagg_cpu":
             result = run_disaggregated(args, problems, "cpu")
         elif internal_baseline == "disagg_pim_naive":

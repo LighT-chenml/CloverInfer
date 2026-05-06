@@ -20,8 +20,10 @@ class ClusterConfig(BaseModel):
     attention_resource: Optional[str] = None
     use_gpu_for_prefill: bool = True
     use_gpu_for_decode_dense: bool = True
+    use_gpu_for_attention: bool = False
     prefill_gpu_fraction: float = 1.0
     decode_dense_gpu_fraction: float = 1.0
+    attention_gpu_fraction: float = 0.0
     attention_backend: str = "cpu"
     pim_num_dpus: int = 4
     pim_resident_store_backend: str = "host"
