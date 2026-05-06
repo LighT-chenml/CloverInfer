@@ -9,6 +9,11 @@ import torch
 import tiktoken
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+try:
+    from transformers import DynamicCache
+except Exception:  # pragma: no cover - compatibility fallback for older transformers
+    DynamicCache = None
+
 
 QWEN_PAT_STR = r"""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"""
 QWEN_ENDOFTEXT = "<|endoftext|>"
@@ -171,12 +176,8 @@ class CausalModelAdapter:
             logits = outputs.logits[:, -1, :]
             first_token_id = int(torch.argmax(logits, dim=-1).item())
 
-        past_key_values = outputs.past_key_values
-        if hasattr(past_key_values, "to_legacy_cache"):
-            past_key_values = past_key_values.to_legacy_cache()
-
         initial_kv: List[Dict[str, torch.Tensor]] = []
-        for layer_kv in past_key_values:
+        for layer_kv in self._iter_past_key_values(outputs.past_key_values):
             key = layer_kv.key_cache if hasattr(layer_kv, "key_cache") else layer_kv[0]
             value = layer_kv.value_cache if hasattr(layer_kv, "value_cache") else layer_kv[1]
             initial_kv.append(
@@ -257,7 +258,12 @@ class CausalModelAdapter:
         repeat_factor = self.num_heads // self.num_key_value_heads
         return tensor[:, ::repeat_factor, :].contiguous()
 
-    def _denormalize_past_key_values(self, initial_kv: List[Dict[str, torch.Tensor]]):
+    def _iter_past_key_values(self, past_key_values):
+        if hasattr(past_key_values, "to_legacy_cache"):
+            return past_key_values.to_legacy_cache()
+        return past_key_values
+
+    def _build_legacy_past_key_values(self, initial_kv: List[Dict[str, torch.Tensor]]):
         past_key_values = []
         for layer_kv in initial_kv:
             key = layer_kv["key"].to(self.device)
@@ -275,6 +281,12 @@ class CausalModelAdapter:
                 raise ValueError(f"Unsupported model type for cache restore: {self.model_type}")
             past_key_values.append((key, value))
         return tuple(past_key_values)
+
+    def _denormalize_past_key_values(self, initial_kv: List[Dict[str, torch.Tensor]]):
+        legacy_cache = self._build_legacy_past_key_values(initial_kv)
+        if DynamicCache is not None and self.model_type in {"opt", "llama"}:
+            return DynamicCache(ddp_cache_data=legacy_cache, config=self.model.config)
+        return legacy_cache
 
     def start_token(self, token_id: int, position: int) -> torch.Tensor:
         input_ids = torch.tensor([[token_id]], dtype=torch.long, device=self.device)
@@ -650,8 +662,6 @@ class CausalModelAdapter:
             generated_ids = [first_token_id]
             current_token_id = first_token_id
             past_key_values = outputs.past_key_values
-            if hasattr(past_key_values, "to_legacy_cache"):
-                past_key_values = past_key_values.to_legacy_cache()
 
             for step in range(1, max_new_tokens):
                 total_len = prompt_len + step
@@ -664,8 +674,6 @@ class CausalModelAdapter:
                 outputs = self.model(**decode_inputs)
                 current_token_id = int(torch.argmax(outputs.logits[:, -1, :], dim=-1).item())
                 past_key_values = outputs.past_key_values
-                if hasattr(past_key_values, "to_legacy_cache"):
-                    past_key_values = past_key_values.to_legacy_cache()
                 generated_ids.append(current_token_id)
 
         finished_at = time.perf_counter()

@@ -4,22 +4,160 @@ import os
 import statistics
 import sys
 import time
-from typing import Dict, List
+from typing import Callable, Dict, List, Tuple
 
 import ray
 import torch
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
+TESTS_ROOT = os.path.dirname(os.path.abspath(__file__))
+for path in (REPO_ROOT, TESTS_ROOT):
+    if path not in sys.path:
+        sys.path.insert(0, path)
 
+from benchmark_utils import DATASET_FORMAT_CHOICES, load_benchmark_samples, load_tokenizer_for_benchmark
 from src.core.config import ClusterConfig, ModelConfig
 from src.core.model_adapter import CausalModelAdapter
 from src.core.nodes import DecodeDenseNode, PrefillNode
 from src.core.scheduler import GlobalScheduler
 
 
+def _normalize_baseline_alias(value: str) -> str:
+    return "".join(ch.lower() for ch in value if ch.isalnum())
+
+
+BASELINE_ALIAS_GROUPS = [
+    {
+        "canonical_key": "monolithic_gpu",
+        "canonical_name": "Monolithic-GPU",
+        "internal_baseline": "monolithic_gpu",
+        "alias_note": "Paper naming keeps this as the monolithic GPU reference.",
+        "aliases": [
+            "monolithic_gpu",
+            "monolithic-gpu",
+            "monolithic",
+            "mono",
+            "gpu",
+        ],
+    },
+    {
+        "canonical_key": "pd",
+        "canonical_name": "PD",
+        "internal_baseline": "split_gpu_full_decode",
+        "alias_note": "PD resolves to the prefill/decoding split baseline implemented by split_gpu_full_decode.",
+        "aliases": [
+            "pd",
+            "pd-baseline",
+            "prefill-decoding",
+            "prefill_decoding",
+            "prefill-decoding-separation",
+            "split_gpu_full_decode",
+        ],
+    },
+    {
+        "canonical_key": "cpu_attention",
+        "canonical_name": "CPU-Attention",
+        "internal_baseline": "disagg_cpu",
+        "alias_note": (
+            "The current repo does not yet expose a standalone GPU-attention AFD path, "
+            "so both AFD and CPU-Attention resolve to the disagg_cpu implementation."
+        ),
+        "aliases": [
+            "afd",
+            "afd-baseline",
+            "af-split",
+            "af_split",
+            "cpu-attention",
+            "cpu_attention",
+            "cpu",
+            "disagg_cpu",
+        ],
+    },
+    {
+        "canonical_key": "naive_pim",
+        "canonical_name": "Naive PIM",
+        "internal_baseline": "disagg_pim_naive",
+        "alias_note": "Naive PIM resolves to the current disagg_pim_naive implementation.",
+        "aliases": [
+            "naive-pim",
+            "naive_pim",
+            "pim-naive",
+            "pim_naive",
+            "disagg_pim_naive",
+        ],
+    },
+    {
+        "canonical_key": "cloverinfer",
+        "canonical_name": "CloverInfer",
+        "internal_baseline": "disagg_cloverinfer",
+        "alias_note": "CloverInfer resolves to the current disagg_cloverinfer implementation.",
+        "aliases": [
+            "cloverinfer",
+            "clover-infer",
+            "disagg_cloverinfer",
+        ],
+    },
+]
+
+
+BASELINE_ALIAS_INDEX = {}
+for group in BASELINE_ALIAS_GROUPS:
+    for alias in group["aliases"]:
+        BASELINE_ALIAS_INDEX[_normalize_baseline_alias(alias)] = group
+
+
+BASELINE_HELP_TEXT = (
+    "Comma-separated baseline list. Accepts legacy names "
+    "(monolithic_gpu, split_gpu_full_decode, disagg_cpu, disagg_pim_naive, disagg_cloverinfer) "
+    "and paper aliases (PD, AFD, CPU-Attention, Naive PIM, CloverInfer). "
+    "AFD currently normalizes to the same implementation as CPU-Attention."
+)
+
+
+def resolve_requested_baselines(value: str) -> List[Dict[str, object]]:
+    grouped: Dict[str, Dict[str, object]] = {}
+    ordered: List[Dict[str, object]] = []
+    raw_items = [item.strip() for item in value.split(",") if item.strip()]
+    if not raw_items:
+        raise ValueError("at least one baseline must be specified")
+
+    for raw_item in raw_items:
+        normalized = _normalize_baseline_alias(raw_item)
+        group = BASELINE_ALIAS_INDEX.get(normalized)
+        if group is None:
+            supported = sorted({alias for entry in BASELINE_ALIAS_GROUPS for alias in entry["aliases"]})
+            raise ValueError(
+                f"unsupported baseline alias: {raw_item}. "
+                f"Supported aliases include: {', '.join(supported)}"
+            )
+
+        key = str(group["canonical_key"])
+        if key not in grouped:
+            spec = {
+                "canonical_key": key,
+                "canonical_name": str(group["canonical_name"]),
+                "internal_baseline": str(group["internal_baseline"]),
+                "alias_note": str(group["alias_note"]),
+                "requested_aliases": [raw_item],
+                "resolved_aliases": list(group["aliases"]),
+            }
+            grouped[key] = spec
+            ordered.append(spec)
+        else:
+            if raw_item not in grouped[key]["requested_aliases"]:
+                grouped[key]["requested_aliases"].append(raw_item)
+    return ordered
+
+
 def summarize_metrics(metric_list: List[Dict[str, float]]) -> Dict[str, float]:
+    if not metric_list:
+        return {
+            "avg_latency": 0.0,
+            "avg_ttft": 0.0,
+            "avg_tpot": 0.0,
+            "avg_throughput": 0.0,
+            "avg_total_tokens": 0.0,
+        }
     return {
         "avg_latency": float(statistics.mean(item["latency"] for item in metric_list)),
         "avg_ttft": float(statistics.mean(item["ttft"] for item in metric_list)),
@@ -29,41 +167,137 @@ def summarize_metrics(metric_list: List[Dict[str, float]]) -> Dict[str, float]:
     }
 
 
-def load_prompts(path: str, limit: int | None) -> List[Dict[str, str]]:
-    problems = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            problems.append(json.loads(line))
-    if limit is not None:
-        problems = problems[:limit]
-    return problems
+def summarize_run(
+    records: List[Dict[str, object]],
+    wall_time_s: float,
+    requested_concurrency: int,
+    effective_concurrency: int,
+    execution_mode: str,
+) -> Dict[str, object]:
+    summary = summarize_metrics([record["metrics"] for record in records])
+    total_generated_tokens = sum(int(record["metrics"]["total_tokens"]) for record in records)
+    summary.update(
+        {
+            "num_requests": int(len(records)),
+            "wall_time_s": float(wall_time_s),
+            "request_throughput_rps": float(len(records) / wall_time_s) if wall_time_s > 0 else 0.0,
+            "output_token_throughput_tps": float(total_generated_tokens / wall_time_s) if wall_time_s > 0 else 0.0,
+            "requested_concurrency": int(requested_concurrency),
+            "effective_concurrency": int(effective_concurrency),
+            "execution_mode": execution_mode,
+            "out_of_order_completions": int(
+                sum(
+                    1
+                    for record in records
+                    if int(record["request_index"]) != int(record["completion_index"])
+                )
+            ),
+        }
+    )
+    return summary
 
 
-def run_monolithic_gpu(args, problems: List[Dict[str, str]]) -> Dict[str, object]:
-    dtype = torch.float16 if args.dtype == "float16" else torch.float32
-    adapter = CausalModelAdapter(args.model, "cuda", dtype)
+def build_record(
+    request_index: int,
+    task_id: str,
+    completion: str,
+    metrics: Dict[str, object],
+    submit_started_at: float,
+    submit_finished_at: float,
+    completion_index: int,
+    inflight_at_submit: int,
+) -> Dict[str, object]:
+    return {
+        "request_index": int(request_index),
+        "completion_index": int(completion_index),
+        "task_id": str(task_id),
+        "completion": completion,
+        "metrics": metrics,
+        "submit_started_at": float(submit_started_at),
+        "submit_finished_at": float(submit_finished_at),
+        "finished_at": float(time.time()),
+        "inflight_at_submit": int(inflight_at_submit),
+    }
 
-    records = []
-    for problem in problems:
-        result = adapter.greedy_generate(problem["prompt"], args.max_new_tokens)
+
+def run_serial_requests(
+    problems: List[Dict[str, object]],
+    generate_fn: Callable[[Dict[str, object]], Tuple[str, Dict[str, object]]],
+) -> Tuple[List[Dict[str, object]], float]:
+    records: List[Dict[str, object]] = []
+    run_started_at = time.time()
+    for request_index, problem in enumerate(problems, start=1):
+        submit_started_at = time.time()
+        completion, metrics = generate_fn(problem)
+        submit_finished_at = submit_started_at
         records.append(
-            {
-                "task_id": problem["task_id"],
-                "completion": result["text"],
-                "metrics": result["metrics"],
+            build_record(
+                request_index=request_index,
+                task_id=str(problem["task_id"]),
+                completion=completion,
+                metrics=metrics,
+                submit_started_at=submit_started_at,
+                submit_finished_at=submit_finished_at,
+                completion_index=request_index,
+                inflight_at_submit=1,
+            )
+        )
+    wall_time_s = max(time.time() - run_started_at, 1e-12)
+    return records, wall_time_s
+
+
+def run_scheduler_requests(
+    scheduler,
+    problems: List[Dict[str, object]],
+    max_new_tokens: int,
+    concurrency: int,
+) -> Tuple[List[Dict[str, object]], float]:
+    records: List[Dict[str, object]] = []
+    pending: Dict[ray.ObjectRef, Dict[str, object]] = {}
+    next_idx = 0
+    completion_index = 0
+    run_started_at = time.time()
+
+    while next_idx < len(problems) or pending:
+        while next_idx < len(problems) and len(pending) < concurrency:
+            problem = problems[next_idx]
+            request_index = next_idx + 1
+            submit_started_at = time.time()
+            future = scheduler.submit_request.remote(
+                problem["prompt"],
+                return_metrics=True,
+                max_new_tokens=max_new_tokens,
+            )
+            submit_finished_at = time.time()
+            pending[future] = {
+                "request_index": request_index,
+                "problem": problem,
+                "submit_started_at": submit_started_at,
+                "submit_finished_at": submit_finished_at,
+                "inflight_at_submit": len(pending) + 1,
             }
+            next_idx += 1
+
+        ready, _ = ray.wait(list(pending.keys()), num_returns=1)
+        future = ready[0]
+        meta = pending.pop(future)
+        completion, metrics = ray.get(future)
+        completion_index += 1
+        records.append(
+            build_record(
+                request_index=int(meta["request_index"]),
+                task_id=str(meta["problem"]["task_id"]),
+                completion=completion,
+                metrics=metrics,
+                submit_started_at=float(meta["submit_started_at"]),
+                submit_finished_at=float(meta["submit_finished_at"]),
+                completion_index=completion_index,
+                inflight_at_submit=int(meta["inflight_at_submit"]),
+            )
         )
 
-    return {
-        "baseline": "monolithic_gpu",
-        "placement": {
-            "mode": "single_process",
-            "ip": ray.util.get_node_ip_address() if ray.is_initialized() else "local",
-            "device": "cuda",
-        },
-        "records": records,
-        "summary": summarize_metrics([record["metrics"] for record in records]),
-    }
+    wall_time_s = max(time.time() - run_started_at, 1e-12)
+    return records, wall_time_s
 
 
 def make_cluster_config(args, attention_backend: str) -> ClusterConfig:
@@ -115,7 +349,34 @@ def make_cluster_config(args, attention_backend: str) -> ClusterConfig:
     )
 
 
-def run_disaggregated(args, problems: List[Dict[str, str]], attention_backend: str) -> Dict[str, object]:
+def run_monolithic_gpu(args, problems: List[Dict[str, object]]) -> Dict[str, object]:
+    dtype = torch.float16 if args.dtype == "float16" else torch.float32
+    adapter = CausalModelAdapter(args.model, "cuda", dtype)
+
+    def _generate(problem: Dict[str, object]) -> Tuple[str, Dict[str, object]]:
+        result = adapter.greedy_generate(str(problem["prompt"]), args.max_new_tokens)
+        return result["text"], result["metrics"]
+
+    records, wall_time_s = run_serial_requests(problems, _generate)
+    return {
+        "baseline": "monolithic_gpu",
+        "placement": {
+            "mode": "single_process",
+            "ip": ray.util.get_node_ip_address() if ray.is_initialized() else "local",
+            "device": "cuda",
+        },
+        "records": records,
+        "summary": summarize_run(
+            records,
+            wall_time_s=wall_time_s,
+            requested_concurrency=max(1, int(args.concurrency)),
+            effective_concurrency=1,
+            execution_mode="serial_local_adapter",
+        ),
+    }
+
+
+def run_disaggregated(args, problems: List[Dict[str, object]], attention_backend: str) -> Dict[str, object]:
     cluster_conf = make_cluster_config(args, attention_backend)
     model_conf = ModelConfig(
         model_name=args.model_name,
@@ -126,33 +387,28 @@ def run_disaggregated(args, problems: List[Dict[str, str]], attention_backend: s
     )
     scheduler = GlobalScheduler.remote(cluster_conf, model_conf)
     placement = ray.get(scheduler.initialize_cluster.remote())
-
-    records = []
-    for problem in problems:
-        completion, metrics = ray.get(
-            scheduler.submit_request.remote(
-                problem["prompt"],
-                return_metrics=True,
-                max_new_tokens=args.max_new_tokens,
-            )
-        )
-        records.append(
-            {
-                "task_id": problem["task_id"],
-                "completion": completion,
-                "metrics": metrics,
-            }
-        )
+    records, wall_time_s = run_scheduler_requests(
+        scheduler,
+        problems,
+        max_new_tokens=args.max_new_tokens,
+        concurrency=max(1, int(args.concurrency)),
+    )
 
     return {
         "baseline": f"disagg_{attention_backend}",
         "placement": placement,
         "records": records,
-        "summary": summarize_metrics([record["metrics"] for record in records]),
+        "summary": summarize_run(
+            records,
+            wall_time_s=wall_time_s,
+            requested_concurrency=max(1, int(args.concurrency)),
+            effective_concurrency=max(1, int(args.concurrency)),
+            execution_mode="async_scheduler_queue",
+        ),
     }
 
 
-def run_split_gpu(args, problems: List[Dict[str, str]]) -> Dict[str, object]:
+def run_split_gpu(args, problems: List[Dict[str, object]]) -> Dict[str, object]:
     model_conf = ModelConfig(
         model_name=args.model_name,
         model_path=args.model,
@@ -175,10 +431,9 @@ def run_split_gpu(args, problems: List[Dict[str, str]]) -> Dict[str, object]:
         "decode_full": ray.get(decode.get_info.remote()),
     }
 
-    records = []
-    for problem in problems:
+    def _generate(problem: Dict[str, object]) -> Tuple[str, Dict[str, object]]:
         wall_started = time.time()
-        prefill_out = ray.get(prefill.process_prompt.remote(problem["prompt"]))
+        prefill_out = ray.get(prefill.process_prompt.remote(str(problem["prompt"])))
         first_token_ready = time.time()
         decode_out = ray.get(
             decode.continue_full_decode.remote(
@@ -219,38 +474,42 @@ def run_split_gpu(args, problems: List[Dict[str, str]]) -> Dict[str, object]:
                 },
             },
         }
+        return decode_out["text"], metrics
 
-        records.append(
-            {
-                "task_id": problem["task_id"],
-                "completion": decode_out["text"],
-                "metrics": metrics,
-            }
-        )
-
+    records, wall_time_s = run_serial_requests(problems, _generate)
     return {
         "baseline": "split_gpu_full_decode",
         "placement": placement,
         "records": records,
-        "summary": summarize_metrics([record["metrics"] for record in records]),
+        "summary": summarize_run(
+            records,
+            wall_time_s=wall_time_s,
+            requested_concurrency=max(1, int(args.concurrency)),
+            effective_concurrency=1,
+            execution_mode="serial_split_pipeline",
+        ),
     }
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", default="dataset/humaneval.jsonl")
+    parser.add_argument(
+        "--dataset-format",
+        default="auto",
+        choices=DATASET_FORMAT_CHOICES,
+    )
     parser.add_argument("--limit", type=int, default=5)
     parser.add_argument("--model", default="/home/cml/CloverInfer/model/Qwen-1_8B")
     parser.add_argument("--model-name", default="qwen-1_8b")
     parser.add_argument("--max-new-tokens", type=int, default=3)
+    parser.add_argument("--prompt-token-length", type=int, default=0)
+    parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--dtype", default="float16")
     parser.add_argument(
         "--baselines",
         default="monolithic_gpu,split_gpu_full_decode,disagg_cpu,disagg_pim_naive",
-        help=(
-            "Comma-separated subset of "
-            "monolithic_gpu,split_gpu_full_decode,disagg_cpu,disagg_pim_naive,disagg_cloverinfer"
-        ),
+        help=BASELINE_HELP_TEXT,
     )
     parser.add_argument("--address", default="192.168.123.4:26379")
     parser.add_argument("--prefill-resource", default="prefill_gpu")
@@ -340,6 +599,7 @@ def main():
             "cannot set both --clover-pim-context-fused-experimental-enabled and "
             "--no-clover-pim-context-fused-experimental-enabled"
         )
+
     if not args.pim_qk_mixed_enabled and not args.no_pim_qk_mixed_enabled:
         args.pim_qk_mixed_enabled = True
     if args.no_pim_qk_mixed_enabled:
@@ -386,8 +646,18 @@ def main():
     if args.no_clover_pim_context_fused_experimental_enabled:
         args.clover_pim_context_fused_experimental_enabled = False
 
-    problems = load_prompts(args.data, args.limit)
-    baselines = [item.strip() for item in args.baselines.split(",") if item.strip()]
+    tokenizer = None
+    if int(args.prompt_token_length) > 0:
+        tokenizer = load_tokenizer_for_benchmark(args.model)
+
+    problems = load_benchmark_samples(
+        args.data,
+        dataset_format=args.dataset_format,
+        limit=args.limit,
+        tokenizer=tokenizer,
+        prompt_token_length=int(args.prompt_token_length),
+    )
+    baseline_specs = resolve_requested_baselines(args.baselines)
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
 
     ray.init(
@@ -397,22 +667,49 @@ def main():
     )
 
     results = []
-    for baseline in baselines:
-        if baseline == "monolithic_gpu":
+    data_config = {
+        "path": args.data,
+        "dataset_format": args.dataset_format,
+        "loaded_samples": len(problems),
+        "prompt_token_length_override": int(args.prompt_token_length),
+        "concurrency": max(1, int(args.concurrency)),
+        "max_new_tokens": int(args.max_new_tokens),
+        "resource_layout": {
+            "prefill_resource": str(args.prefill_resource),
+            "decode_dense_resource": str(args.decode_dense_resource),
+            "attention_resource": str(args.attention_resource),
+        },
+    }
+
+    for baseline_spec in baseline_specs:
+        internal_baseline = str(baseline_spec["internal_baseline"])
+        if internal_baseline == "monolithic_gpu":
             result = run_monolithic_gpu(args, problems)
-        elif baseline == "split_gpu_full_decode":
+        elif internal_baseline == "split_gpu_full_decode":
             result = run_split_gpu(args, problems)
-        elif baseline == "disagg_cpu":
+        elif internal_baseline == "disagg_cpu":
             result = run_disaggregated(args, problems, "cpu")
-        elif baseline == "disagg_pim_naive":
+        elif internal_baseline == "disagg_pim_naive":
             result = run_disaggregated(args, problems, "pim_naive")
-        elif baseline == "disagg_cloverinfer":
+        elif internal_baseline == "disagg_cloverinfer":
             result = run_disaggregated(args, problems, "cloverinfer")
         else:
-            raise ValueError(f"unsupported baseline: {baseline}")
+            raise ValueError(f"unsupported internal baseline: {internal_baseline}")
 
+        result["legacy_baseline"] = result["baseline"]
+        result["baseline"] = str(baseline_spec["canonical_name"])
+        result["baseline_key"] = str(baseline_spec["canonical_key"])
+        result["internal_baseline"] = internal_baseline
+        result["requested_aliases"] = list(baseline_spec["requested_aliases"])
+        result["resolved_aliases"] = list(baseline_spec["resolved_aliases"])
+        result["alias_note"] = str(baseline_spec["alias_note"])
+        result["data_config"] = data_config
+        result["summary"]["baseline"] = result["baseline"]
+        result["summary"]["baseline_key"] = result["baseline_key"]
+        result["summary"]["internal_baseline"] = internal_baseline
+        result["summary"]["requested_aliases"] = list(baseline_spec["requested_aliases"])
         results.append(result)
-        print(json.dumps({"baseline": result["baseline"], **result["summary"]}, ensure_ascii=False))
+        print(json.dumps(result["summary"], ensure_ascii=False))
 
     with open(args.output, "w", encoding="utf-8") as f:
         for result in results:

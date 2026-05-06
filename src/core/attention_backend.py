@@ -432,10 +432,17 @@ class PimNaiveAttentionBackend:
             ):
                 effective_capacity += growth_block_tokens
             total_capacity_elems += effective_capacity * int(num_heads) * int(head_dim)
-        min_dpus_by_capacity = max(
-            1,
-            math.ceil(float(total_capacity_elems) / float(max(self.resident_store.POOL_CAPACITY_ELEMS, 1))),
-        )
+        # Host-backed resident storage has no per-DPU slot pool, so capacity
+        # should not artificially widen the requested stripe there. Fall back to
+        # a single logical stripe when the store does not expose DPU pool size.
+        pool_capacity_elems = int(getattr(self.resident_store, "POOL_CAPACITY_ELEMS", 0))
+        if pool_capacity_elems <= 0:
+            min_dpus_by_capacity = 1
+        else:
+            min_dpus_by_capacity = max(
+                1,
+                math.ceil(float(total_capacity_elems) / float(pool_capacity_elems)),
+            )
         return int(total_live_elems), int(max_layer_groups), int(min_dpus_by_capacity)
 
     def _choose_active_rank_for_request(

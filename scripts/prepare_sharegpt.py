@@ -7,6 +7,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=str, default="dataset/sharegpt_processed.json")
     parser.add_argument("--num-samples", type=int, default=None, help="Number of samples to keeping. If None, keep all.")
+    parser.add_argument(
+        "--output-format",
+        choices=["auto", "json", "jsonl"],
+        default="auto",
+        help="When auto, infer from output extension.",
+    )
     args = parser.parse_args()
 
     print("Loading ShareGPT...")
@@ -39,12 +45,20 @@ def main():
         if first_sender in ["human", "user"]:
             prompt = convs[0].get("value", "")
             if prompt:
-                samples.append({"id": item.get("id", str(idx)), "prompt": prompt})
+                samples.append({"task_id": item.get("id", str(idx)), "prompt": prompt})
                 count += 1
 
     print(f"Collected {len(samples)} samples. Saving to {args.output}...")
-    with open(args.output, "w") as f:
-        json.dump(samples, f, indent=2)
+    output_format = args.output_format
+    if output_format == "auto":
+        output_format = "jsonl" if args.output.endswith(".jsonl") else "json"
+
+    with open(args.output, "w", encoding="utf-8") as f:
+        if output_format == "jsonl":
+            for sample in samples:
+                f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+        else:
+            json.dump(samples, f, indent=2, ensure_ascii=False)
     print("Done.")
 
 if __name__ == "__main__":

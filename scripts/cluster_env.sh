@@ -6,24 +6,82 @@ DECODE_DENSE_IP="${DECODE_DENSE_IP:-192.168.123.3}"
 ATTENTION_IP="${ATTENTION_IP:-192.168.123.7}"
 USER_NAME="${USER_NAME:-cml}"
 PROJECT_DIR="${PROJECT_DIR:-/home/cml/CloverInfer}"
-CONDA_PREFIX_HEAD="${CONDA_PREFIX_HEAD:-/home/cml/anaconda3/envs/clover_infer}"
-CONDA_PREFIX_PREFILL="${CONDA_PREFIX_PREFILL:-/home/cml/miniconda3/envs/clover_infer}"
-CONDA_PREFIX_DECODE_DENSE="${CONDA_PREFIX_DECODE_DENSE:-/home/cml/miniconda3/envs/clover_infer}"
-CONDA_PREFIX_ATTENTION="${CONDA_PREFIX_ATTENTION:-/home/cml/miniconda3/envs/clover_infer}"
+
+# Keep all cluster-side Python imports inside the resolved conda envs. This
+# avoids silently mixing in ~/.local site-packages on the head node.
+export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
+
+# These may be set explicitly by the caller. When unset, we auto-detect a
+# usable clover_infer env on each machine instead of assuming one global path.
+CONDA_PREFIX_HEAD="${CONDA_PREFIX_HEAD:-}"
+CONDA_PREFIX_PREFILL="${CONDA_PREFIX_PREFILL:-}"
+CONDA_PREFIX_DECODE_DENSE="${CONDA_PREFIX_DECODE_DENSE:-}"
+CONDA_PREFIX_ATTENTION="${CONDA_PREFIX_ATTENTION:-}"
+
 RAY_PORT="${RAY_PORT:-26379}"
 DASHBOARD_PORT="${DASHBOARD_PORT:-8265}"
 RAY_VERSION_MATCH_LEVEL="${RAY_VERSION_MATCH_LEVEL:-minor}"
 
-PYTHON_BIN="${CONDA_PREFIX_HEAD}/bin/python"
-PREFILL_PYTHON_BIN="${CONDA_PREFIX_PREFILL}/bin/python"
-DECODE_DENSE_PYTHON_BIN="${CONDA_PREFIX_DECODE_DENSE}/bin/python"
-ATTENTION_PYTHON_BIN="${CONDA_PREFIX_ATTENTION}/bin/python"
 RAY_ADDRESS="${HEAD_IP}:${RAY_PORT}"
 
 ssh_remote() {
   local host="$1"
   shift
   ssh -o BatchMode=yes -o ConnectTimeout=8 "${USER_NAME}@${host}" "$@"
+}
+
+resolve_local_conda_prefix() {
+  local requested_prefix="${1:-}"
+  shift || true
+  local candidates=()
+  if [[ -n "${requested_prefix}" ]]; then
+    candidates+=("${requested_prefix}")
+  fi
+  candidates+=("$@")
+
+  local prefix
+  for prefix in "${candidates[@]}"; do
+    if [[ -x "${prefix}/bin/python" ]]; then
+      printf '%s' "${prefix}"
+      return 0
+    fi
+  done
+
+  echo "Unable to find a local clover_infer env among: ${candidates[*]}" >&2
+  return 1
+}
+
+resolve_remote_conda_prefix() {
+  local host="$1"
+  local requested_prefix="${2:-}"
+  shift 2 || true
+
+  local candidates=()
+  if [[ -n "${requested_prefix}" ]]; then
+    candidates+=("${requested_prefix}")
+  fi
+  candidates+=("$@")
+
+  local joined_candidates=""
+  local prefix
+  for prefix in "${candidates[@]}"; do
+    if [[ -n "${joined_candidates}" ]]; then
+      joined_candidates+=" "
+    fi
+    joined_candidates+="${prefix@Q}"
+  done
+
+  ssh_remote "${host}" "bash -lc '
+    set -e
+    for prefix in ${joined_candidates}; do
+      if [[ -x \"\${prefix}/bin/python\" ]]; then
+        printf \"%s\" \"\${prefix}\"
+        exit 0
+      fi
+    done
+    echo \"Unable to find a remote clover_infer env among: ${candidates[*]}\" >&2
+    exit 1
+  '"
 }
 
 resolve_ray_bin() {
@@ -67,7 +125,68 @@ resolve_remote_ray_bin() {
   '"
 }
 
+CONDA_PREFIX_HEAD="$(
+  resolve_local_conda_prefix \
+    "${CONDA_PREFIX_HEAD}" \
+    "/home/${USER_NAME}/anaconda3/envs/clover_infer" \
+    "/home/${USER_NAME}/miniconda3/envs/clover_infer"
+)"
+if [[ "${PREFILL_IP}" == "${HEAD_IP}" ]]; then
+  CONDA_PREFIX_PREFILL="${CONDA_PREFIX_HEAD}"
+else
+  CONDA_PREFIX_PREFILL="$(
+    resolve_remote_conda_prefix \
+      "${PREFILL_IP}" \
+      "${CONDA_PREFIX_PREFILL}" \
+      "/home/${USER_NAME}/anaconda3/envs/clover_infer" \
+      "/home/${USER_NAME}/miniconda3/envs/clover_infer"
+  )"
+fi
+
+if [[ "${DECODE_DENSE_IP}" == "${HEAD_IP}" ]]; then
+  CONDA_PREFIX_DECODE_DENSE="${CONDA_PREFIX_HEAD}"
+else
+  CONDA_PREFIX_DECODE_DENSE="$(
+    resolve_remote_conda_prefix \
+      "${DECODE_DENSE_IP}" \
+      "${CONDA_PREFIX_DECODE_DENSE}" \
+      "/home/${USER_NAME}/anaconda3/envs/clover_infer" \
+      "/home/${USER_NAME}/miniconda3/envs/clover_infer"
+  )"
+fi
+
+if [[ "${ATTENTION_IP}" == "${HEAD_IP}" ]]; then
+  CONDA_PREFIX_ATTENTION="${CONDA_PREFIX_HEAD}"
+else
+  CONDA_PREFIX_ATTENTION="$(
+    resolve_remote_conda_prefix \
+      "${ATTENTION_IP}" \
+      "${CONDA_PREFIX_ATTENTION}" \
+      "/home/${USER_NAME}/anaconda3/envs/clover_infer" \
+      "/home/${USER_NAME}/miniconda3/envs/clover_infer"
+  )"
+fi
+
+PYTHON_BIN="${CONDA_PREFIX_HEAD}/bin/python"
+PREFILL_PYTHON_BIN="${CONDA_PREFIX_PREFILL}/bin/python"
+DECODE_DENSE_PYTHON_BIN="${CONDA_PREFIX_DECODE_DENSE}/bin/python"
+ATTENTION_PYTHON_BIN="${CONDA_PREFIX_ATTENTION}/bin/python"
+
 RAY_CMD="${RAY_CMD:-$(resolve_ray_bin "${CONDA_PREFIX_HEAD}")}"
-PREFILL_RAY_CMD="${PREFILL_RAY_CMD:-$(resolve_remote_ray_bin "${PREFILL_IP}" "${CONDA_PREFIX_PREFILL}")}"
-DECODE_DENSE_RAY_CMD="${DECODE_DENSE_RAY_CMD:-$(resolve_remote_ray_bin "${DECODE_DENSE_IP}" "${CONDA_PREFIX_DECODE_DENSE}")}"
-ATTENTION_RAY_CMD="${ATTENTION_RAY_CMD:-$(resolve_remote_ray_bin "${ATTENTION_IP}" "${CONDA_PREFIX_ATTENTION}")}"
+if [[ "${PREFILL_IP}" == "${HEAD_IP}" ]]; then
+  PREFILL_RAY_CMD="${PREFILL_RAY_CMD:-${RAY_CMD}}"
+else
+  PREFILL_RAY_CMD="${PREFILL_RAY_CMD:-$(resolve_remote_ray_bin "${PREFILL_IP}" "${CONDA_PREFIX_PREFILL}")}"
+fi
+
+if [[ "${DECODE_DENSE_IP}" == "${HEAD_IP}" ]]; then
+  DECODE_DENSE_RAY_CMD="${DECODE_DENSE_RAY_CMD:-${RAY_CMD}}"
+else
+  DECODE_DENSE_RAY_CMD="${DECODE_DENSE_RAY_CMD:-$(resolve_remote_ray_bin "${DECODE_DENSE_IP}" "${CONDA_PREFIX_DECODE_DENSE}")}"
+fi
+
+if [[ "${ATTENTION_IP}" == "${HEAD_IP}" ]]; then
+  ATTENTION_RAY_CMD="${ATTENTION_RAY_CMD:-${RAY_CMD}}"
+else
+  ATTENTION_RAY_CMD="${ATTENTION_RAY_CMD:-$(resolve_remote_ray_bin "${ATTENTION_IP}" "${CONDA_PREFIX_ATTENTION}")}"
+fi
