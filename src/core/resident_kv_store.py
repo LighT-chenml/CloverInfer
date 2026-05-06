@@ -1458,6 +1458,13 @@ class UpmemKVSlotStore(ResidentKVStore):
         tail_available = max(0, tail_capacity - tail_seq_len)
         block_kind = str(tail_block.get("block_kind", "growth"))
         if block_kind == "base":
+            # Keep shorter prompts below the base resident length on a compact
+            # single-block path. Rollover on base blocks is meant to create new
+            # placement freedom once decode is actually pushing the request
+            # beyond its base resident budget, not while it is still fitting
+            # comfortably under that budget.
+            if int(slot_info.get("seq_len", 0)) < int(self.block_tokens):
+                return False
             rollover_threshold = max(8, int(self.base_block_rollover_tokens))
         else:
             rollover_threshold = max(8, self.growth_block_tokens // 4)

@@ -418,10 +418,18 @@ class PimNaiveAttentionBackend:
             effective_capacity = base_capacity
             tail_available = max(0, base_capacity - logical_capacity)
             # Mirror the blocked-store rollover behavior roughly enough for
-            # stripe sizing: when decode reserve is non-zero and the tail block
-            # is already close to full, appends will spill into an extra growth
-            # block instead of consuming the small remaining tail in place.
-            if reserve_tokens > 0 and growth_block_tokens > 0 and tail_available <= base_rollover_tokens:
+            # stripe sizing: once the request is expected to decode beyond the
+            # base resident length, a nearly-full tail block will spill into an
+            # extra growth block instead of consuming the small remaining tail
+            # in place. Keep shorter prompts below the base resident length on
+            # the compact path so we do not over-widen Qwen/OPT stripes just to
+            # reserve growth blocks they will not actually touch.
+            if (
+                reserve_tokens > 0
+                and growth_block_tokens > 0
+                and logical_capacity > int(self.length)
+                and tail_available <= base_rollover_tokens
+            ):
                 effective_capacity += growth_block_tokens
             total_capacity_elems += effective_capacity * int(num_heads) * int(head_dim)
         min_dpus_by_capacity = max(
@@ -1463,6 +1471,18 @@ class PimNaiveAttentionBackend:
 
     def _apply_qk_mixed_batch(self, records: List[Dict[str, object]]) -> None:
         if not self.qk_mixed_enabled:
+            self.qk_mixed_last_head_diffs = []
+            self.qk_mixed_last_max_abs_diff = 0.0
+            self.qk_mixed_last_diag = {}
+            self.qk_mixed_last_diag_path = ""
+            return
+
+        if len(records) > 1 or len(self.request_states) > 1:
+            # Throughput-oriented concurrent serving often still reaches this
+            # path with a singleton layer batch while multiple requests remain
+            # active overall. In practice the mixed-QK overwrite pass is still
+            # net-negative in that situation, so keep it for truly
+            # single-request decode only.
             self.qk_mixed_last_head_diffs = []
             self.qk_mixed_last_max_abs_diff = 0.0
             self.qk_mixed_last_diag = {}

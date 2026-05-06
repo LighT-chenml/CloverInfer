@@ -415,7 +415,14 @@ static int qk_items_round_compatible(const qk_slot_item_t *seed, const qk_slot_i
     if (seed == NULL || item == NULL || !seed->ready || !item->ready) {
         return 0;
     }
-    if (item->num_heads != seed->num_heads || item->window != seed->window || item->head_dim != seed->head_dim) {
+    /*
+     * Batched QK rounds already size score transfers to the max window in the
+     * round and then copy each item's compact score slice back out afterwards.
+     * Keeping the window equality requirement here prevents concurrent decode
+     * requests with slightly different context lengths from sharing a round at
+     * all, which is especially harmful for Qwen continuous batching.
+     */
+    if (item->num_heads != seed->num_heads || item->head_dim != seed->head_dim) {
         return 0;
     }
     if (item->slot_args.mode != seed->slot_args.mode) {

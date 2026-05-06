@@ -41,6 +41,18 @@ def main():
     parser.add_argument("--dtype", type=str, default="float16")
     parser.add_argument("--pim-num-dpus", type=int, default=4)
     parser.add_argument("--pim-length", type=int, default=128)
+    parser.add_argument("--pim-block-tokens", type=int, default=256)
+    parser.add_argument(
+        "--pim-max-resident-groups-per-layer",
+        type=int,
+        default=0,
+    )
+    parser.add_argument(
+        "--pim-head-grouping-policy",
+        type=str,
+        default="balanced",
+        choices=["legacy", "balanced", "coarse", "segment_aware"],
+    )
     parser.add_argument(
         "--pim-resident-store-backend",
         type=str,
@@ -77,6 +89,14 @@ def main():
     parser.add_argument("--no-clover-host-qk-mixed-enabled", action="store_true")
     parser.add_argument("--decode-continuous-batch-window-ms", type=float, default=0.0)
     parser.add_argument("--decode-continuous-batch-max-size", type=int, default=8)
+    parser.add_argument("--attention-rpc-batch-window-ms", type=float, default=1.0)
+    parser.add_argument("--attention-rpc-batch-max-size", type=int, default=8)
+    parser.add_argument("--attention-rpc-cross-key-batch-enabled", action="store_true")
+    parser.add_argument("--no-attention-rpc-cross-key-batch-enabled", action="store_true")
+    parser.add_argument("--attention-actor-side-batching-enabled", action="store_true")
+    parser.add_argument("--no-attention-actor-side-batching-enabled", action="store_true")
+    parser.add_argument("--attention-actor-batch-window-ms", type=float, default=1.0)
+    parser.add_argument("--attention-actor-batch-max-size", type=int, default=8)
     parser.add_argument("--sequential", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
@@ -107,6 +127,14 @@ def main():
         raise ValueError("cannot set both --clover-op-profiling-enabled and --no-clover-op-profiling-enabled")
     if args.clover_host_qk_mixed_enabled and args.no_clover_host_qk_mixed_enabled:
         raise ValueError("cannot set both --clover-host-qk-mixed-enabled and --no-clover-host-qk-mixed-enabled")
+    if args.attention_rpc_cross_key_batch_enabled and args.no_attention_rpc_cross_key_batch_enabled:
+        raise ValueError(
+            "cannot set both --attention-rpc-cross-key-batch-enabled and --no-attention-rpc-cross-key-batch-enabled"
+        )
+    if args.attention_actor_side_batching_enabled and args.no_attention_actor_side_batching_enabled:
+        raise ValueError(
+            "cannot set both --attention-actor-side-batching-enabled and --no-attention-actor-side-batching-enabled"
+        )
 
     use_gpu_for_prefill = True
     if args.no_gpu_for_prefill:
@@ -176,6 +204,18 @@ def main():
     elif args.no_clover_host_qk_mixed_enabled:
         clover_host_qk_mixed_enabled = False
 
+    attention_rpc_cross_key_batch_enabled = False
+    if args.no_attention_rpc_cross_key_batch_enabled:
+        attention_rpc_cross_key_batch_enabled = False
+    elif args.attention_rpc_cross_key_batch_enabled:
+        attention_rpc_cross_key_batch_enabled = True
+
+    attention_actor_side_batching_enabled = False
+    if args.no_attention_actor_side_batching_enabled:
+        attention_actor_side_batching_enabled = False
+    elif args.attention_actor_side_batching_enabled:
+        attention_actor_side_batching_enabled = True
+
     # Init Ray
     if not ray.is_initialized():
         runtime_env = {
@@ -206,7 +246,10 @@ def main():
         attention_backend=args.attention_backend,
         pim_num_dpus=args.pim_num_dpus,
         pim_length=args.pim_length,
+        pim_block_tokens=args.pim_block_tokens,
         pim_resident_store_backend=args.pim_resident_store_backend,
+        pim_max_resident_groups_per_layer=args.pim_max_resident_groups_per_layer,
+        pim_head_grouping_policy=args.pim_head_grouping_policy,
         pim_dpu_placement_policy=args.pim_dpu_placement_policy,
         pim_qk_full_enabled=pim_qk_full_enabled,
         pim_qk_full_shadow_check=pim_qk_full_shadow_check,
@@ -221,6 +264,12 @@ def main():
         clover_shadow_check_token_interval=args.clover_shadow_check_token_interval,
         clover_shadow_check_layer_interval=args.clover_shadow_check_layer_interval,
         clover_host_qk_mixed_enabled=clover_host_qk_mixed_enabled,
+        attention_rpc_batch_window_s=args.attention_rpc_batch_window_ms / 1000.0,
+        attention_rpc_batch_max_size=args.attention_rpc_batch_max_size,
+        attention_rpc_cross_key_batch_enabled=attention_rpc_cross_key_batch_enabled,
+        attention_actor_side_batching_enabled=attention_actor_side_batching_enabled,
+        attention_actor_batch_window_s=args.attention_actor_batch_window_ms / 1000.0,
+        attention_actor_batch_max_size=args.attention_actor_batch_max_size,
         decode_continuous_batch_window_s=args.decode_continuous_batch_window_ms / 1000.0,
         decode_continuous_batch_max_size=args.decode_continuous_batch_max_size,
     )
@@ -341,6 +390,30 @@ def main():
                     ensure_ascii=False,
                 )
             )
+            helper_profile = resident_store_debug.get("helper_profile", {})
+            if helper_profile:
+                print("\nHelper Profile Summary:")
+                print(
+                    json.dumps(
+                        {
+                            "qk_rounds_total": int(helper_profile.get("qk_rounds_total", 0)),
+                            "qk_batched_rounds": int(helper_profile.get("qk_batched_rounds", 0)),
+                            "qk_fallback_rounds": int(helper_profile.get("qk_fallback_rounds", 0)),
+                            "qk_round_items_total": int(helper_profile.get("qk_round_items_total", 0)),
+                            "qk_batched_items_total": int(helper_profile.get("qk_batched_items_total", 0)),
+                            "qk_active_ranks_total": int(helper_profile.get("qk_active_ranks_total", 0)),
+                            "qk_max_round_size": int(helper_profile.get("qk_max_round_size", 0)),
+                            "av_rounds_total": int(helper_profile.get("av_rounds_total", 0)),
+                            "av_batched_rounds": int(helper_profile.get("av_batched_rounds", 0)),
+                            "av_fallback_rounds": int(helper_profile.get("av_fallback_rounds", 0)),
+                            "av_round_items_total": int(helper_profile.get("av_round_items_total", 0)),
+                            "av_batched_items_total": int(helper_profile.get("av_batched_items_total", 0)),
+                            "av_active_ranks_total": int(helper_profile.get("av_active_ranks_total", 0)),
+                            "av_max_round_size": int(helper_profile.get("av_max_round_size", 0)),
+                        },
+                        ensure_ascii=False,
+                    )
+                )
     else:
         print("\nNo metrics collected.")
 

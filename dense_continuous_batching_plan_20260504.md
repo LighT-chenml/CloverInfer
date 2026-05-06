@@ -1084,3 +1084,281 @@ Current practical takeaway:
   to `16` improves useful DPU breadth and produces the best throughput so far
 - the remaining tradeoff to watch is TTFT, which rose modestly on `v10` even
   while TPOT and end-to-end throughput improved
+
+Follow-up repeat runs showed that the width-16 path is real but somewhat
+variable:
+
+- artifact: `groupedav_placepack_full_v11`
+  - `avg_latency = 60.9934 s`
+  - `avg_ttft = 0.3903 s`
+  - `avg_tpot = 0.9620 s`
+  - `avg_throughput = 1.0493 tok/s`
+  - resident store:
+    - `active_dpus = 15`
+  - backend:
+    - `stripe_width = 16`
+    - `stripe_expand_count = 0`
+    - `last_stripe_update_reason = init`
+
+- artifact: `groupedav_placepack_full_v12`
+  - `avg_latency = 63.2945 s`
+  - `avg_ttft = 0.3889 s`
+  - `avg_tpot = 0.9985 s`
+  - `avg_throughput = 1.0112 tok/s`
+  - resident store:
+    - `active_dpus = 15`
+  - backend:
+    - `stripe_width = 16`
+    - `stripe_expand_count = 0`
+    - `last_stripe_update_reason = init`
+
+Across `v10` / `v11` / `v12`:
+
+- width-16 stayed stable on the structural properties we care about:
+  - same-rank decode waves
+  - `av_max_active_ranks = 1`
+  - `active_dpus = 15`
+- throughput mean was about `1.0457 tok/s`
+- throughput standard deviation was about `0.0269 tok/s`
+
+So the current width-16 result should be treated as a strong candidate policy,
+but not yet as a perfectly settled throughput optimum.
+
+### 2026-05-06 Capacity-Aware Width Sizing For Qwen
+
+Trying to apply the same widened same-rank heuristic directly to real-model
+`Qwen-1_8B` exposed a different bottleneck:
+
+- the original stripe-width sizing looked only at current live KV elements
+- it underestimated the true blocked-store footprint once base block capacity,
+  growth blocks, and decode reserve were considered together
+- on the real cluster, this caused decode append to fail with
+  `Blocked DPU pool capacity exceeded`
+
+The width-sizing logic was then refined:
+
+- `_request_shape_targets()` now estimates stripe width from effective resident
+  capacity footprint rather than only from live KV footprint
+- the estimate includes:
+  - base blocked capacity rounding
+  - decode reserve
+  - likely extra growth-block spill when the tail block is already near full
+
+With that change in place, the same three-machine `Qwen-1_8B` smoke completed:
+
+- artifact: `humaneval_qwen_pim_naive_smoke_placewidth16_v2`
+  - `avg_latency = 6.1291 s`
+  - `avg_ttft = 0.5372 s`
+  - `avg_tpot = 2.7960 s`
+  - `avg_throughput = 0.4901 tok/s`
+  - helper:
+    - `av_max_active_ranks = 1`
+  - resident store:
+    - `active_dpus = 18`
+  - backend:
+    - `stripe_width = 18`
+    - `stripe_expand_count = 0`
+    - `last_stripe_update_reason = init`
+
+This does not mean Qwen is now fast. The important current result is narrower:
+
+- the capacity-aware same-rank stripe sizing avoided the earlier DPU pool
+  capacity failure
+- the widened placement path now survives a real Qwen decode smoke without
+  reverting to a mixed-rank helper pattern
+
+### 2026-05-06 Qwen Over-Rollover Follow-up
+
+The first capacity-aware fix for `Qwen-1_8B` was safe, but it also turned out
+to be too conservative for short prompts:
+
+- the successful smoke showed `stripe_width = 18`
+- blocked slots were almost all split into two blocks already:
+  - `total_blocks = 373` for `192` blocked slots on one sample
+- helper AV work therefore expanded to many more DPU items than the logical
+  request/layer count alone would suggest
+
+The deeper cause was that both:
+
+- width estimation in `_request_shape_targets()`
+- and real blocked-slot rollover in `UpmemKVSlotStore`
+
+were treating short prompts below the base resident length as if they were
+already about to spill into an extra growth block.
+
+The current refinement narrows that behavior:
+
+- base-block growth is only pre-reserved once the logical capacity is expected
+  to exceed the base resident length
+- runtime base-block rollover is also suppressed while a blocked slot is still
+  below the base block budget
+
+Expected effect:
+
+- keep short Qwen prompts on a more compact one-block path longer
+- reduce premature `base + growth` fragmentation
+- reduce helper AV item count
+- pull `stripe_width` and active DPU count back down from the earlier
+  over-conservative `18` where possible, while still avoiding the earlier pool
+  capacity failure
+
+### 2026-05-06 Qwen Concurrent QK Follow-up
+
+Real concurrent `Qwen-1_8B` runs then showed that dense-side continuous batching
+was structurally working, but helper-side QK batching was still stuck:
+
+- `scheduler_dense_continuous_batching.max_observed_size = 4`
+- helper `qk_round_items_total / qk_rounds_total = 1.0`
+- helper `qk_batched_rounds = 0`
+
+The immediate root cause was not lack of concurrency. The helper's QK round
+compatibility gate required identical `window` across items before they could
+share a batched round. Under real concurrent decode, requests quickly diverge
+in context length by a few tokens, so that shape gate collapsed QK back to
+one-item rounds even when items were same-rank and otherwise compatible.
+
+The next validation target after relaxing that gate is:
+
+- `qk_batched_rounds > 0`
+- `qk_round_items_total / qk_rounds_total > 1.0`
+- and end-to-end Qwen TTFT / TPOT / throughput should improve together rather
+  than only AV-side helper stats
+
+That validation did succeed once the helper-side QK window gate was relaxed:
+
+- artifact: `humaneval_qwen_pim_conc4_batching_v2_qkrelax`
+  - `avg_ttft = 0.9644 s`
+  - `avg_tpot = 6.6576 s`
+  - `avg_throughput = 0.2144 tok/s`
+  - helper:
+    - `qk_rounds_total = 66`
+    - `qk_batched_rounds = 42`
+    - `qk_fallback_rounds = 24`
+    - `qk_round_items_total = 174`
+    - `qk_items_per_round = 2.625`
+
+So the original one-item QK-round bottleneck was real and the relaxed shape
+gate fixed it.
+
+### 2026-05-06 Qwen Mixed-QK Throughput Follow-up
+
+The next bottleneck turned out not to be scheduler-side but mixed-QK overwrite
+on top of concurrent decode:
+
+- raising `qk_mixed_heads` from `2` to `4` or `8` made throughput worse
+- even with the helper QK batching fix in place, best concurrent throughput
+  came from disabling `qk_mixed`
+
+Measured reference points:
+
+- artifact: `humaneval_qwen_pim_conc4_batching_v5_noqkmixed`
+  - `avg_ttft = 0.9706 s`
+  - `avg_tpot = 5.5336 s`
+  - `avg_throughput = 0.2546 tok/s`
+
+- artifact: `humaneval_qwen_pim_conc4_batching_v6_autoskipqkmixed`
+  - benchmark default path with `qk_mixed` off
+  - `avg_ttft = 0.9536 s`
+  - `avg_tpot = 5.3953 s`
+  - `avg_throughput = 0.2610 tok/s`
+
+An initial attempt to auto-skip mixed-QK only when `len(records) > 1` was not
+sufficient under continuous batching:
+
+- artifact: `humaneval_qwen_pim_conc4_batching_v7_qkmixed_on_autoskip`
+  - `qk_mixed_enabled = true`
+  - `qk_mixed_count = 48`
+  - `avg_throughput = 0.2377 tok/s`
+
+This exposed an important serving detail:
+
+- concurrent decode can still hit singleton per-layer batches while multiple
+  requests remain active overall
+- so `len(records) > 1` is too weak a proxy for true concurrency
+
+The skip condition was then widened to treat any `len(self.request_states) > 1`
+case as concurrent serving and keep mixed-QK for truly single-request decode
+only.
+
+Validation result:
+
+- artifact: `humaneval_qwen_pim_conc4_batching_v8_qkmixed_on_autoskip_active_reqs`
+  - `qk_mixed_enabled = true`
+  - `qk_mixed_count = 0`
+  - `avg_ttft = 0.9353 s`
+  - `avg_tpot = 5.2992 s`
+  - `avg_throughput = 0.2665 tok/s`
+
+Current practical takeaway:
+
+- for throughput-oriented concurrent Qwen serving, mixed-QK should be treated
+  as a single-request optimization, not a general concurrent default
+- after this change, explicit `--pim-qk-mixed-enabled` no longer regresses the
+  concurrent path because active-request concurrency suppresses the mixed-QK
+  overwrite automatically
+- the next remaining attention-side bottleneck is AV fallback rather than QK
+
+### 2026-05-06 AV Fallback Direction
+
+The concurrent `Qwen-1_8B` helper profile after the mixed-QK fix still shows
+non-trivial AV fallback while locality itself remains good:
+
+- `av_max_active_ranks = 1`
+- so the fallback is no longer primarily a cross-rank locality problem
+
+The most likely remaining source is over-strict AV round shape compatibility:
+
+- `group_heads`
+- `head_dim`
+- `dtype_code`
+- `padded_context_bytes`
+- `weights_resident_on_dpu`
+- `context_from_qk_kernel`
+- and grouped-vs-regular parity must all match today
+
+So the next optimization target should be reducing same-rank AV fallback caused
+by shape/segmentation gating, not by DPU placement.
+
+### 2026-05-06 Llama Availability Check
+
+Before validating the same heuristic on Llama, the local model directories were
+checked:
+
+- `/home/cml/CloverInfer/model/Llama-2-7b-hf`
+- `/home/cml/CloverInfer/model/Llama-2-13b-hf`
+
+Current finding:
+
+- both directories currently contain only lightweight metadata files such as
+  `README.md` / `LICENSE.txt`
+- required model files such as `config.json`, tokenizer assets, and weight
+  index files are not present yet
+
+So Llama smoke validation is still pending model download, not blocked by the
+current scheduler / DPU-placement code path.
+
+### 2026-05-06 Llama Download Reachability Blocker
+
+The next step was to start downloading `meta-llama/Llama-2-7b-hf` using a
+fresh Hugging Face READ token, but the current cluster environment is still
+blocked on outbound HTTPS to Hugging Face:
+
+- DNS resolution works on the involved machines
+- but `curl -I https://huggingface.co` times out from:
+  - `192.168.123.3`
+  - `192.168.123.4`
+  - `192.168.123.7`
+- `huggingface_hub.HfApi(...).model_info(...)` also hangs or fails instead of
+  reaching the gated-repo access check
+
+To avoid false positives from partial local directories, `scripts/prepare_models.py`
+now does two extra checks:
+
+- verify remote model access before declaring success
+- verify that the local directory contains required assets such as:
+  - `config.json`
+  - tokenizer files
+  - weight file or weight index
+
+So the current Llama blocker is environmental reachability, not missing
+download logic.
