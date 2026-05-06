@@ -960,7 +960,9 @@ class HostResidentKVStore(ResidentKVStore):
         capacity: int,
         preferred_dpu: int | None = None,
         force_host_fallback: bool = False,
+        allowed_dpus: list[int] | None = None,
     ) -> Dict[str, object]:
+        del allowed_dpus
         started_at = time.perf_counter()
         key = self._slot_key(k_slot, v_slot)
         if key in self.groups:
@@ -2552,16 +2554,46 @@ class UpmemKVSlotStore(ResidentKVStore):
                     segment_ordinal=int(item["segment_ordinal"]),
                 ),
             )
-            dpu_started_at = time.perf_counter()
-            grouped_outputs = self.helper.qk_slot_scores_grouped_batch(
-                [item["payload"] for item in ordered_grouped_entries]
-            )
-            self._record_timing("qk_slot_scores_batch_dpu", dpu_started_at)
-            self.batch_item_totals["qk_slot_scores_batch_dpu_items"] += len(ordered_grouped_entries)
-            for entry, scores in zip(ordered_grouped_entries, grouped_outputs):
-                segmented_outputs.setdefault(int(entry["logical_idx"]), []).append(
-                    (int(entry["segment_ordinal"]), scores)
+            try:
+                dpu_started_at = time.perf_counter()
+                grouped_outputs = self.helper.qk_slot_scores_grouped_batch(
+                    [item["payload"] for item in ordered_grouped_entries]
                 )
+                self._record_timing("qk_slot_scores_batch_dpu", dpu_started_at)
+                self.batch_item_totals["qk_slot_scores_batch_dpu_items"] += len(ordered_grouped_entries)
+                for entry, scores in zip(ordered_grouped_entries, grouped_outputs):
+                    segmented_outputs.setdefault(int(entry["logical_idx"]), []).append(
+                        (int(entry["segment_ordinal"]), scores)
+                    )
+            except RuntimeError:
+                for entry in ordered_grouped_entries:
+                    base_segment_ordinal = int(entry["segment_ordinal"])
+                    for segment_offset, (
+                        slot_id,
+                        take_len,
+                        segment_local_head_indices,
+                        segment_queries,
+                    ) in enumerate(entry["payload"]):
+                        dpu_entries.append(
+                            {
+                                "payload": (
+                                    int(slot_id),
+                                    [int(v) for v in segment_local_head_indices],
+                                    int(take_len),
+                                    segment_queries,
+                                ),
+                                "physical_dpu": int(entry["physical_dpu"]),
+                                "shape_key": (
+                                    len(segment_local_head_indices),
+                                    int(take_len),
+                                    int(segment_queries.shape[1]),
+                                ),
+                                "slot_id": int(slot_id),
+                                "logical_idx": int(entry["logical_idx"]),
+                                "segment_ordinal": base_segment_ordinal + int(segment_offset),
+                                "ref_kind": "segmented",
+                            }
+                        )
 
         if dpu_entries:
             ordered_entries = sorted(
@@ -2702,18 +2734,38 @@ class UpmemKVSlotStore(ResidentKVStore):
                     segment_ordinal=int(item["segment_ordinal"]),
                 ),
             )
-            dpu_started_at = time.perf_counter()
-            grouped_contexts = self.helper.weighted_value_sum_grouped_batch(
-                [item["payload"] for item in ordered_grouped_entries]
-            )
-            self._record_timing("weighted_value_sum_batch_dpu", dpu_started_at)
-            self.batch_item_totals["weighted_value_sum_batch_dpu_items"] += len(ordered_grouped_entries)
-            for entry, context in zip(ordered_grouped_entries, grouped_contexts):
-                idx = int(entry["logical_idx"])
-                if idx not in segmented_contexts:
-                    segmented_contexts[idx] = context
-                else:
-                    segmented_contexts[idx] = segmented_contexts[idx] + context
+            try:
+                dpu_started_at = time.perf_counter()
+                grouped_contexts = self.helper.weighted_value_sum_grouped_batch(
+                    [item["payload"] for item in ordered_grouped_entries]
+                )
+                self._record_timing("weighted_value_sum_batch_dpu", dpu_started_at)
+                self.batch_item_totals["weighted_value_sum_batch_dpu_items"] += len(ordered_grouped_entries)
+                for entry, context in zip(ordered_grouped_entries, grouped_contexts):
+                    idx = int(entry["logical_idx"])
+                    if idx not in segmented_contexts:
+                        segmented_contexts[idx] = context
+                    else:
+                        segmented_contexts[idx] = segmented_contexts[idx] + context
+            except RuntimeError:
+                for entry in ordered_grouped_entries:
+                    base_segment_ordinal = int(entry["segment_ordinal"])
+                    for segment_offset, (slot_id, segment_len, block_weights) in enumerate(entry["payload"]):
+                        dpu_entries.append(
+                            {
+                                "payload": (int(slot_id), block_weights),
+                                "physical_dpu": int(entry["physical_dpu"]),
+                                "shape_key": (
+                                    int(block_weights.shape[0]),
+                                    int(block_weights.shape[1]),
+                                    0,
+                                ),
+                                "slot_id": int(slot_id),
+                                "logical_idx": int(entry["logical_idx"]),
+                                "segment_ordinal": base_segment_ordinal + int(segment_offset),
+                                "ref_kind": "segmented",
+                            }
+                        )
 
         if dpu_entries:
             ordered_entries = sorted(

@@ -4,6 +4,7 @@ import os
 import statistics
 import sys
 import time
+from contextlib import suppress
 from typing import Callable, Dict, List, Tuple
 
 import ray
@@ -386,26 +387,30 @@ def run_disaggregated(args, problems: List[Dict[str, object]], attention_backend
         dtype=args.dtype,
     )
     scheduler = GlobalScheduler.remote(cluster_conf, model_conf)
-    placement = ray.get(scheduler.initialize_cluster.remote())
-    records, wall_time_s = run_scheduler_requests(
-        scheduler,
-        problems,
-        max_new_tokens=args.max_new_tokens,
-        concurrency=max(1, int(args.concurrency)),
-    )
+    try:
+        placement = ray.get(scheduler.initialize_cluster.remote())
+        records, wall_time_s = run_scheduler_requests(
+            scheduler,
+            problems,
+            max_new_tokens=args.max_new_tokens,
+            concurrency=max(1, int(args.concurrency)),
+        )
 
-    return {
-        "baseline": f"disagg_{attention_backend}",
-        "placement": placement,
-        "records": records,
-        "summary": summarize_run(
-            records,
-            wall_time_s=wall_time_s,
-            requested_concurrency=max(1, int(args.concurrency)),
-            effective_concurrency=max(1, int(args.concurrency)),
-            execution_mode="async_scheduler_queue",
-        ),
-    }
+        return {
+            "baseline": f"disagg_{attention_backend}",
+            "placement": placement,
+            "records": records,
+            "summary": summarize_run(
+                records,
+                wall_time_s=wall_time_s,
+                requested_concurrency=max(1, int(args.concurrency)),
+                effective_concurrency=max(1, int(args.concurrency)),
+                execution_mode="async_scheduler_queue",
+            ),
+        }
+    finally:
+        with suppress(Exception):
+            ray.kill(scheduler, no_restart=True)
 
 
 def run_split_gpu(args, problems: List[Dict[str, object]]) -> Dict[str, object]:
@@ -426,69 +431,75 @@ def run_split_gpu(args, problems: List[Dict[str, object]]) -> Dict[str, object]:
         resources={args.decode_dense_resource: 0.01},
     ).remote(0, model_conf, True)
 
-    placement = {
-        "prefill": ray.get(prefill.get_info.remote()),
-        "decode_full": ray.get(decode.get_info.remote()),
-    }
-
-    def _generate(problem: Dict[str, object]) -> Tuple[str, Dict[str, object]]:
-        wall_started = time.time()
-        prefill_out = ray.get(prefill.process_prompt.remote(str(problem["prompt"])))
-        first_token_ready = time.time()
-        decode_out = ray.get(
-            decode.continue_full_decode.remote(
-                prefill_out["initial_kv"],
-                prefill_out["prompt_len"],
-                prefill_out["first_token_id"],
-                args.max_new_tokens,
-            )
-        )
-        request_finished = time.time()
-
-        total_tokens = int(len(decode_out["generated_ids"]))
-        ttft = float(first_token_ready - wall_started)
-        latency = float(request_finished - wall_started)
-        tpot = float((latency - ttft) / max(total_tokens - 1, 1))
-        throughput = float(total_tokens / latency) if latency > 0 else 0.0
-
-        metrics = {
-            "ttft": ttft,
-            "tpot": tpot,
-            "latency": latency,
-            "throughput": throughput,
-            "total_tokens": total_tokens,
-            "stage_timing": {
-                "scheduler": {
-                    "prefill_rpc_s": ttft,
-                    "decode_full_rpc_s": max(0.0, latency - ttft),
-                    "total_rpc_s": latency,
-                },
-                "actors": {
-                    "prefill_compute_s": float(prefill_out.get("profile", {}).get("compute_s", 0.0)),
-                    "decode_full_compute_s": float(decode_out.get("profile", {}).get("compute_s", 0.0)),
-                    "total_compute_s": float(prefill_out.get("profile", {}).get("compute_s", 0.0))
-                    + float(decode_out.get("profile", {}).get("compute_s", 0.0)),
-                },
-                "counts": {
-                    "decode_steps": max(0, total_tokens - 1),
-                },
-            },
+    try:
+        placement = {
+            "prefill": ray.get(prefill.get_info.remote()),
+            "decode_full": ray.get(decode.get_info.remote()),
         }
-        return decode_out["text"], metrics
 
-    records, wall_time_s = run_serial_requests(problems, _generate)
-    return {
-        "baseline": "split_gpu_full_decode",
-        "placement": placement,
-        "records": records,
-        "summary": summarize_run(
-            records,
-            wall_time_s=wall_time_s,
-            requested_concurrency=max(1, int(args.concurrency)),
-            effective_concurrency=1,
-            execution_mode="serial_split_pipeline",
-        ),
-    }
+        def _generate(problem: Dict[str, object]) -> Tuple[str, Dict[str, object]]:
+            wall_started = time.time()
+            prefill_out = ray.get(prefill.process_prompt.remote(str(problem["prompt"])))
+            first_token_ready = time.time()
+            decode_out = ray.get(
+                decode.continue_full_decode.remote(
+                    prefill_out["initial_kv"],
+                    prefill_out["prompt_len"],
+                    prefill_out["first_token_id"],
+                    args.max_new_tokens,
+                )
+            )
+            request_finished = time.time()
+
+            total_tokens = int(len(decode_out["generated_ids"]))
+            ttft = float(first_token_ready - wall_started)
+            latency = float(request_finished - wall_started)
+            tpot = float((latency - ttft) / max(total_tokens - 1, 1))
+            throughput = float(total_tokens / latency) if latency > 0 else 0.0
+
+            metrics = {
+                "ttft": ttft,
+                "tpot": tpot,
+                "latency": latency,
+                "throughput": throughput,
+                "total_tokens": total_tokens,
+                "stage_timing": {
+                    "scheduler": {
+                        "prefill_rpc_s": ttft,
+                        "decode_full_rpc_s": max(0.0, latency - ttft),
+                        "total_rpc_s": latency,
+                    },
+                    "actors": {
+                        "prefill_compute_s": float(prefill_out.get("profile", {}).get("compute_s", 0.0)),
+                        "decode_full_compute_s": float(decode_out.get("profile", {}).get("compute_s", 0.0)),
+                        "total_compute_s": float(prefill_out.get("profile", {}).get("compute_s", 0.0))
+                        + float(decode_out.get("profile", {}).get("compute_s", 0.0)),
+                    },
+                    "counts": {
+                        "decode_steps": max(0, total_tokens - 1),
+                    },
+                },
+            }
+            return decode_out["text"], metrics
+
+        records, wall_time_s = run_serial_requests(problems, _generate)
+        return {
+            "baseline": "split_gpu_full_decode",
+            "placement": placement,
+            "records": records,
+            "summary": summarize_run(
+                records,
+                wall_time_s=wall_time_s,
+                requested_concurrency=max(1, int(args.concurrency)),
+                effective_concurrency=1,
+                execution_mode="serial_split_pipeline",
+            ),
+        }
+    finally:
+        with suppress(Exception):
+            ray.kill(prefill, no_restart=True)
+        with suppress(Exception):
+            ray.kill(decode, no_restart=True)
 
 
 def main():
@@ -716,6 +727,8 @@ def main():
             f.write(json.dumps(result, ensure_ascii=False) + "\n")
 
     print(f"Saved baseline comparison results to {args.output}")
+    with suppress(Exception):
+        ray.shutdown()
 
 
 if __name__ == "__main__":

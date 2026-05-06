@@ -31,6 +31,9 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         host_qk_mixed_enabled: bool = False,
         pim_attention_enabled: bool = False,
         pim_context_fused_experimental_enabled: bool = False,
+        pim_rank_spread_alloc_experimental_enabled: bool = False,
+        fine_head_grouping_experimental_enabled: bool = False,
+        target_heads_per_group_experimental: int = 0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -42,6 +45,9 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         self.host_qk_mixed_enabled = bool(host_qk_mixed_enabled)
         self.pim_attention_enabled = bool(pim_attention_enabled)
         self.pim_context_fused_experimental_enabled = bool(pim_context_fused_experimental_enabled)
+        self.pim_rank_spread_alloc_experimental_enabled = bool(pim_rank_spread_alloc_experimental_enabled)
+        self.fine_head_grouping_experimental_enabled = bool(fine_head_grouping_experimental_enabled)
+        self.target_heads_per_group_experimental = max(0, int(target_heads_per_group_experimental))
         self.backend_variant = "cloverinfer"
         self.shadow_k_buffers: Dict[str, List[torch.Tensor]] = {}
         self.shadow_v_buffers: Dict[str, List[torch.Tensor]] = {}
@@ -77,6 +83,12 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                     "CloverInfer PIM attention requires a resident store with PIM AV support; "
                     "use pim_resident_store_backend='upmem_kvslot'"
                 )
+        if hasattr(self.resident_store, "set_experimental_flags"):
+            self.resident_store.set_experimental_flags(
+                context_fused_enabled=self.pim_context_fused_experimental_enabled,
+                shape_rounds_enabled=self.fine_head_grouping_experimental_enabled,
+                rank_spread_alloc_enabled=self.pim_rank_spread_alloc_experimental_enabled,
+            )
 
     def _timed(self, name: str):
         class _Timer:
