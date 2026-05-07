@@ -1,0 +1,16 @@
+{
+  "case_index": 10,
+  "case": {
+    "case_slug": "qwen-1-8b__humaneval__p1024__o8__c2",
+    "model_label": "qwen-1_8b",
+    "model_slug": "qwen-1-8b",
+    "model_path": "/home/cml/CloverInfer/model/Qwen-1_8B",
+    "dataset_label": "humaneval",
+    "dataset_slug": "humaneval",
+    "dataset_path": "dataset/humaneval.jsonl",
+    "dataset_format": "auto",
+    "prompt_token_length": 1024,
+    "max_new_tokens": 8,
+    "concurrency": 2
+  }
+}

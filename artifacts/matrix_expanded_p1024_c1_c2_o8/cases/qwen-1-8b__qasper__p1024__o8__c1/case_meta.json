@@ -1,0 +1,16 @@
+{
+  "case_index": 7,
+  "case": {
+    "case_slug": "qwen-1-8b__qasper__p1024__o8__c1",
+    "model_label": "qwen-1_8b",
+    "model_slug": "qwen-1-8b",
+    "model_path": "/home/cml/CloverInfer/model/Qwen-1_8B",
+    "dataset_label": "qasper",
+    "dataset_slug": "qasper",
+    "dataset_path": "dataset/longbench/qasper.jsonl",
+    "dataset_format": "auto",
+    "prompt_token_length": 1024,
+    "max_new_tokens": 8,
+    "concurrency": 1
+  }
+}

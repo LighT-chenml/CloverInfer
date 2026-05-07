@@ -15,6 +15,24 @@ from src.core.scheduler import GlobalScheduler
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+
+def resolve_pim_dpu_placement_policy(attention_backend: str, requested_policy: str) -> str:
+    policy = str(requested_policy)
+    if policy != "auto":
+        return policy
+    if attention_backend == "pim_naive":
+        return "load_aware"
+    return "rotated"
+
+
+def resolve_pim_head_grouping_policy(attention_backend: str, requested_policy: str) -> str:
+    policy = str(requested_policy)
+    if policy != "auto":
+        return policy
+    if attention_backend == "pim_naive":
+        return "coarse"
+    return "balanced"
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=str, default="dataset/humaneval.jsonl")
@@ -50,20 +68,20 @@ def main():
     parser.add_argument(
         "--pim-head-grouping-policy",
         type=str,
-        default="balanced",
-        choices=["legacy", "balanced", "coarse", "segment_aware"],
+        default="auto",
+        choices=["auto", "legacy", "balanced", "coarse", "segment_aware"],
     )
     parser.add_argument(
         "--pim-resident-store-backend",
         type=str,
-        default="host",
-        choices=["host", "upmem_kvslot"],
+        default="auto",
+        choices=["auto", "host", "upmem_kvslot"],
     )
     parser.add_argument(
         "--pim-dpu-placement-policy",
         type=str,
-        default="rotated",
-        choices=["identity", "rotated", "rank_spread", "load_aware"],
+        default="auto",
+        choices=["auto", "identity", "rotated", "rank_spread", "load_aware"],
     )
     parser.add_argument("--pim-qk-full-enabled", action="store_true")
     parser.add_argument("--no-pim-qk-full-enabled", action="store_true")
@@ -216,6 +234,24 @@ def main():
     elif args.attention_actor_side_batching_enabled:
         attention_actor_side_batching_enabled = True
 
+    resident_store_backend = args.pim_resident_store_backend
+    if resident_store_backend == "auto":
+        resident_store_backend = "upmem_kvslot" if args.attention_backend in {"pim_naive", "cloverinfer"} else "host"
+    if args.attention_backend in {"pim_naive", "cloverinfer"}:
+        pim_qk_full_enabled = True
+        pim_softmax_av_fused_enabled = True
+    if args.attention_backend == "pim_naive":
+        pim_qk_full_shadow_check = False
+        pim_softmax_av_shadow_check = False
+    pim_dpu_placement_policy = resolve_pim_dpu_placement_policy(
+        args.attention_backend,
+        args.pim_dpu_placement_policy,
+    )
+    pim_head_grouping_policy = resolve_pim_head_grouping_policy(
+        args.attention_backend,
+        args.pim_head_grouping_policy,
+    )
+
     # Init Ray
     if not ray.is_initialized():
         runtime_env = {
@@ -247,10 +283,10 @@ def main():
         pim_num_dpus=args.pim_num_dpus,
         pim_length=args.pim_length,
         pim_block_tokens=args.pim_block_tokens,
-        pim_resident_store_backend=args.pim_resident_store_backend,
+        pim_resident_store_backend=resident_store_backend,
         pim_max_resident_groups_per_layer=args.pim_max_resident_groups_per_layer,
-        pim_head_grouping_policy=args.pim_head_grouping_policy,
-        pim_dpu_placement_policy=args.pim_dpu_placement_policy,
+        pim_head_grouping_policy=pim_head_grouping_policy,
+        pim_dpu_placement_policy=pim_dpu_placement_policy,
         pim_qk_full_enabled=pim_qk_full_enabled,
         pim_qk_full_shadow_check=pim_qk_full_shadow_check,
         pim_softmax_av_fused_enabled=pim_softmax_av_fused_enabled,

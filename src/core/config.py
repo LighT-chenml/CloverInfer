@@ -37,7 +37,7 @@ class ClusterConfig(BaseModel):
     pim_length: int = 128
     pim_block_tokens: int = 256
     pim_max_resident_groups_per_layer: int = 0
-    pim_head_grouping_policy: str = "balanced"
+    pim_head_grouping_policy: str = "auto"
     pim_dpu_placement_policy: str = "rotated"
     pim_resident_kv_dtype: str = "fp32"
     clover_cpu_shadow_enabled: bool = True

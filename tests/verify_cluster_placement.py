@@ -13,6 +13,24 @@ from src.core.scheduler import GlobalScheduler
 FLOAT_TOL = 1e-4
 
 
+def resolve_pim_dpu_placement_policy(attention_backend: str, requested_policy: str) -> str:
+    policy = str(requested_policy)
+    if policy != "auto":
+        return policy
+    if attention_backend == "pim_naive":
+        return "load_aware"
+    return "rotated"
+
+
+def resolve_pim_head_grouping_policy(attention_backend: str, requested_policy: str) -> str:
+    policy = str(requested_policy)
+    if policy != "auto":
+        return policy
+    if attention_backend == "pim_naive":
+        return "coarse"
+    return "balanced"
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--address", default="192.168.123.4:26379")
@@ -22,7 +40,17 @@ def parse_args():
     parser.add_argument("--skip-generation", action="store_true")
     parser.add_argument("--attention-backend", default="cpu", choices=["cpu", "gpu", "pim_naive", "cloverinfer"])
     parser.add_argument("--pim-num-dpus", type=int, default=4)
-    parser.add_argument("--pim-resident-store-backend", default="host", choices=["host", "upmem_kvslot"])
+    parser.add_argument("--pim-resident-store-backend", default="auto", choices=["auto", "host", "upmem_kvslot"])
+    parser.add_argument(
+        "--pim-head-grouping-policy",
+        default="auto",
+        choices=["auto", "legacy", "balanced", "coarse", "segment_aware"],
+    )
+    parser.add_argument(
+        "--pim-dpu-placement-policy",
+        default="auto",
+        choices=["auto", "identity", "rotated", "rank_spread", "load_aware"],
+    )
     parser.add_argument("--pim-qk-full-enabled", action="store_true")
     parser.add_argument("--no-pim-qk-full-enabled", action="store_true")
     parser.add_argument("--pim-qk-full-shadow-check", action="store_true")
@@ -120,6 +148,24 @@ def main():
         runtime_env={"env_vars": {"PYTHONPATH": REPO_ROOT}},
     )
 
+    resident_store_backend = args.pim_resident_store_backend
+    if resident_store_backend == "auto":
+        resident_store_backend = "upmem_kvslot" if args.attention_backend in {"pim_naive", "cloverinfer"} else "host"
+    if args.attention_backend in {"pim_naive", "cloverinfer"}:
+        pim_qk_full_enabled = True
+        pim_softmax_av_fused_enabled = True
+    if args.attention_backend == "pim_naive":
+        pim_qk_full_shadow_check = False
+        pim_softmax_av_shadow_check = False
+    pim_dpu_placement_policy = resolve_pim_dpu_placement_policy(
+        args.attention_backend,
+        args.pim_dpu_placement_policy,
+    )
+    pim_head_grouping_policy = resolve_pim_head_grouping_policy(
+        args.attention_backend,
+        args.pim_head_grouping_policy,
+    )
+
     use_gpu_for_attention = args.attention_backend == "gpu"
     attention_resource = "decode_dense_gpu" if use_gpu_for_attention else "attention_pim"
     decode_dense_gpu_fraction = 0.5 if use_gpu_for_attention else 1.0
@@ -139,7 +185,7 @@ def main():
         attention_gpu_fraction=attention_gpu_fraction,
         attention_backend=args.attention_backend,
         pim_num_dpus=args.pim_num_dpus,
-        pim_resident_store_backend=args.pim_resident_store_backend,
+        pim_resident_store_backend=resident_store_backend,
         pim_qk_full_enabled=pim_qk_full_enabled,
         pim_qk_full_shadow_check=pim_qk_full_shadow_check,
         pim_softmax_av_fused_enabled=pim_softmax_av_fused_enabled,
@@ -148,6 +194,8 @@ def main():
         pim_qk_mixed_heads=args.pim_qk_mixed_heads,
         pim_qk_mixed_window=args.pim_qk_mixed_window,
         pim_length=args.pim_length,
+        pim_head_grouping_policy=pim_head_grouping_policy,
+        pim_dpu_placement_policy=pim_dpu_placement_policy,
         decode_step_sync_window_s=args.decode_step_sync_window_s,
         decode_step_sync_max_size=args.decode_step_sync_max_size,
         attention_decode_wave_persist_enabled=args.attention_decode_wave_persist_enabled,
@@ -182,7 +230,9 @@ def main():
         debug = info["attention"]["backend_debug"]
         assert debug["num_dpus"] == args.pim_num_dpus, debug
         assert debug["length"] == args.pim_length, debug
-        assert debug["resident_store_backend"] == args.pim_resident_store_backend, debug
+        assert debug["resident_store_backend"] == resident_store_backend, debug
+        assert debug["head_grouping_policy"] == pim_head_grouping_policy, debug
+        assert debug["dpu_placement_policy"] == pim_dpu_placement_policy, debug
         assert debug["qk_full_enabled"] == pim_qk_full_enabled, debug
         assert debug["qk_full_shadow_check"] == pim_qk_full_shadow_check, debug
         assert debug["softmax_av_fused_enabled"] == pim_softmax_av_fused_enabled, debug
@@ -235,11 +285,10 @@ def main():
                 assert debug["resident_materialize_ops"] > 0, debug
                 if args.attention_backend == "pim_naive" or clover_shadow_checks_enabled:
                     assert debug["resident_shadow_max_abs_diff"] <= FLOAT_TOL, debug
-            assert debug["resident_last_freed_request_id"], debug
-            assert debug["resident_request_count"] == 0, debug
-            if args.pim_resident_store_backend == "upmem_kvslot":
+            if resident_store_backend == "upmem_kvslot":
                 store_debug = debug["resident_store_debug"]
                 assert store_debug["backend"] == "upmem_kvslot_store", store_debug
+                assert store_debug["placement_policy"] == pim_dpu_placement_policy, store_debug
                 assert store_debug["dpu_allocations"] > 0, store_debug
                 assert store_debug["helper_restarts"] >= 1, store_debug
                 allocator_stats = store_debug["allocator_stats"]

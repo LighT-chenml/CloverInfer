@@ -16,6 +16,24 @@ from src.core.config import ClusterConfig, ModelConfig
 from src.core.scheduler import GlobalScheduler
 
 
+def resolve_pim_dpu_placement_policy(attention_backend: str, requested_policy: str) -> str:
+    policy = str(requested_policy)
+    if policy != "auto":
+        return policy
+    if attention_backend == "pim_naive":
+        return "load_aware"
+    return "rotated"
+
+
+def resolve_pim_head_grouping_policy(attention_backend: str, requested_policy: str) -> str:
+    policy = str(requested_policy)
+    if policy != "auto":
+        return policy
+    if attention_backend == "pim_naive":
+        return "coarse"
+    return "balanced"
+
+
 def load_prompts(path: str, limit: int | None) -> List[Dict[str, str]]:
     prompts = []
     with open(path, "r", encoding="utf-8") as f:
@@ -146,13 +164,13 @@ def main():
     parser.add_argument("--pim-max-resident-groups-per-layer", type=int, default=0)
     parser.add_argument(
         "--pim-head-grouping-policy",
-        default="balanced",
-        choices=["legacy", "balanced", "coarse", "segment_aware"],
+        default="auto",
+        choices=["auto", "legacy", "balanced", "coarse", "segment_aware"],
     )
     parser.add_argument(
         "--pim-dpu-placement-policy",
-        default="rotated",
-        choices=["identity", "rotated", "rank_spread", "load_aware"],
+        default="auto",
+        choices=["auto", "identity", "rotated", "rank_spread", "load_aware"],
     )
     parser.add_argument("--pim-resident-kv-dtype", default="fp32", choices=["fp32", "fp16"])
     parser.add_argument("--pim-resident-store-backend", default="upmem_kvslot", choices=["host", "upmem_kvslot"])
@@ -268,6 +286,24 @@ def main():
     if args.no_clover_pim_context_fused_experimental_enabled:
         clover_pim_context_fused_experimental_enabled = False
 
+    resident_store_backend = args.pim_resident_store_backend
+    if resident_store_backend == "auto":
+        resident_store_backend = "upmem_kvslot" if args.attention_backend in {"pim_naive", "cloverinfer"} else "host"
+    if args.attention_backend in {"pim_naive", "cloverinfer"}:
+        pim_qk_full_enabled = True
+        pim_softmax_av_fused_enabled = True
+    if args.attention_backend == "pim_naive":
+        pim_qk_full_shadow_check = False
+        pim_softmax_av_shadow_check = False
+    pim_dpu_placement_policy = resolve_pim_dpu_placement_policy(
+        args.attention_backend,
+        args.pim_dpu_placement_policy,
+    )
+    pim_head_grouping_policy = resolve_pim_head_grouping_policy(
+        args.attention_backend,
+        args.pim_head_grouping_policy,
+    )
+
     prompts = load_prompts(args.data, args.limit)
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
 
@@ -288,10 +324,10 @@ def main():
         use_gpu_for_decode_dense=True,
         attention_backend=args.attention_backend,
         pim_num_dpus=args.pim_num_dpus,
-        pim_resident_store_backend=args.pim_resident_store_backend,
+        pim_resident_store_backend=resident_store_backend,
         pim_max_resident_groups_per_layer=args.pim_max_resident_groups_per_layer,
-        pim_head_grouping_policy=args.pim_head_grouping_policy,
-        pim_dpu_placement_policy=args.pim_dpu_placement_policy,
+        pim_head_grouping_policy=pim_head_grouping_policy,
+        pim_dpu_placement_policy=pim_dpu_placement_policy,
         pim_resident_kv_dtype=args.pim_resident_kv_dtype,
         pim_qk_full_enabled=pim_qk_full_enabled,
         pim_qk_full_shadow_check=pim_qk_full_shadow_check,

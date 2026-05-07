@@ -1,0 +1,16 @@
+{
+  "case_index": 12,
+  "case": {
+    "case_slug": "qwen-1-8b__sharegpt__p1024__o2__c2",
+    "model_label": "qwen-1_8b",
+    "model_slug": "qwen-1-8b",
+    "model_path": "/home/cml/CloverInfer/model/Qwen-1_8B",
+    "dataset_label": "sharegpt",
+    "dataset_slug": "sharegpt",
+    "dataset_path": "dataset/sharegpt_processed.json",
+    "dataset_format": "auto",
+    "prompt_token_length": 1024,
+    "max_new_tokens": 2,
+    "concurrency": 2
+  }
+}

@@ -209,6 +209,24 @@ def summarize_run(
     return summary
 
 
+def resolve_pim_dpu_placement_policy(attention_backend: str, requested_policy: str) -> str:
+    policy = str(requested_policy)
+    if policy != "auto":
+        return policy
+    if attention_backend == "pim_naive":
+        return "load_aware"
+    return "rotated"
+
+
+def resolve_pim_head_grouping_policy(attention_backend: str, requested_policy: str) -> str:
+    policy = str(requested_policy)
+    if policy != "auto":
+        return policy
+    if attention_backend == "pim_naive":
+        return "coarse"
+    return "balanced"
+
+
 def build_record(
     request_index: int,
     task_id: str,
@@ -315,16 +333,29 @@ def run_scheduler_requests(
 def make_cluster_config(args, attention_backend: str) -> ClusterConfig:
     resident_store_backend = str(args.pim_resident_store_backend)
     if resident_store_backend == "auto":
-        resident_store_backend = "upmem_kvslot" if attention_backend == "cloverinfer" else "host"
+        resident_store_backend = "upmem_kvslot" if attention_backend in {"pim_naive", "cloverinfer"} else "host"
 
     qk_full_enabled = bool(args.pim_qk_full_enabled)
     softmax_av_fused_enabled = bool(args.pim_softmax_av_fused_enabled)
-    if attention_backend == "cloverinfer":
+    qk_full_shadow_check = bool(args.pim_qk_full_shadow_check)
+    softmax_av_shadow_check = bool(args.pim_softmax_av_shadow_check)
+    if attention_backend in {"pim_naive", "cloverinfer"}:
         qk_full_enabled = True
         softmax_av_fused_enabled = True
+    if attention_backend == "pim_naive":
+        qk_full_shadow_check = False
+        softmax_av_shadow_check = False
     use_gpu_for_attention = attention_backend == "gpu"
     decode_dense_gpu_fraction = float(args.decode_dense_gpu_fraction)
     attention_gpu_fraction = float(args.attention_gpu_fraction) if use_gpu_for_attention else 0.0
+    pim_dpu_placement_policy = resolve_pim_dpu_placement_policy(
+        attention_backend,
+        args.pim_dpu_placement_policy,
+    )
+    pim_head_grouping_policy = resolve_pim_head_grouping_policy(
+        attention_backend,
+        args.pim_head_grouping_policy,
+    )
     attention_resource = str(args.attention_resource)
     if attention_backend == "gpu":
         attention_resource = str(args.decode_dense_resource)
@@ -358,14 +389,14 @@ def make_cluster_config(args, attention_backend: str) -> ClusterConfig:
         pim_num_dpus=args.pim_num_dpus,
         pim_resident_store_backend=resident_store_backend,
         pim_qk_full_enabled=qk_full_enabled,
-        pim_qk_full_shadow_check=args.pim_qk_full_shadow_check,
+        pim_qk_full_shadow_check=qk_full_shadow_check,
         pim_softmax_av_fused_enabled=softmax_av_fused_enabled,
-        pim_softmax_av_shadow_check=args.pim_softmax_av_shadow_check,
+        pim_softmax_av_shadow_check=softmax_av_shadow_check,
         pim_length=args.pim_length,
         pim_block_tokens=args.pim_block_tokens,
         pim_max_resident_groups_per_layer=args.pim_max_resident_groups_per_layer,
-        pim_head_grouping_policy=args.pim_head_grouping_policy,
-        pim_dpu_placement_policy=args.pim_dpu_placement_policy,
+        pim_head_grouping_policy=pim_head_grouping_policy,
+        pim_dpu_placement_policy=pim_dpu_placement_policy,
         pim_resident_kv_dtype=args.pim_resident_kv_dtype,
         pim_qk_mixed_enabled=args.pim_qk_mixed_enabled,
         pim_qk_mixed_heads=args.pim_qk_mixed_heads,
@@ -572,13 +603,13 @@ def main():
     parser.add_argument("--pim-max-resident-groups-per-layer", type=int, default=0)
     parser.add_argument(
         "--pim-head-grouping-policy",
-        default="balanced",
-        choices=["legacy", "balanced", "coarse", "segment_aware"],
+        default="auto",
+        choices=["auto", "legacy", "balanced", "coarse", "segment_aware"],
     )
     parser.add_argument(
         "--pim-dpu-placement-policy",
-        default="rotated",
-        choices=["identity", "rotated", "rank_spread", "load_aware"],
+        default="auto",
+        choices=["auto", "identity", "rotated", "rank_spread", "load_aware"],
     )
     parser.add_argument("--pim-resident-kv-dtype", default="fp32", choices=["fp32", "fp16"])
     parser.add_argument("--pim-qk-full-enabled", action="store_true")
