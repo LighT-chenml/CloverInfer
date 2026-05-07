@@ -1,0 +1,77 @@
+{
+  "created_at": 1778056409.071413,
+  "output_dir": "artifacts/experiment_matrix_smoke",
+  "address": "192.168.123.4:26379",
+  "cluster_layout": {
+    "prefill_ip": "192.168.123.4",
+    "decode_dense_ip": "192.168.123.3",
+    "attention_ip": "192.168.123.7",
+    "prefill_resource": "prefill_gpu",
+    "decode_dense_resource": "decode_dense_gpu",
+    "attention_resource": "attention_pim"
+  },
+  "models": [
+    {
+      "label": "opt-125m",
+      "slug": "opt-125m",
+      "path": "/home/cml/CloverInfer/model/opt-125m"
+    }
+  ],
+  "datasets": [
+    {
+      "label": "humaneval",
+      "slug": "humaneval",
+      "path": "dataset/humaneval.jsonl",
+      "format": "auto"
+    }
+  ],
+  "prompt_token_lengths": [
+    0
+  ],
+  "output_token_lengths": [
+    2
+  ],
+  "concurrency_values": [
+    1
+  ],
+  "limit": 1,
+  "dtype": "float16",
+  "baselines": "PD,Naive PIM",
+  "resolved_baselines": [
+    {
+      "canonical_key": "pd",
+      "canonical_name": "PD",
+      "internal_baseline": "split_gpu_full_decode",
+      "alias_note": "PD resolves to the prefill/decoding split baseline implemented by split_gpu_full_decode.",
+      "requested_aliases": [
+        "PD"
+      ],
+      "resolved_aliases": [
+        "pd",
+        "pd-baseline",
+        "prefill-decoding",
+        "prefill_decoding",
+        "prefill-decoding-separation",
+        "split_gpu_full_decode"
+      ]
+    },
+    {
+      "canonical_key": "naive_pim",
+      "canonical_name": "Naive PIM",
+      "internal_baseline": "disagg_pim_naive",
+      "alias_note": "Naive PIM resolves to the current disagg_pim_naive implementation.",
+      "requested_aliases": [
+        "Naive PIM"
+      ],
+      "resolved_aliases": [
+        "naive-pim",
+        "naive_pim",
+        "pim-naive",
+        "pim_naive",
+        "disagg_pim_naive"
+      ]
+    }
+  ],
+  "num_cases": 1,
+  "dry_run": false
+}

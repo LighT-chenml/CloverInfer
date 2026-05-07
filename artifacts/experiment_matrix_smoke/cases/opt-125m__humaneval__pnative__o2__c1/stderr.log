@@ -1,0 +1,52 @@
+2026-05-06 08:33:33,825	INFO worker.py:1821 -- Connecting to existing Ray cluster at address: 192.168.123.4:26379...
+2026-05-06 08:33:33,845	INFO worker.py:1998 -- Connected to Ray cluster. View the dashboard at [1m[32m192.168.123.4:8265 [39m[22m
+/home/cml/.local/lib/python3.10/site-packages/ray/_private/worker.py:2046: FutureWarning: Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default). To enable this behavior and turn off this error message, set RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  warnings.warn(
+[33m(raylet, ip=192.168.123.3)[0m Python patch version mismatch: The cluster was started with:
+[33m(raylet, ip=192.168.123.3)[0m     Ray: 2.53.0
+[33m(raylet, ip=192.168.123.3)[0m     Python: 3.10.19
+[33m(raylet, ip=192.168.123.3)[0m This process on node 192.168.123.3 was started with:
+[33m(raylet, ip=192.168.123.3)[0m 
+Traceback (most recent call last):
+  File "/home/cml/CloverInfer/tests/benchmark_baselines.py", line 722, in <module>
+    main()
+  File "/home/cml/CloverInfer/tests/benchmark_baselines.py", line 689, in main
+    result = run_split_gpu(args, problems)
+  File "/home/cml/CloverInfer/tests/benchmark_baselines.py", line 479, in run_split_gpu
+    records, wall_time_s = run_serial_requests(problems, _generate)
+  File "/home/cml/CloverInfer/tests/benchmark_baselines.py", line 231, in run_serial_requests
+    completion, metrics = generate_fn(problem)
+  File "/home/cml/CloverInfer/tests/benchmark_baselines.py", line 438, in _generate
+    decode_out = ray.get(
+  File "/home/cml/.local/lib/python3.10/site-packages/ray/_private/auto_init_hook.py", line 22, in auto_init_wrapper
+    return fn(*args, **kwargs)
+  File "/home/cml/.local/lib/python3.10/site-packages/ray/_private/client_mode_hook.py", line 104, in wrapper
+    return func(*args, **kwargs)
+  File "/home/cml/.local/lib/python3.10/site-packages/ray/_private/worker.py", line 2967, in get
+    values, debugger_breakpoint = worker.get_objects(
+  File "/home/cml/.local/lib/python3.10/site-packages/ray/_private/worker.py", line 1015, in get_objects
+    raise value.as_instanceof_cause()
+ray.exceptions.RayTaskError(AttributeError): [36mray::DecodeDenseNode.continue_full_decode()[39m (pid=2079576, ip=192.168.123.3, actor_id=4319c317b2776d18b5346d0230000000, repr=<src.core.nodes.DecodeDenseNode object at 0x7f51fe6fbca0>)
+  File "/home/cml/CloverInfer/src/core/nodes.py", line 389, in continue_full_decode
+    result = self.adapter.continue_greedy_generate(
+  File "/home/cml/CloverInfer/src/core/model_adapter.py", line 728, in continue_greedy_generate
+    outputs = self.model(**decode_inputs)
+  File "/home/cml/miniconda3/envs/clover_infer/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/cml/miniconda3/envs/clover_infer/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/cml/miniconda3/envs/clover_infer/lib/python3.10/site-packages/transformers/utils/generic.py", line 835, in wrapper
+    output = func(self, *args, **kwargs)
+  File "/home/cml/miniconda3/envs/clover_infer/lib/python3.10/site-packages/transformers/models/opt/modeling_opt.py", line 770, in forward
+    outputs: BaseModelOutputWithPast = self.model.decoder(
+  File "/home/cml/miniconda3/envs/clover_infer/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/cml/miniconda3/envs/clover_infer/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/cml/miniconda3/envs/clover_infer/lib/python3.10/site-packages/transformers/utils/generic.py", line 835, in wrapper
+    output = func(self, *args, **kwargs)
+  File "/home/cml/miniconda3/envs/clover_infer/lib/python3.10/site-packages/transformers/models/opt/modeling_opt.py", line 567, in forward
+    past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+AttributeError: 'tuple' object has no attribute 'get_seq_length'
+[33m(raylet, ip=192.168.123.3)[0m     Ray: 2.53.0
+[33m(raylet, ip=192.168.123.3)[0m     Python: 3.10.20

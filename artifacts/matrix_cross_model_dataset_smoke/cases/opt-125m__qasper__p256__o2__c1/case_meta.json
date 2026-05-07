@@ -1,0 +1,16 @@
+{
+  "case_index": 1,
+  "case": {
+    "case_slug": "opt-125m__qasper__p256__o2__c1",
+    "model_label": "opt-125m",
+    "model_slug": "opt-125m",
+    "model_path": "/home/cml/CloverInfer/model/opt-125m",
+    "dataset_label": "qasper",
+    "dataset_slug": "qasper",
+    "dataset_path": "dataset/longbench/qasper.jsonl",
+    "dataset_format": "auto",
+    "prompt_token_length": 256,
+    "max_new_tokens": 2,
+    "concurrency": 1
+  }
+}

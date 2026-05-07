@@ -1,0 +1,119 @@
+{
+  "created_at": 1778056146.2711952,
+  "output_dir": "/home/cml/CloverInfer/artifacts/experiment_matrix",
+  "address": "192.168.123.4:26379",
+  "cluster_layout": {
+    "prefill_ip": "192.168.123.4",
+    "decode_dense_ip": "192.168.123.3",
+    "attention_ip": "192.168.123.7",
+    "prefill_resource": "prefill_gpu",
+    "decode_dense_resource": "decode_dense_gpu",
+    "attention_resource": "attention_pim"
+  },
+  "models": [
+    {
+      "label": "opt-125m",
+      "slug": "opt-125m",
+      "path": "/home/cml/CloverInfer/model/opt-125m"
+    }
+  ],
+  "datasets": [
+    {
+      "label": "humaneval",
+      "slug": "humaneval",
+      "path": "dataset/humaneval.jsonl",
+      "format": "auto"
+    },
+    {
+      "label": "sharegpt",
+      "slug": "sharegpt",
+      "path": "dataset/sharegpt_processed.json",
+      "format": "auto"
+    }
+  ],
+  "prompt_token_lengths": [
+    0,
+    128
+  ],
+  "output_token_lengths": [
+    4
+  ],
+  "concurrency_values": [
+    1,
+    2
+  ],
+  "limit": 2,
+  "dtype": "float16",
+  "baselines": "PD,AFD,CPU-Attention,Naive PIM,CloverInfer",
+  "resolved_baselines": [
+    {
+      "canonical_key": "pd",
+      "canonical_name": "PD",
+      "internal_baseline": "split_gpu_full_decode",
+      "alias_note": "PD resolves to the prefill/decoding split baseline implemented by split_gpu_full_decode.",
+      "requested_aliases": [
+        "PD"
+      ],
+      "resolved_aliases": [
+        "pd",
+        "pd-baseline",
+        "prefill-decoding",
+        "prefill_decoding",
+        "prefill-decoding-separation",
+        "split_gpu_full_decode"
+      ]
+    },
+    {
+      "canonical_key": "cpu_attention",
+      "canonical_name": "CPU-Attention",
+      "internal_baseline": "disagg_cpu",
+      "alias_note": "The current repo does not yet expose a standalone GPU-attention AFD path, so both AFD and CPU-Attention resolve to the disagg_cpu implementation.",
+      "requested_aliases": [
+        "AFD",
+        "CPU-Attention"
+      ],
+      "resolved_aliases": [
+        "afd",
+        "afd-baseline",
+        "af-split",
+        "af_split",
+        "cpu-attention",
+        "cpu_attention",
+        "cpu",
+        "disagg_cpu"
+      ]
+    },
+    {
+      "canonical_key": "naive_pim",
+      "canonical_name": "Naive PIM",
+      "internal_baseline": "disagg_pim_naive",
+      "alias_note": "Naive PIM resolves to the current disagg_pim_naive implementation.",
+      "requested_aliases": [
+        "Naive PIM"
+      ],
+      "resolved_aliases": [
+        "naive-pim",
+        "naive_pim",
+        "pim-naive",
+        "pim_naive",
+        "disagg_pim_naive"
+      ]
+    },
+    {
+      "canonical_key": "cloverinfer",
+      "canonical_name": "CloverInfer",
+      "internal_baseline": "disagg_cloverinfer",
+      "alias_note": "CloverInfer resolves to the current disagg_cloverinfer implementation.",
+      "requested_aliases": [
+        "CloverInfer"
+      ],
+      "resolved_aliases": [
+        "cloverinfer",
+        "clover-infer",
+        "disagg_cloverinfer"
+      ]
+    }
+  ],
+  "num_cases": 8,
+  "dry_run": true
+}

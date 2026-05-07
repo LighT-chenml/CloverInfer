@@ -1,0 +1,2 @@
+[36m(DecodeDenseNode pid=2079576, ip=192.168.123.3)[0m DecodeDenseNode 0 loading model from /home/cml/CloverInfer/model/opt-125m on cuda
+[36m(PrefillNode pid=2121926)[0m PrefillNode 0 loading model from /home/cml/CloverInfer/model/opt-125m on cuda

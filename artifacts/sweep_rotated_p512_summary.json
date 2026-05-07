@@ -1,0 +1,154 @@
+[
+  {
+    "concurrency": 1,
+    "returncode": 0,
+    "summary": {
+      "num_requests": 8,
+      "concurrency": 1,
+      "max_latency": 6.951662540435791,
+      "avg_latency": 6.519336760044098,
+      "max_prompt_token_length": 512,
+      "max_total_blocks": 432,
+      "max_blocks_per_group": 3,
+      "max_usage_ratio": 0.53125,
+      "max_free_range_count": 0.0,
+      "max_live_slot_count": 34.0,
+      "max_dpu_allocate_failures": 0,
+      "max_dpu_capacity_fallbacks": 0,
+      "max_fallback_allocations": 0,
+      "out_of_order_completions": 0,
+      "requests_with_overlap_snapshot": 8,
+      "requests_with_free_ranges": 0,
+      "failed": false
+    },
+    "output": "artifacts/sweep_rotated_p512_c1.jsonl",
+    "stdout_tail": [
+      "{\"request_index\": 5, \"completion_index\": 5, \"inflight_at_submit\": 1, \"prompt_token_length\": 512, \"total_blocks\": 432, \"max_blocks_per_group\": 3, \"max_usage_ratio\": 0.53125, \"avg_usage_ratio\": 0.421875, \"max_free_range_count\": 0.0, \"min_largest_free_range\": 0.0, \"max_live_slot_count\": 34.0}",
+      "{\"request_index\": 6, \"completion_index\": 6, \"inflight_at_submit\": 1, \"prompt_token_length\": 512, \"total_blocks\": 432, \"max_blocks_per_group\": 3, \"max_usage_ratio\": 0.53125, \"avg_usage_ratio\": 0.421875, \"max_free_range_count\": 0.0, \"min_largest_free_range\": 0.0, \"max_live_slot_count\": 34.0}",
+      "{\"request_index\": 7, \"completion_index\": 7, \"inflight_at_submit\": 1, \"prompt_token_length\": 512, \"total_blocks\": 432, \"max_blocks_per_group\": 3, \"max_usage_ratio\": 0.53125, \"avg_usage_ratio\": 0.421875, \"max_free_range_count\": 0.0, \"min_largest_free_range\": 0.0, \"max_live_slot_count\": 34.0}",
+      "{\"request_index\": 8, \"completion_index\": 8, \"inflight_at_submit\": 1, \"prompt_token_length\": 512, \"total_blocks\": 432, \"max_blocks_per_group\": 3, \"max_usage_ratio\": 0.53125, \"avg_usage_ratio\": 0.421875, \"max_free_range_count\": 0.0, \"min_largest_free_range\": 0.0, \"max_live_slot_count\": 34.0}",
+      "{\"summary\": {\"num_requests\": 8, \"concurrency\": 1, \"max_latency\": 6.951662540435791, \"avg_latency\": 6.519336760044098, \"max_prompt_token_length\": 512, \"max_total_blocks\": 432, \"max_blocks_per_group\": 3, \"max_usage_ratio\": 0.53125, \"max_free_range_count\": 0.0, \"max_live_slot_count\": 34.0, \"max_dpu_allocate_failures\": 0, \"max_dpu_capacity_fallbacks\": 0, \"max_fallback_allocations\": 0, \"out_of_order_completions\": 0, \"requests_with_overlap_snapshot\": 8, \"requests_with_free_ranges\": 0, \"failed\": false}, \"output\": \"artifacts/sweep_rotated_p512_c1.jsonl\"}"
+    ],
+    "stderr_tail": [
+      "\u001b[33m(raylet, ip=192.168.123.3)\u001b[0m ",
+      "\u001b[33m(raylet, ip=192.168.123.3)\u001b[0m Python patch version mismatch: The cluster was started with:\u001b[32m [repeated 2x across cluster] (Ray deduplicates logs by default. Set RAY_DEDUP_LOGS=0 to disable log deduplication, or see https://docs.ray.io/en/master/ray-observability/user-guides/configure-logging.html#log-deduplication for more options.)\u001b[0m",
+      "\u001b[33m(raylet, ip=192.168.123.3)\u001b[0m     Ray: 2.53.0\u001b[32m [repeated 5x across cluster]\u001b[0m",
+      "\u001b[33m(raylet, ip=192.168.123.3)\u001b[0m     Python: 3.10.20\u001b[32m [repeated 5x across cluster]\u001b[0m",
+      "\u001b[33m(raylet, ip=192.168.123.3)\u001b[0m This process on node 192.168.123.3 was started with:\u001b[32m [repeated 2x across cluster]\u001b[0m"
+    ]
+  },
+  {
+    "concurrency": 2,
+    "returncode": 0,
+    "summary": {
+      "num_requests": 8,
+      "concurrency": 2,
+      "max_latency": 12.140957355499268,
+      "avg_latency": 11.593649744987488,
+      "max_prompt_token_length": 512,
+      "max_total_blocks": 432,
+      "max_blocks_per_group": 3,
+      "max_usage_ratio": 1.0,
+      "max_free_range_count": 1.0,
+      "max_live_slot_count": 64.0,
+      "max_dpu_allocate_failures": 29,
+      "max_dpu_capacity_fallbacks": 0,
+      "max_fallback_allocations": 29,
+      "out_of_order_completions": 0,
+      "requests_with_overlap_snapshot": 8,
+      "requests_with_free_ranges": 3,
+      "failed": false
+    },
+    "output": "artifacts/sweep_rotated_p512_c2.jsonl",
+    "stdout_tail": [
+      "{\"request_index\": 5, \"completion_index\": 5, \"inflight_at_submit\": 2, \"prompt_token_length\": 512, \"total_blocks\": 432, \"max_blocks_per_group\": 3, \"max_usage_ratio\": 1.0, \"avg_usage_ratio\": 0.8203125, \"max_free_range_count\": 0.0, \"min_largest_free_range\": 0.0, \"max_live_slot_count\": 64.0}",
+      "{\"request_index\": 6, \"completion_index\": 6, \"inflight_at_submit\": 2, \"prompt_token_length\": 512, \"total_blocks\": 408, \"max_blocks_per_group\": 3, \"max_usage_ratio\": 0.46875, \"avg_usage_ratio\": 0.3984375, \"max_free_range_count\": 1.0, \"min_largest_free_range\": 393216.0, \"max_live_slot_count\": 30.0}",
+      "{\"request_index\": 7, \"completion_index\": 7, \"inflight_at_submit\": 2, \"prompt_token_length\": 512, \"total_blocks\": 393, \"max_blocks_per_group\": 3, \"max_usage_ratio\": 0.90625, \"avg_usage_ratio\": 0.8056640625, \"max_free_range_count\": 0.0, \"min_largest_free_range\": 0.0, \"max_live_slot_count\": 58.0}",
+      "{\"request_index\": 8, \"completion_index\": 8, \"inflight_at_submit\": 2, \"prompt_token_length\": 512, \"total_blocks\": 432, \"max_blocks_per_group\": 3, \"max_usage_ratio\": 0.53125, \"avg_usage_ratio\": 0.421875, \"max_free_range_count\": 1.0, \"min_largest_free_range\": 344064.0, \"max_live_slot_count\": 34.0}",
+      "{\"summary\": {\"num_requests\": 8, \"concurrency\": 2, \"max_latency\": 12.140957355499268, \"avg_latency\": 11.593649744987488, \"max_prompt_token_length\": 512, \"max_total_blocks\": 432, \"max_blocks_per_group\": 3, \"max_usage_ratio\": 1.0, \"max_free_range_count\": 1.0, \"max_live_slot_count\": 64.0, \"max_dpu_allocate_failures\": 29, \"max_dpu_capacity_fallbacks\": 0, \"max_fallback_allocations\": 29, \"out_of_order_completions\": 0, \"requests_with_overlap_snapshot\": 8, \"requests_with_free_ranges\": 3, \"failed\": false}, \"output\": \"artifacts/sweep_rotated_p512_c2.jsonl\"}"
+    ],
+    "stderr_tail": [
+      "\u001b[33m(raylet, ip=192.168.123.7)\u001b[0m ",
+      "\u001b[33m(raylet, ip=192.168.123.7)\u001b[0m Python patch version mismatch: The cluster was started with:\u001b[32m [repeated 2x across cluster] (Ray deduplicates logs by default. Set RAY_DEDUP_LOGS=0 to disable log deduplication, or see https://docs.ray.io/en/master/ray-observability/user-guides/configure-logging.html#log-deduplication for more options.)\u001b[0m",
+      "\u001b[33m(raylet, ip=192.168.123.7)\u001b[0m     Ray: 2.53.0\u001b[32m [repeated 5x across cluster]\u001b[0m",
+      "\u001b[33m(raylet, ip=192.168.123.7)\u001b[0m     Python: 3.10.20\u001b[32m [repeated 5x across cluster]\u001b[0m",
+      "\u001b[33m(raylet, ip=192.168.123.7)\u001b[0m This process on node 192.168.123.7 was started with:\u001b[32m [repeated 2x across cluster]\u001b[0m"
+    ]
+  },
+  {
+    "concurrency": 4,
+    "returncode": 0,
+    "summary": {
+      "num_requests": 8,
+      "concurrency": 4,
+      "max_latency": 14.809644222259521,
+      "avg_latency": 14.006616741418839,
+      "max_prompt_token_length": 512,
+      "max_total_blocks": 432,
+      "max_blocks_per_group": 3,
+      "max_usage_ratio": 1.0,
+      "max_free_range_count": 0.0,
+      "max_live_slot_count": 64.0,
+      "max_dpu_allocate_failures": 520,
+      "max_dpu_capacity_fallbacks": 0,
+      "max_fallback_allocations": 520,
+      "out_of_order_completions": 3,
+      "requests_with_overlap_snapshot": 8,
+      "requests_with_free_ranges": 0,
+      "failed": false
+    },
+    "output": "artifacts/sweep_rotated_p512_c4.jsonl",
+    "stdout_tail": [
+      "{\"request_index\": 5, \"completion_index\": 5, \"inflight_at_submit\": 4, \"prompt_token_length\": 512, \"total_blocks\": 0, \"max_blocks_per_group\": 0, \"max_usage_ratio\": 0.984375, \"avg_usage_ratio\": 0.8583984375, \"max_free_range_count\": 0.0, \"min_largest_free_range\": 0.0, \"max_live_slot_count\": 63.0}",
+      "{\"request_index\": 6, \"completion_index\": 6, \"inflight_at_submit\": 4, \"prompt_token_length\": 512, \"total_blocks\": 132, \"max_blocks_per_group\": 3, \"max_usage_ratio\": 0.984375, \"avg_usage_ratio\": 0.8583984375, \"max_free_range_count\": 0.0, \"min_largest_free_range\": 0.0, \"max_live_slot_count\": 63.0}",
+      "{\"request_index\": 7, \"completion_index\": 7, \"inflight_at_submit\": 4, \"prompt_token_length\": 512, \"total_blocks\": 132, \"max_blocks_per_group\": 3, \"max_usage_ratio\": 0.984375, \"avg_usage_ratio\": 0.8583984375, \"max_free_range_count\": 0.0, \"min_largest_free_range\": 0.0, \"max_live_slot_count\": 63.0}",
+      "{\"request_index\": 8, \"completion_index\": 8, \"inflight_at_submit\": 4, \"prompt_token_length\": 512, \"total_blocks\": 132, \"max_blocks_per_group\": 3, \"max_usage_ratio\": 0.984375, \"avg_usage_ratio\": 0.8583984375, \"max_free_range_count\": 0.0, \"min_largest_free_range\": 0.0, \"max_live_slot_count\": 63.0}",
+      "{\"summary\": {\"num_requests\": 8, \"concurrency\": 4, \"max_latency\": 14.809644222259521, \"avg_latency\": 14.006616741418839, \"max_prompt_token_length\": 512, \"max_total_blocks\": 432, \"max_blocks_per_group\": 3, \"max_usage_ratio\": 1.0, \"max_free_range_count\": 0.0, \"max_live_slot_count\": 64.0, \"max_dpu_allocate_failures\": 520, \"max_dpu_capacity_fallbacks\": 0, \"max_fallback_allocations\": 520, \"out_of_order_completions\": 3, \"requests_with_overlap_snapshot\": 8, \"requests_with_free_ranges\": 0, \"failed\": false}, \"output\": \"artifacts/sweep_rotated_p512_c4.jsonl\"}"
+    ],
+    "stderr_tail": [
+      "\u001b[33m(raylet, ip=192.168.123.7)\u001b[0m ",
+      "\u001b[33m(raylet, ip=192.168.123.7)\u001b[0m Python patch version mismatch: The cluster was started with:\u001b[32m [repeated 2x across cluster] (Ray deduplicates logs by default. Set RAY_DEDUP_LOGS=0 to disable log deduplication, or see https://docs.ray.io/en/master/ray-observability/user-guides/configure-logging.html#log-deduplication for more options.)\u001b[0m",
+      "\u001b[33m(raylet, ip=192.168.123.7)\u001b[0m     Ray: 2.53.0\u001b[32m [repeated 5x across cluster]\u001b[0m",
+      "\u001b[33m(raylet, ip=192.168.123.7)\u001b[0m     Python: 3.10.20\u001b[32m [repeated 5x across cluster]\u001b[0m",
+      "\u001b[33m(raylet, ip=192.168.123.7)\u001b[0m This process on node 192.168.123.7 was started with:\u001b[32m [repeated 2x across cluster]\u001b[0m"
+    ]
+  },
+  {
+    "concurrency": 8,
+    "returncode": 0,
+    "summary": {
+      "num_requests": 8,
+      "concurrency": 8,
+      "max_latency": 16.518474340438843,
+      "avg_latency": 16.47830042243004,
+      "max_prompt_token_length": 512,
+      "max_total_blocks": 432,
+      "max_blocks_per_group": 3,
+      "max_usage_ratio": 1.0,
+      "max_free_range_count": 1.0,
+      "max_live_slot_count": 64.0,
+      "max_dpu_allocate_failures": 813,
+      "max_dpu_capacity_fallbacks": 0,
+      "max_fallback_allocations": 813,
+      "out_of_order_completions": 3,
+      "requests_with_overlap_snapshot": 8,
+      "requests_with_free_ranges": 6,
+      "failed": false
+    },
+    "output": "artifacts/sweep_rotated_p512_c8.jsonl",
+    "stdout_tail": [
+      "{\"request_index\": 7, \"completion_index\": 5, \"inflight_at_submit\": 7, \"prompt_token_length\": 512, \"total_blocks\": 432, \"max_blocks_per_group\": 3, \"max_usage_ratio\": 0.625, \"avg_usage_ratio\": 0.5712890625, \"max_free_range_count\": 1.0, \"min_largest_free_range\": 393216.0, \"max_live_slot_count\": 40.0}",
+      "{\"request_index\": 6, \"completion_index\": 6, \"inflight_at_submit\": 6, \"prompt_token_length\": 512, \"total_blocks\": 432, \"max_blocks_per_group\": 3, \"max_usage_ratio\": 0.625, \"avg_usage_ratio\": 0.5712890625, \"max_free_range_count\": 1.0, \"min_largest_free_range\": 393216.0, \"max_live_slot_count\": 40.0}",
+      "{\"request_index\": 8, \"completion_index\": 7, \"inflight_at_submit\": 8, \"prompt_token_length\": 512, \"total_blocks\": 153, \"max_blocks_per_group\": 3, \"max_usage_ratio\": 0.25, \"avg_usage_ratio\": 0.1494140625, \"max_free_range_count\": 1.0, \"min_largest_free_range\": 786432.0, \"max_live_slot_count\": 16.0}",
+      "{\"request_index\": 5, \"completion_index\": 8, \"inflight_at_submit\": 5, \"prompt_token_length\": 512, \"total_blocks\": 432, \"max_blocks_per_group\": 3, \"max_usage_ratio\": 0.625, \"avg_usage_ratio\": 0.5712890625, \"max_free_range_count\": 1.0, \"min_largest_free_range\": 393216.0, \"max_live_slot_count\": 40.0}",
+      "{\"summary\": {\"num_requests\": 8, \"concurrency\": 8, \"max_latency\": 16.518474340438843, \"avg_latency\": 16.47830042243004, \"max_prompt_token_length\": 512, \"max_total_blocks\": 432, \"max_blocks_per_group\": 3, \"max_usage_ratio\": 1.0, \"max_free_range_count\": 1.0, \"max_live_slot_count\": 64.0, \"max_dpu_allocate_failures\": 813, \"max_dpu_capacity_fallbacks\": 0, \"max_fallback_allocations\": 813, \"out_of_order_completions\": 3, \"requests_with_overlap_snapshot\": 8, \"requests_with_free_ranges\": 6, \"failed\": false}, \"output\": \"artifacts/sweep_rotated_p512_c8.jsonl\"}"
+    ],
+    "stderr_tail": [
+      "\u001b[33m(raylet, ip=192.168.123.7)\u001b[0m ",
+      "\u001b[33m(raylet, ip=192.168.123.7)\u001b[0m Python patch version mismatch: The cluster was started with:\u001b[32m [repeated 2x across cluster] (Ray deduplicates logs by default. Set RAY_DEDUP_LOGS=0 to disable log deduplication, or see https://docs.ray.io/en/master/ray-observability/user-guides/configure-logging.html#log-deduplication for more options.)\u001b[0m",
+      "\u001b[33m(raylet, ip=192.168.123.7)\u001b[0m     Ray: 2.53.0\u001b[32m [repeated 5x across cluster]\u001b[0m",
+      "\u001b[33m(raylet, ip=192.168.123.7)\u001b[0m     Python: 3.10.20\u001b[32m [repeated 5x across cluster]\u001b[0m",
+      "\u001b[33m(raylet, ip=192.168.123.7)\u001b[0m This process on node 192.168.123.7 was started with:\u001b[32m [repeated 2x across cluster]\u001b[0m"
+    ]
+  }
+]

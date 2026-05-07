@@ -1,0 +1,4 @@
+[36m(DecodeDenseNode pid=2087622, ip=192.168.123.3)[0m DecodeDenseNode 0 loading model from /home/cml/CloverInfer/model/opt-125m on cuda
+[36m(PrefillNode pid=2215031)[0m PrefillNode 0 loading model from /home/cml/CloverInfer/model/opt-125m on cuda
+{"avg_latency": 0.7211410999298096, "avg_ttft": 0.28890442848205566, "avg_tpot": 0.4322366714477539, "avg_throughput": 2.773382352211883, "avg_total_tokens": 2.0, "num_requests": 1, "wall_time_s": 0.721290111541748, "request_throughput_rps": 1.3864046990225796, "output_token_throughput_tps": 2.772809398045159, "requested_concurrency": 1, "effective_concurrency": 1, "execution_mode": "serial_split_pipeline", "out_of_order_completions": 0, "baseline": "PD", "baseline_key": "pd", "internal_baseline": "split_gpu_full_decode", "requested_aliases": ["PD"]}
+Saved baseline comparison results to artifacts/matrix_smoke_opt_pd/cases/opt-125m__humaneval__pnative__o2__c1/results.jsonl
