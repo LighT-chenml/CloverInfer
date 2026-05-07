@@ -1,6 +1,5 @@
 dataset/
 model/
-artifacts/
 
 # Python编译文件
 __pycache__/
