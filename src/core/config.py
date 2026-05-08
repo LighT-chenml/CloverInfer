@@ -58,6 +58,8 @@ class ClusterConfig(BaseModel):
     clover_rankset_overlap_enabled: bool = False
     clover_rankset_overlap_max_ranksets_per_batch: int = 0
     clover_rankset_overlap_transfer_granularity: str = "stripe"
+    clover_rankset_overlap_async_dispatch_enabled: bool = False
+    clover_rankset_overlap_transfer_latency_s: float = 0.0
     decode_step_sync_window_s: float = 0.0
     decode_step_sync_max_size: int = 8
     attention_decode_wave_persist_enabled: bool = False

@@ -386,6 +386,32 @@ Validation:
 - reduced exposed communication cost in stage timing
 - improved TPOT at medium/high concurrency
 
+Current implementation progress as of 2026-05-08:
+
+- request packing hints now include `rankset_plan` and per-layer
+  `layer_group_map`
+- scheduler task graphs no longer stop at one work item per rankset; when
+  `--clover-rankset-overlap-transfer-granularity rankset` is enabled they can
+  split a single request into multiple group-slice work items inside the same
+  rankset
+- `AttentionNode` supports:
+  - async transfer staging
+  - serial compute consumption
+  - per-work-item event timelines
+- CloverInfer backend now exposes a partial path:
+  - prepare decode records once
+  - compute group-slice partial contexts per work item
+  - assemble the final per-request context after all partials complete
+
+Practical interpretation:
+
+- the codebase now has a real single-request multi-work-item execution path
+- overlap is still conservative:
+  - transfer is async
+  - compute is still consumed serially inside the attention actor
+- this is enough to validate task-graph granularity, partial readiness, and
+  reassembly correctness before attempting deeper async execution
+
 ### Phase D: Mixed-granularity relayout and bubble-free pipeline
 
 Goal:

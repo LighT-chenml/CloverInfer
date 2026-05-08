@@ -252,6 +252,21 @@ def build_case_command(args, case: Dict[str, object], output_path: str) -> List[
         "--clover-rankset-overlap-transfer-granularity",
         args.clover_rankset_overlap_transfer_granularity,
     )
+    append_optional_flag(
+        cmd,
+        "--clover-rankset-overlap-async-dispatch-enabled",
+        args.clover_rankset_overlap_async_dispatch_enabled,
+    )
+    append_optional_flag(
+        cmd,
+        "--no-clover-rankset-overlap-async-dispatch-enabled",
+        args.no_clover_rankset_overlap_async_dispatch_enabled,
+    )
+    append_key_value(
+        cmd,
+        "--clover-rankset-overlap-transfer-latency-s",
+        args.clover_rankset_overlap_transfer_latency_s,
+    )
     append_key_value(cmd, "--decode-continuous-batch-window-s", args.decode_continuous_batch_window_s)
     append_key_value(cmd, "--decode-continuous-batch-window-ms", args.decode_continuous_batch_window_ms)
     append_key_value(cmd, "--decode-continuous-batch-max-size", args.decode_continuous_batch_max_size)
@@ -379,6 +394,9 @@ def main():
         default="stripe",
         choices=["stripe", "rankset"],
     )
+    parser.add_argument("--clover-rankset-overlap-async-dispatch-enabled", action="store_true")
+    parser.add_argument("--no-clover-rankset-overlap-async-dispatch-enabled", action="store_true")
+    parser.add_argument("--clover-rankset-overlap-transfer-latency-s", type=float, default=0.0)
     parser.add_argument("--decode-continuous-batch-window-s", type=float, default=0.0)
     parser.add_argument("--decode-continuous-batch-window-ms", type=float, default=0.0)
     parser.add_argument("--decode-continuous-batch-max-size", type=int, default=8)
@@ -423,6 +441,10 @@ def main():
         "clover_rankset_overlap_enabled": bool(args.clover_rankset_overlap_enabled),
         "clover_rankset_overlap_max_ranksets_per_batch": int(args.clover_rankset_overlap_max_ranksets_per_batch),
         "clover_rankset_overlap_transfer_granularity": str(args.clover_rankset_overlap_transfer_granularity),
+        "clover_rankset_overlap_async_dispatch_enabled": bool(
+            args.clover_rankset_overlap_async_dispatch_enabled
+        ),
+        "clover_rankset_overlap_transfer_latency_s": float(args.clover_rankset_overlap_transfer_latency_s),
         "decode_continuous_batch_window_s": float(args.decode_continuous_batch_window_s),
         "decode_continuous_batch_window_ms": float(args.decode_continuous_batch_window_ms),
         "decode_continuous_batch_max_size": int(args.decode_continuous_batch_max_size),

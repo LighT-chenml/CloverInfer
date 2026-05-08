@@ -783,6 +783,137 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                 outputs.append(record["context"].unsqueeze(0))
             return outputs
 
+    def _match_record_group(self, record: Dict[str, object], group_slice: Dict[str, object]):
+        layer_state = record["request_state"].layer_states[record["layer_idx"]]
+        target_k_slot = str(group_slice.get("k_slot", ""))
+        target_v_slot = str(group_slice.get("v_slot", ""))
+        target_head_start = int(group_slice.get("head_start", 0))
+        target_head_end = int(group_slice.get("head_end", 0))
+        for group in layer_state.head_groups:
+            if target_k_slot and target_v_slot:
+                if str(group.k_slot) == target_k_slot and str(group.v_slot) == target_v_slot:
+                    return group
+            if int(group.head_start) == target_head_start and int(group.head_end) == target_head_end:
+                return group
+        raise KeyError(
+            f"unable to match group slice for request={record['request_id']} "
+            f"layer={record['layer_idx']} head_range=({target_head_start},{target_head_end})"
+        )
+
+    def _compute_partial_group_context(
+        self,
+        record: Dict[str, object],
+        group_slice: Dict[str, object],
+    ) -> tuple[int, int, torch.Tensor]:
+        group = self._match_record_group(record, group_slice)
+        head_start = int(group.head_start)
+        head_end = int(group.head_end)
+        local_query = record["q_fp32"][head_start:head_end].contiguous()
+        if record["use_resident_av"] and self.softmax_av_fused_enabled:
+            with self._timed("resident_av_s"):
+                context = self.resident_store.qk_softmax_weighted_value_sum_batch(
+                    [
+                        (
+                            group.k_slot,
+                            group.v_slot,
+                            list(range(group.group_heads)),
+                            int(group.seq_len),
+                            local_query,
+                            float(record["score_scale"]),
+                        )
+                    ]
+                )[0]
+            self.qk_full_batch_calls += 1
+            self.softmax_av_fused_batch_calls += 1
+            self.softmax_av_fused_ops += 1
+            return (head_start, head_end, context.to(record["query_dtype"]))
+
+        if record["use_resident_av"]:
+            with self._timed("resident_qk_batch_s"):
+                score_mat = self.resident_store.qk_slot_scores_batch(
+                    [
+                        (
+                            group.k_slot,
+                            group.v_slot,
+                            list(range(group.group_heads)),
+                            int(group.seq_len),
+                            local_query,
+                        )
+                    ]
+                )[0]
+            self.qk_batch_calls += 1
+            scaled_scores = score_mat.to(torch.float32) * float(record["score_scale"])
+            with self._timed("resident_av_s"):
+                context = self.resident_store.softmax_weighted_value_sum_batch(
+                    [(group.k_slot, group.v_slot, scaled_scores.contiguous())]
+                )[0]
+            self.resident_av_batch_calls += 1
+            self.resident_av_ops += 1
+            return (head_start, head_end, context.to(record["query_dtype"]))
+
+        keys = record["keys"][:, head_start:head_end, :]
+        values = record["values"][:, head_start:head_end, :]
+        with self._timed("host_score_compute_s"):
+            scores = torch.einsum("hd,lhd->hl", local_query, keys.float()) * float(record["score_scale"])
+        with self._timed("softmax_av_s"):
+            weights = torch.softmax(scores, dim=-1)
+        with self._timed("host_context_compute_s"):
+            context = torch.einsum("hl,lhd->hd", weights, values.float()).to(record["query_dtype"])
+        return (head_start, head_end, context)
+
+    def prepare_decode_records(self, items: List[Dict[str, object]]) -> List[Dict[str, object]]:
+        return [self._prepare_decode_record(item) for item in items]
+
+    def compute_rankset_partial_contexts(
+        self,
+        records: List[Dict[str, object]],
+        work_item: Dict[str, object],
+    ) -> Dict[str, List[tuple[int, int, torch.Tensor]]]:
+        partials_by_request: Dict[str, List[tuple[int, int, torch.Tensor]]] = {}
+        request_group_slices = dict(work_item.get("request_group_slices", {}) or {})
+        for record in records:
+            request_id = str(record["request_id"])
+            group_slices = list(request_group_slices.get(request_id, []) or [])
+            if not group_slices:
+                continue
+            partials_by_request[request_id] = [
+                self._compute_partial_group_context(record, group_slice)
+                for group_slice in group_slices
+            ]
+        return partials_by_request
+
+    def finalize_rankset_decode_records(
+        self,
+        records: List[Dict[str, object]],
+        partials_by_request: Dict[str, List[tuple[int, int, torch.Tensor]]],
+    ) -> List[torch.Tensor]:
+        outputs: List[torch.Tensor] = []
+        for record in records:
+            request_id = str(record["request_id"])
+            partials = list(partials_by_request.get(request_id, []) or [])
+            if not partials:
+                raise RuntimeError(
+                    f"missing rankset partial contexts for request={request_id} layer={record['layer_idx']}"
+                )
+            context = torch.empty(record["q_fp32"].shape, dtype=record["query_dtype"])
+            covered = torch.zeros(int(record["q_fp32"].shape[0]), dtype=torch.bool)
+            for head_start, head_end, partial_context in sorted(partials, key=lambda item: item[0]):
+                context[head_start:head_end] = partial_context.to(record["query_dtype"])
+                covered[head_start:head_end] = True
+            if not bool(torch.all(covered).item()):
+                missing_heads = [idx for idx, flag in enumerate(covered.tolist()) if not flag]
+                raise RuntimeError(
+                    f"incomplete rankset partial coverage for request={request_id} "
+                    f"layer={record['layer_idx']} missing_heads={missing_heads[:8]}"
+                )
+            if self.cpu_shadow_enabled:
+                if record["layer_idx"] == record["request_state"].num_layers - 1:
+                    self.cpu_backend.context_lens[request_id] += 1
+            elif record["layer_idx"] == record["request_state"].num_layers - 1:
+                record["request_state"].context_len = int(record["request_state"].context_len)
+            outputs.append(context.unsqueeze(0))
+        return outputs
+
     def init_request(
         self,
         request_id: str,

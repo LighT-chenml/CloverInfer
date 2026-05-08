@@ -84,6 +84,13 @@ class AttentionNode:
         self.backend_name = backend
         self.device = _select_device(prefer_gpu)
         backend_kwargs = backend_kwargs or {}
+        self.rankset_overlap_async_dispatch_enabled = bool(
+            backend_kwargs.pop("rankset_overlap_async_dispatch_enabled", False)
+        )
+        self.rankset_overlap_transfer_latency_s = max(
+            0.0,
+            float(backend_kwargs.pop("rankset_overlap_transfer_latency_s", 0.0)),
+        )
         decode_batch_window_s = float(backend_kwargs.pop("decode_batch_window_s", decode_batch_window_s))
         decode_batch_max_size = int(backend_kwargs.pop("decode_batch_max_size", decode_batch_max_size))
         if backend == "cpu":
@@ -134,6 +141,8 @@ class AttentionNode:
             "work_items": int(self.rankset_task_graph_exec_work_items),
             "max_work_items": int(self.rankset_task_graph_exec_max_work_items),
             "fallback_batches": int(self.rankset_task_graph_exec_fallback_batches),
+            "async_dispatch_enabled": bool(self.rankset_overlap_async_dispatch_enabled),
+            "transfer_latency_s": float(self.rankset_overlap_transfer_latency_s),
         }
         if hasattr(self.backend, "get_debug_info"):
             info["backend_debug"] = self.backend.get_debug_info()
@@ -197,7 +206,7 @@ class AttentionNode:
             for payload, context in zip(payloads, contexts)
         ]
 
-    def _execute_rankset_task_graph_batch(self, payloads):
+    async def _execute_rankset_task_graph_batch(self, payloads):
         if not payloads:
             return []
         task_graph = dict(payloads[0].get("rankset_task_graph", {}) or {})
@@ -243,7 +252,12 @@ class AttentionNode:
                 execution_mode="scaffold_serial_attention",
                 fallback_reason="task_graph_request_coverage_mismatch",
             )
-        if any(len(work_item_ids) != 1 for work_item_ids in request_to_work_items.values()):
+        multi_work_item_per_request = any(len(work_item_ids) != 1 for work_item_ids in request_to_work_items.values())
+        if multi_work_item_per_request and not (
+            hasattr(self.backend, "prepare_decode_records")
+            and hasattr(self.backend, "compute_rankset_partial_contexts")
+            and hasattr(self.backend, "finalize_rankset_decode_records")
+        ):
             return self._fallback_rankset_execution(
                 payloads,
                 execution_mode="scaffold_serial_attention",
@@ -260,33 +274,29 @@ class AttentionNode:
             len(work_items),
         )
 
-        for work_item in work_items:
-            work_item_id = str(work_item.get("work_item_id", ""))
-            subpayloads = [
-                payload_by_request_id[str(request_id)]
-                for request_id in work_item.get("request_ids", []) or []
-                if str(request_id) in payload_by_request_id
-            ]
-            if not subpayloads:
-                continue
-            started_at = time.perf_counter()
-            contexts = self.backend.decode_layer_batch(subpayloads)
-            finished_at = time.perf_counter()
-            batch_compute_s = float(finished_at - started_at)
-            per_item_compute_s = batch_compute_s / max(len(contexts), 1)
-            executed_work_item_ids.append(work_item_id)
-            work_item_events.append(
-                {
-                    "work_item_id": work_item_id,
-                    "layer_idx": int(work_item.get("layer_idx", 0)),
-                    "rankset_id": str(work_item.get("rankset_id", "")),
-                    "request_ids": [str(request_id) for request_id in work_item.get("request_ids", []) or []],
-                    "batch_size": int(len(subpayloads)),
-                    "started_at": float(started_at),
-                    "finished_at": float(finished_at),
-                    "duration_s": float(batch_compute_s),
-                }
+        prepared_records = None
+        if multi_work_item_per_request:
+            prepared_records = self.backend.prepare_decode_records(payloads)
+        if self.rankset_overlap_async_dispatch_enabled and len(work_items) > 1:
+            work_item_results = await self._execute_rankset_task_graph_batch_async(
+                payload_by_request_id, work_items, prepared_records=prepared_records
             )
+        else:
+            work_item_results = await self._execute_rankset_task_graph_batch_serial(
+                payload_by_request_id, work_items, prepared_records=prepared_records
+            )
+
+        partials_by_request = {}
+        for item_result in work_item_results:
+            work_item_id = str(item_result["work_item_id"])
+            subpayloads = list(item_result["subpayloads"])
+            contexts = list(item_result.get("contexts", []))
+            per_item_compute_s = float(item_result["per_item_compute_s"])
+            executed_work_item_ids.append(work_item_id)
+            work_item_events.append(dict(item_result["event"]))
+            partial_contexts = dict(item_result.get("partial_contexts_by_request", {}) or {})
+            for request_id, partials in partial_contexts.items():
+                partials_by_request.setdefault(str(request_id), []).extend(list(partials or []))
             for payload, context in zip(subpayloads, contexts):
                 request_id = str(payload.get("request_id", ""))
                 results_by_request_id[request_id] = {
@@ -299,7 +309,41 @@ class AttentionNode:
                         "enabled": True,
                         "layer_idx": int(payload.get("layer_idx", 0)),
                         "request_id": request_id,
-                        "execution_mode": "rankset_task_graph_serial",
+                        "execution_mode": str(item_result["execution_mode"]),
+                        "work_item_count": int(task_graph.get("work_item_count", 0)),
+                        "executed_work_item_ids": list(executed_work_item_ids),
+                        "executed_work_item_count": int(len(executed_work_item_ids)),
+                        "rankset_ids": [
+                            str(item.get("rankset_id"))
+                            for item in list(payload.get("request_rankset_plan", []) or [])
+                            if item.get("rankset_id") is not None
+                        ],
+                        "request_rankset_count": int(len(list(payload.get("request_rankset_plan", []) or []))),
+                        "fallback_to_full_batch": False,
+                        "fallback_reason": "",
+                        "work_item_events": list(work_item_events),
+                    },
+                }
+
+        if multi_work_item_per_request and prepared_records is not None:
+            final_contexts = self.backend.finalize_rankset_decode_records(prepared_records, partials_by_request)
+            for payload, context in zip(payloads, final_contexts):
+                request_id = str(payload.get("request_id", ""))
+                results_by_request_id[request_id] = {
+                    "context": context,
+                    "profile": {
+                        "compute_s": 0.0,
+                        "batch_size": len(payloads),
+                    },
+                    "rankset_execution": {
+                        "enabled": True,
+                        "layer_idx": int(payload.get("layer_idx", 0)),
+                        "request_id": request_id,
+                        "execution_mode": (
+                            "rankset_task_graph_async_dispatch_serial_compute"
+                            if self.rankset_overlap_async_dispatch_enabled and len(work_items) > 1
+                            else "rankset_task_graph_serial"
+                        ),
                         "work_item_count": int(task_graph.get("work_item_count", 0)),
                         "executed_work_item_ids": list(executed_work_item_ids),
                         "executed_work_item_count": int(len(executed_work_item_ids)),
@@ -323,6 +367,113 @@ class AttentionNode:
             )
         return [results_by_request_id[str(payload.get("request_id", ""))] for payload in payloads]
 
+    def _build_rankset_subpayloads(self, payload_by_request_id, work_item):
+        return [
+            payload_by_request_id[str(request_id)]
+            for request_id in work_item.get("request_ids", []) or []
+            if str(request_id) in payload_by_request_id
+        ]
+
+    async def _execute_single_rankset_work_item(self, work_item, subpayloads, transferred_at: float, prepared_records=None):
+        compute_started_at = time.perf_counter()
+        partial_contexts_by_request = {}
+        if prepared_records is not None:
+            partial_contexts_by_request = self.backend.compute_rankset_partial_contexts(prepared_records, work_item)
+            contexts = []
+        else:
+            contexts = self.backend.decode_layer_batch(subpayloads)
+        compute_finished_at = time.perf_counter()
+        compute_duration_s = float(compute_finished_at - compute_started_at)
+        transfer_started_at = float(work_item.get("transfer_started_at", transferred_at))
+        return {
+            "work_item_id": str(work_item.get("work_item_id", "")),
+            "subpayloads": subpayloads,
+            "contexts": contexts,
+            "partial_contexts_by_request": partial_contexts_by_request,
+            "per_item_compute_s": compute_duration_s / max(len(contexts), 1),
+            "execution_mode": "rankset_task_graph_async_dispatch_serial_compute",
+            "event": {
+                "work_item_id": str(work_item.get("work_item_id", "")),
+                "layer_idx": int(work_item.get("layer_idx", 0)),
+                "rankset_id": str(work_item.get("rankset_id", "")),
+                "request_ids": [str(request_id) for request_id in work_item.get("request_ids", []) or []],
+                "batch_size": int(len(subpayloads)),
+                "transfer_started_at": float(transfer_started_at),
+                "transfer_finished_at": float(transferred_at),
+                "transfer_duration_s": max(0.0, float(transferred_at - transfer_started_at)),
+                "compute_started_at": float(compute_started_at),
+                "compute_finished_at": float(compute_finished_at),
+                "compute_duration_s": float(compute_duration_s),
+                "started_at": float(transfer_started_at),
+                "finished_at": float(compute_finished_at),
+                "duration_s": max(0.0, float(compute_finished_at - transfer_started_at)),
+                "overlap_ready_at": float(transferred_at),
+            },
+        }
+
+    async def _execute_rankset_task_graph_batch_serial(self, payload_by_request_id, work_items, prepared_records=None):
+        results = []
+        for work_item in work_items:
+            subpayloads = self._build_rankset_subpayloads(payload_by_request_id, work_item)
+            if not subpayloads:
+                continue
+            transfer_started_at = time.perf_counter()
+            transferred_at = transfer_started_at
+            if self.rankset_overlap_transfer_latency_s > 0.0:
+                await asyncio.sleep(self.rankset_overlap_transfer_latency_s)
+                transferred_at = time.perf_counter()
+            work_item["transfer_started_at"] = transfer_started_at
+            results.append(
+                await self._execute_single_rankset_work_item(
+                    work_item,
+                    subpayloads,
+                    transferred_at,
+                    prepared_records=prepared_records,
+                )
+            )
+        return results
+
+    async def _simulate_rankset_transfer(self, work_item, subpayloads):
+        transfer_started_at = time.perf_counter()
+        if self.rankset_overlap_transfer_latency_s > 0.0:
+            await asyncio.sleep(self.rankset_overlap_transfer_latency_s)
+        transferred_at = time.perf_counter()
+        return {
+            "work_item": work_item,
+            "subpayloads": subpayloads,
+            "transfer_started_at": float(transfer_started_at),
+            "transferred_at": float(transferred_at),
+        }
+
+    async def _execute_rankset_task_graph_batch_async(self, payload_by_request_id, work_items, prepared_records=None):
+        transfer_tasks = []
+        for work_item in work_items:
+            subpayloads = self._build_rankset_subpayloads(payload_by_request_id, work_item)
+            if not subpayloads:
+                continue
+            transfer_tasks.append(asyncio.create_task(self._simulate_rankset_transfer(work_item, subpayloads)))
+        if not transfer_tasks:
+            return []
+
+        ready_items = []
+        for transfer_task in asyncio.as_completed(transfer_tasks):
+            ready_items.append(await transfer_task)
+        ready_items.sort(key=lambda item: (float(item["transferred_at"]), str(item["work_item"].get("work_item_id", ""))))
+
+        results = []
+        for ready_item in ready_items:
+            work_item = dict(ready_item["work_item"])
+            work_item["transfer_started_at"] = float(ready_item["transfer_started_at"])
+            results.append(
+                await self._execute_single_rankset_work_item(
+                    work_item,
+                    list(ready_item["subpayloads"]),
+                    float(ready_item["transferred_at"]),
+                    prepared_records=prepared_records,
+                )
+            )
+        return results
+
     async def _flush_decode_layer_batch(self):
         try:
             if self.decode_batch_window_s > 0:
@@ -336,7 +487,7 @@ class AttentionNode:
                 self.decode_batch_total_items += len(payloads)
                 self.decode_batch_max_observed = max(self.decode_batch_max_observed, len(payloads))
                 try:
-                    results = self._execute_rankset_task_graph_batch(payloads)
+                    results = await self._execute_rankset_task_graph_batch(payloads)
                     for future, result in zip(futures, results):
                         if not future.done():
                             future.set_result(result)
@@ -376,8 +527,8 @@ class AttentionNode:
             self._decode_batch_task = asyncio.create_task(self._flush_decode_layer_batch())
         return await future
 
-    def decode_layer_batch(self, payloads):
-        return self._execute_rankset_task_graph_batch(payloads)
+    async def decode_layer_batch(self, payloads):
+        return await self._execute_rankset_task_graph_batch(payloads)
 
     def get_context_len(self, request_id: str):
         return self.backend.get_context_len(request_id)

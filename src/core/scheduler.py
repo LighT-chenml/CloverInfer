@@ -171,6 +171,14 @@ class GlobalScheduler:
         self.rankset_overlap_first_work_item_completion_s_count = 0
         self.rankset_overlap_last_work_item_completion_s_total = 0.0
         self.rankset_overlap_last_work_item_completion_s_count = 0
+        self.rankset_overlap_first_transfer_ready_s_total = 0.0
+        self.rankset_overlap_first_transfer_ready_s_count = 0
+        self.rankset_overlap_last_transfer_ready_s_total = 0.0
+        self.rankset_overlap_last_transfer_ready_s_count = 0
+        self.rankset_overlap_transfer_span_s_total = 0.0
+        self.rankset_overlap_transfer_span_s_count = 0
+        self.rankset_overlap_transfer_duration_s_total = 0.0
+        self.rankset_overlap_transfer_duration_s_count = 0
         self.rankset_overlap_work_item_span_s_total = 0.0
         self.rankset_overlap_work_item_span_s_count = 0
         self.rankset_overlap_work_item_duration_s_total = 0.0
@@ -340,6 +348,58 @@ class GlobalScheduler:
                 ]
             for request_rankset in request_ranksets:
                 rankset_id = str(request_rankset.get("rankset_id", fallback_rankset_id))
+                layer_group_map = dict(request_rankset.get("layer_group_map", {}) or {})
+                layer_groups = list(layer_group_map.get(str(layer_idx), []) or [])
+                if self.clover_rankset_overlap_transfer_granularity == "rankset" and not layer_groups:
+                    continue
+                transfer_granularity = str(
+                    request_rankset.get(
+                        "transfer_granularity",
+                        self.clover_rankset_overlap_transfer_granularity,
+                    )
+                )
+                if layer_groups and self.clover_rankset_overlap_transfer_granularity == "rankset":
+                    for group in layer_groups:
+                        head_start = int(group.get("head_start", 0))
+                        head_end = int(group.get("head_end", 0))
+                        physical_dpu = int(group.get("physical_dpu", 0))
+                        work_item_key = (
+                            f"{rankset_id}:dpu{physical_dpu}:h{head_start}-{head_end}"
+                        )
+                        work_item = grouped.get(work_item_key)
+                        if work_item is None:
+                            work_item = {
+                                "work_item_id": f"layer{int(layer_idx)}:{work_item_key}",
+                                "layer_idx": int(layer_idx),
+                                "rankset_id": rankset_id,
+                                "rank_index": request_rankset.get("rank_index"),
+                                "physical_dpus": [physical_dpu],
+                                "stripe_width": 1,
+                                "transfer_granularity": transfer_granularity,
+                                "request_ids": [],
+                                "request_group_slices": {},
+                                "group_signature": {
+                                    "head_start": head_start,
+                                    "head_end": head_end,
+                                    "group_heads": int(group.get("group_heads", 0)),
+                                    "physical_dpu": physical_dpu,
+                                },
+                                "status": "planned",
+                            }
+                            grouped[work_item_key] = work_item
+                        work_item["request_ids"].append(request_id)
+                        work_item["request_group_slices"].setdefault(request_id, []).append(
+                            {
+                                "head_start": head_start,
+                                "head_end": head_end,
+                                "group_heads": int(group.get("group_heads", 0)),
+                                "physical_dpu": physical_dpu,
+                                "k_slot": str(group.get("k_slot", "")),
+                                "v_slot": str(group.get("v_slot", "")),
+                            }
+                        )
+                    continue
+
                 work_item = grouped.get(rankset_id)
                 if work_item is None:
                     work_item = {
@@ -349,17 +409,25 @@ class GlobalScheduler:
                         "rank_index": request_rankset.get("rank_index"),
                         "physical_dpus": list(request_rankset.get("physical_dpus", []) or []),
                         "stripe_width": int(request_rankset.get("stripe_width", 0) or 0),
-                        "transfer_granularity": str(
-                            request_rankset.get(
-                                "transfer_granularity",
-                                self.clover_rankset_overlap_transfer_granularity,
-                            )
-                        ),
+                        "transfer_granularity": transfer_granularity,
                         "request_ids": [],
+                        "request_group_slices": {},
                         "status": "planned",
                     }
                     grouped[rankset_id] = work_item
                 work_item["request_ids"].append(request_id)
+                if layer_groups:
+                    work_item["request_group_slices"][request_id] = [
+                        {
+                            "head_start": int(group.get("head_start", 0)),
+                            "head_end": int(group.get("head_end", 0)),
+                            "group_heads": int(group.get("group_heads", 0)),
+                            "physical_dpu": int(group.get("physical_dpu", 0)),
+                            "k_slot": str(group.get("k_slot", "")),
+                            "v_slot": str(group.get("v_slot", "")),
+                        }
+                        for group in layer_groups
+                    ]
 
         work_items = sorted(grouped.values(), key=lambda item: str(item["work_item_id"]))
         if self.clover_rankset_overlap_max_ranksets_per_batch > 0:
@@ -378,7 +446,11 @@ class GlobalScheduler:
             "batch_rankset_count": int(batch_plan.get("rankset_count", 0)),
             "work_item_count": int(len(work_items)),
             "work_items": work_items,
-            "execution_mode": "scaffold_serial_attention",
+            "execution_mode": (
+                "rankset_task_graph_async_dispatch_serial_compute"
+                if bool(getattr(self.cluster_config, "clover_rankset_overlap_async_dispatch_enabled", False))
+                else "scaffold_serial_attention"
+            ),
         }
         self.rankset_overlap_last_task_graph = task_graph
         return task_graph
@@ -412,14 +484,34 @@ class GlobalScheduler:
         timeline_start_at = min(float(event.get("started_at", 0.0)) for event in work_item_events)
         first_finished_at = min(float(event.get("finished_at", timeline_start_at)) for event in work_item_events)
         last_finished_at = max(float(event.get("finished_at", timeline_start_at)) for event in work_item_events)
+        first_transfer_ready_at = min(
+            float(event.get("transfer_finished_at", timeline_start_at)) for event in work_item_events
+        )
+        last_transfer_ready_at = max(
+            float(event.get("transfer_finished_at", timeline_start_at)) for event in work_item_events
+        )
         completion_span_s = max(0.0, last_finished_at - first_finished_at)
         first_completion_s = max(0.0, first_finished_at - timeline_start_at)
         last_completion_s = max(0.0, last_finished_at - timeline_start_at)
+        first_transfer_ready_s = max(0.0, first_transfer_ready_at - timeline_start_at)
+        last_transfer_ready_s = max(0.0, last_transfer_ready_at - timeline_start_at)
+        transfer_span_s = max(0.0, last_transfer_ready_at - first_transfer_ready_at)
+        transfer_duration_sum_s = sum(
+            max(0.0, float(event.get("transfer_duration_s", 0.0))) for event in work_item_events
+        )
         duration_sum_s = sum(max(0.0, float(event.get("duration_s", 0.0))) for event in work_item_events)
         self.rankset_overlap_first_work_item_completion_s_total += first_completion_s
         self.rankset_overlap_first_work_item_completion_s_count += 1
         self.rankset_overlap_last_work_item_completion_s_total += last_completion_s
         self.rankset_overlap_last_work_item_completion_s_count += 1
+        self.rankset_overlap_first_transfer_ready_s_total += first_transfer_ready_s
+        self.rankset_overlap_first_transfer_ready_s_count += 1
+        self.rankset_overlap_last_transfer_ready_s_total += last_transfer_ready_s
+        self.rankset_overlap_last_transfer_ready_s_count += 1
+        self.rankset_overlap_transfer_span_s_total += transfer_span_s
+        self.rankset_overlap_transfer_span_s_count += 1
+        self.rankset_overlap_transfer_duration_s_total += transfer_duration_sum_s
+        self.rankset_overlap_transfer_duration_s_count += len(work_item_events)
         self.rankset_overlap_work_item_span_s_total += completion_span_s
         self.rankset_overlap_work_item_span_s_count += 1
         self.rankset_overlap_work_item_duration_s_total += duration_sum_s
@@ -432,6 +524,10 @@ class GlobalScheduler:
             "executed_work_item_count": int(execution.get("executed_work_item_count", 0)),
             "partial_ready_work_items": int(len(work_item_events)),
             "timeline_start_at": float(timeline_start_at),
+            "first_transfer_ready_s": float(first_transfer_ready_s),
+            "last_transfer_ready_s": float(last_transfer_ready_s),
+            "transfer_ready_span_s": float(transfer_span_s),
+            "transfer_duration_sum_s": float(transfer_duration_sum_s),
             "first_work_item_completion_s": float(first_completion_s),
             "last_work_item_completion_s": float(last_completion_s),
             "work_item_completion_span_s": float(completion_span_s),
@@ -1304,6 +1400,30 @@ class GlobalScheduler:
                 "partial_ready_reports": int(self.rankset_overlap_partial_ready_reports),
                 "partial_ready_work_items": int(self.rankset_overlap_partial_ready_work_items),
                 "partial_ready_max_work_items": int(self.rankset_overlap_partial_ready_max_work_items),
+                "avg_first_transfer_ready_s": (
+                    float(self.rankset_overlap_first_transfer_ready_s_total)
+                    / float(self.rankset_overlap_first_transfer_ready_s_count)
+                    if self.rankset_overlap_first_transfer_ready_s_count > 0
+                    else 0.0
+                ),
+                "avg_last_transfer_ready_s": (
+                    float(self.rankset_overlap_last_transfer_ready_s_total)
+                    / float(self.rankset_overlap_last_transfer_ready_s_count)
+                    if self.rankset_overlap_last_transfer_ready_s_count > 0
+                    else 0.0
+                ),
+                "avg_transfer_ready_span_s": (
+                    float(self.rankset_overlap_transfer_span_s_total)
+                    / float(self.rankset_overlap_transfer_span_s_count)
+                    if self.rankset_overlap_transfer_span_s_count > 0
+                    else 0.0
+                ),
+                "avg_transfer_duration_s": (
+                    float(self.rankset_overlap_transfer_duration_s_total)
+                    / float(self.rankset_overlap_transfer_duration_s_count)
+                    if self.rankset_overlap_transfer_duration_s_count > 0
+                    else 0.0
+                ),
                 "avg_first_work_item_completion_s": (
                     float(self.rankset_overlap_first_work_item_completion_s_total)
                     / float(self.rankset_overlap_first_work_item_completion_s_count)
@@ -1422,6 +1542,12 @@ class GlobalScheduler:
                         ),
                         "target_heads_per_group_experimental": int(
                             self.cluster_config.clover_target_heads_per_group_experimental
+                        ),
+                        "rankset_overlap_async_dispatch_enabled": bool(
+                            getattr(self.cluster_config, "clover_rankset_overlap_async_dispatch_enabled", False)
+                        ),
+                        "rankset_overlap_transfer_latency_s": float(
+                            getattr(self.cluster_config, "clover_rankset_overlap_transfer_latency_s", 0.0)
                         ),
                     }
                 )

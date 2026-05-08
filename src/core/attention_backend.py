@@ -410,8 +410,75 @@ class PimNaiveAttentionBackend:
             except Exception:
                 rank_index = None
         rankset_id = None if rank_index is None else f"rank{int(rank_index)}:w{len(stripe)}"
+        rankset_entries: Dict[str, Dict[str, object]] = {}
+        for layer_state in request_state.layer_states:
+            for group in layer_state.head_groups:
+                group_physical_dpu = int(group.dpu_id)
+                group_rank_index = self._stripe_rank_index([group_physical_dpu])
+                if group_rank_index is None:
+                    group_rankset_id = rankset_id or "rank-unknown"
+                else:
+                    group_rankset_id = f"rank{int(group_rank_index)}"
+                entry = rankset_entries.get(group_rankset_id)
+                if entry is None:
+                    entry = {
+                        "rankset_id": str(group_rankset_id),
+                        "rank_index": None if group_rank_index is None else int(group_rank_index),
+                        "physical_dpus": set(),
+                        "stripe_width": 0,
+                        "transfer_granularity": "rankset",
+                        "layer_group_map": {},
+                    }
+                    rankset_entries[group_rankset_id] = entry
+                entry["physical_dpus"].add(group_physical_dpu)
+                layer_groups = entry["layer_group_map"].setdefault(str(layer_state.layer_idx), [])
+                layer_groups.append(
+                    {
+                        "head_start": int(group.head_start),
+                        "head_end": int(group.head_end),
+                        "group_heads": int(group.group_heads),
+                        "physical_dpu": int(group_physical_dpu),
+                        "k_slot": str(group.k_slot),
+                        "v_slot": str(group.v_slot),
+                    }
+                )
+
         rankset_plan = []
-        if stripe:
+        for entry in sorted(
+            rankset_entries.values(),
+            key=lambda item: (
+                -1 if item.get("rank_index") is None else int(item.get("rank_index", 0)),
+                str(item.get("rankset_id", "")),
+            ),
+        ):
+            physical_dpus = sorted(int(physical_dpu) for physical_dpu in entry.get("physical_dpus", set()))
+            layer_group_map = {}
+            for layer_key, groups in dict(entry.get("layer_group_map", {})).items():
+                layer_group_map[str(layer_key)] = sorted(
+                    [
+                        {
+                            "head_start": int(group["head_start"]),
+                            "head_end": int(group["head_end"]),
+                            "group_heads": int(group["group_heads"]),
+                            "physical_dpu": int(group["physical_dpu"]),
+                            "k_slot": str(group["k_slot"]),
+                            "v_slot": str(group["v_slot"]),
+                        }
+                        for group in groups
+                    ],
+                    key=lambda group: (int(group["head_start"]), int(group["head_end"])),
+                )
+            rankset_plan.append(
+                {
+                    "rankset_id": str(entry.get("rankset_id", "rank-unknown")),
+                    "rank_index": entry.get("rank_index"),
+                    "physical_dpus": physical_dpus,
+                    "stripe_width": int(len(physical_dpus)),
+                    "transfer_granularity": "rankset",
+                    "layer_group_map": layer_group_map,
+                }
+            )
+        if not rankset_plan and stripe:
             rankset_plan.append(
                 {
                     "rankset_id": rankset_id or "rank-unknown",
@@ -419,6 +486,7 @@ class PimNaiveAttentionBackend:
                     "physical_dpus": list(stripe),
                     "stripe_width": len(stripe),
                     "transfer_granularity": "stripe",
+                    "layer_group_map": {},
                 }
             )
         return {

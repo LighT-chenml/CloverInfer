@@ -420,6 +420,10 @@ def make_cluster_config(args, attention_backend: str) -> ClusterConfig:
         ),
         clover_rankset_overlap_max_ranksets_per_batch=args.clover_rankset_overlap_max_ranksets_per_batch,
         clover_rankset_overlap_transfer_granularity=args.clover_rankset_overlap_transfer_granularity,
+        clover_rankset_overlap_async_dispatch_enabled=(
+            args.clover_rankset_overlap_async_dispatch_enabled if attention_backend == "cloverinfer" else False
+        ),
+        clover_rankset_overlap_transfer_latency_s=args.clover_rankset_overlap_transfer_latency_s,
         decode_continuous_batch_window_s=args.decode_continuous_batch_window_s,
         decode_continuous_batch_max_size=args.decode_continuous_batch_max_size,
         attention_rpc_cross_key_batch_enabled=(attention_backend == "cloverinfer"),
@@ -662,6 +666,9 @@ def main():
         default="stripe",
         choices=["stripe", "rankset"],
     )
+    parser.add_argument("--clover-rankset-overlap-async-dispatch-enabled", action="store_true")
+    parser.add_argument("--no-clover-rankset-overlap-async-dispatch-enabled", action="store_true")
+    parser.add_argument("--clover-rankset-overlap-transfer-latency-s", type=float, default=0.0)
     parser.add_argument("--decode-continuous-batch-window-s", type=float, default=0.0)
     parser.add_argument("--decode-continuous-batch-window-ms", type=float, default=0.0)
     parser.add_argument("--decode-continuous-batch-max-size", type=int, default=8)
@@ -715,6 +722,14 @@ def main():
             "cannot set both --clover-rankset-overlap-enabled and "
             "--no-clover-rankset-overlap-enabled"
         )
+    if (
+        args.clover_rankset_overlap_async_dispatch_enabled
+        and args.no_clover_rankset_overlap_async_dispatch_enabled
+    ):
+        raise ValueError(
+            "cannot set both --clover-rankset-overlap-async-dispatch-enabled and "
+            "--no-clover-rankset-overlap-async-dispatch-enabled"
+        )
 
     if not args.pim_qk_mixed_enabled and not args.no_pim_qk_mixed_enabled:
         args.pim_qk_mixed_enabled = True
@@ -767,8 +782,15 @@ def main():
     args.clover_rankset_overlap_enabled = bool(args.clover_rankset_overlap_enabled)
     if args.no_clover_rankset_overlap_enabled:
         args.clover_rankset_overlap_enabled = False
+    args.clover_rankset_overlap_async_dispatch_enabled = bool(
+        args.clover_rankset_overlap_async_dispatch_enabled
+    )
+    if args.no_clover_rankset_overlap_async_dispatch_enabled:
+        args.clover_rankset_overlap_async_dispatch_enabled = False
     if args.clover_rankset_overlap_max_ranksets_per_batch < 0:
         raise ValueError("--clover-rankset-overlap-max-ranksets-per-batch must be non-negative")
+    if args.clover_rankset_overlap_transfer_latency_s < 0.0:
+        raise ValueError("--clover-rankset-overlap-transfer-latency-s must be non-negative")
     if args.decode_continuous_batch_window_s < 0.0:
         raise ValueError("--decode-continuous-batch-window-s must be non-negative")
     if args.decode_continuous_batch_window_ms < 0.0:
@@ -809,6 +831,10 @@ def main():
         "clover_rankset_overlap_enabled": bool(args.clover_rankset_overlap_enabled),
         "clover_rankset_overlap_max_ranksets_per_batch": int(args.clover_rankset_overlap_max_ranksets_per_batch),
         "clover_rankset_overlap_transfer_granularity": str(args.clover_rankset_overlap_transfer_granularity),
+        "clover_rankset_overlap_async_dispatch_enabled": bool(
+            args.clover_rankset_overlap_async_dispatch_enabled
+        ),
+        "clover_rankset_overlap_transfer_latency_s": float(args.clover_rankset_overlap_transfer_latency_s),
         "decode_continuous_batch_window_s": float(args.decode_continuous_batch_window_s),
         "decode_continuous_batch_max_size": int(args.decode_continuous_batch_max_size),
         "resource_layout": {
