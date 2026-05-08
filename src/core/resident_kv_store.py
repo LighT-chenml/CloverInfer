@@ -1,15 +1,52 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib
+import importlib.util
 import math
 import os
 import numpy as np
 import struct
 import subprocess
 import time
-from typing import Dict
+from typing import Dict, List
 
 import torch
+
+
+_HOST_REDUCTION_MODULE = None
+_HOST_REDUCTION_IMPORT_ATTEMPTED = False
+
+
+def _load_host_reduction_module():
+    global _HOST_REDUCTION_MODULE
+    global _HOST_REDUCTION_IMPORT_ATTEMPTED
+    if _HOST_REDUCTION_MODULE is not None:
+        return _HOST_REDUCTION_MODULE
+    if _HOST_REDUCTION_IMPORT_ATTEMPTED:
+        return None
+    _HOST_REDUCTION_IMPORT_ATTEMPTED = True
+    try:
+        _HOST_REDUCTION_MODULE = importlib.import_module("clover_host_reduce")
+    except Exception:
+        module_dir = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "host", "reduction")
+        )
+        try:
+            for file_name in os.listdir(module_dir):
+                if not file_name.startswith("clover_host_reduce") or not file_name.endswith(".so"):
+                    continue
+                module_path = os.path.join(module_dir, file_name)
+                spec = importlib.util.spec_from_file_location("clover_host_reduce", module_path)
+                if spec is None or spec.loader is None:
+                    continue
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                _HOST_REDUCTION_MODULE = module
+                break
+        except Exception:
+            _HOST_REDUCTION_MODULE = None
+    return _HOST_REDUCTION_MODULE
 
 
 @dataclass
@@ -20,6 +57,18 @@ class _HostKVSlot:
     capacity: int
     group_heads: int
     head_dim: int
+    segments: List[_TokenSegmentSpec]
+
+
+@dataclass(frozen=True)
+class _TokenSegmentSpec:
+    physical_dpu: int
+    token_start: int
+    token_end: int
+
+    @property
+    def token_count(self) -> int:
+        return max(0, int(self.token_end) - int(self.token_start))
 
 
 class ResidentKVStore:
@@ -41,6 +90,8 @@ class ResidentKVStore:
         capacity: int,
         preferred_dpu: int | None = None,
         force_host_fallback: bool = False,
+        allowed_dpus: list[int] | None = None,
+        segment_plan: list[Dict[str, int]] | None = None,
     ) -> Dict[str, object]:
         raise NotImplementedError
 
@@ -944,6 +995,54 @@ class HostResidentKVStore(ResidentKVStore):
     def _slot_key(self, k_slot: str, v_slot: str) -> tuple[str, str]:
         return (k_slot, v_slot)
 
+    def _segment_specs_from_plan(
+        self,
+        seq_len: int,
+        preferred_dpu: int | None = None,
+        allowed_dpus: list[int] | None = None,
+        segment_plan: list[Dict[str, int]] | None = None,
+    ) -> List[_TokenSegmentSpec]:
+        if not segment_plan:
+            physical_dpu = 0 if preferred_dpu is None else int(preferred_dpu)
+            return [
+                _TokenSegmentSpec(
+                    physical_dpu=int(physical_dpu),
+                    token_start=0,
+                    token_end=int(seq_len),
+                )
+            ]
+
+        normalized_specs = [
+            _TokenSegmentSpec(
+                physical_dpu=int(item.get("dpu_id", preferred_dpu or 0)),
+                token_start=int(item.get("token_range_start", 0)),
+                token_end=int(item.get("token_range_end", 0)),
+            )
+            for item in segment_plan
+        ]
+        normalized_specs = [spec for spec in normalized_specs if spec.token_count > 0]
+        if not normalized_specs:
+            raise ValueError("segment_plan produced no non-empty token segments")
+
+        normalized_specs = sorted(normalized_specs, key=lambda spec: (int(spec.token_start), int(spec.token_end)))
+        cursor = 0
+        allowed = None if allowed_dpus is None else {int(dpu) for dpu in allowed_dpus}
+        for spec in normalized_specs:
+            if int(spec.token_start) != int(cursor):
+                raise ValueError(
+                    f"segment_plan must be contiguous and non-overlapping: expected_start={cursor} got={spec.token_start}"
+                )
+            if int(spec.token_end) <= int(spec.token_start):
+                raise ValueError(f"invalid token segment range: {spec}")
+            if allowed is not None and int(spec.physical_dpu) not in allowed:
+                raise ValueError(
+                    f"segment_plan physical_dpu={spec.physical_dpu} not present in allowed_dpus={sorted(allowed)}"
+                )
+            cursor = int(spec.token_end)
+        if int(cursor) != int(seq_len):
+            raise ValueError(f"segment_plan coverage mismatch: expected_seq_len={seq_len} covered={cursor}")
+        return normalized_specs
+
     def _slot_bytes(self, slot: _HostKVSlot) -> int:
         return int(slot.k_cache.numel() * slot.k_cache.element_size() + slot.v_cache.numel() * slot.v_cache.element_size())
 
@@ -961,8 +1060,8 @@ class HostResidentKVStore(ResidentKVStore):
         preferred_dpu: int | None = None,
         force_host_fallback: bool = False,
         allowed_dpus: list[int] | None = None,
+        segment_plan: list[Dict[str, int]] | None = None,
     ) -> Dict[str, object]:
-        del allowed_dpus
         started_at = time.perf_counter()
         key = self._slot_key(k_slot, v_slot)
         if key in self.groups:
@@ -974,6 +1073,12 @@ class HostResidentKVStore(ResidentKVStore):
 
         seq_len, group_heads, head_dim = (int(dim) for dim in initial_k.shape)
         capacity = max(int(capacity), seq_len, 1)
+        segment_specs = self._segment_specs_from_plan(
+            seq_len=seq_len,
+            preferred_dpu=preferred_dpu,
+            allowed_dpus=allowed_dpus,
+            segment_plan=segment_plan,
+        )
         k_cache = torch.zeros((capacity, group_heads, head_dim), dtype=initial_k.dtype)
         v_cache = torch.zeros((capacity, group_heads, head_dim), dtype=initial_v.dtype)
         k_cache[:seq_len] = initial_k.contiguous()
@@ -986,6 +1091,7 @@ class HostResidentKVStore(ResidentKVStore):
             capacity=capacity,
             group_heads=group_heads,
             head_dim=head_dim,
+            segments=list(segment_specs),
         )
         self.groups[key] = slot
         self.total_allocations += 1
@@ -996,6 +1102,16 @@ class HostResidentKVStore(ResidentKVStore):
             "backend": "host",
             "physical_dpu": None if preferred_dpu is None else int(preferred_dpu),
             "storage": "host",
+            "segments": [
+                {
+                    "physical_dpu": int(spec.physical_dpu),
+                    "token_start": int(spec.token_start),
+                    "token_end": int(spec.token_end),
+                    "seq_len": int(spec.token_count),
+                    "capacity": int(spec.token_count),
+                }
+                for spec in segment_specs
+            ],
         }
 
     def _grow_slot(self, slot: _HostKVSlot, target_seq_len: int) -> None:
@@ -1042,6 +1158,13 @@ class HostResidentKVStore(ResidentKVStore):
         slot.k_cache[slot.seq_len : expected_seq_len] = k_new.contiguous()
         slot.v_cache[slot.seq_len : expected_seq_len] = v_new.contiguous()
         slot.seq_len = expected_seq_len
+        if slot.segments:
+            last_segment = slot.segments[-1]
+            slot.segments[-1] = _TokenSegmentSpec(
+                physical_dpu=int(last_segment.physical_dpu),
+                token_start=int(last_segment.token_start),
+                token_end=int(expected_seq_len),
+            )
         self.append_ops += 1
         result = {
             "seq_len": slot.seq_len,
@@ -1076,6 +1199,16 @@ class HostResidentKVStore(ResidentKVStore):
             "capacity": slot.capacity,
             "group_heads": slot.group_heads,
             "head_dim": slot.head_dim,
+            "segments": [
+                {
+                    "physical_dpu": int(spec.physical_dpu),
+                    "token_range_start": int(spec.token_start),
+                    "token_range_end": int(spec.token_end),
+                    "seq_len": int(spec.token_count),
+                    "capacity": int(spec.token_count),
+                }
+                for spec in slot.segments
+            ],
         }
 
     def free_group(self, k_slot: str, v_slot: str) -> None:
@@ -1242,6 +1375,7 @@ class UpmemKVSlotStore(ResidentKVStore):
         kv_dtype: str = "fp32",
         block_tokens: int = 256,
         placement_policy: str = "rotated",
+        host_partial_reduce_enabled: bool = True,
     ):
         self.repo_root = repo_root
         self.num_dpus = num_dpus
@@ -1253,6 +1387,7 @@ class UpmemKVSlotStore(ResidentKVStore):
         self.growth_block_tokens = max(64, min(self.block_tokens, 128))
         self.base_block_rollover_tokens = max(32, min(self.block_tokens, 160))
         self.placement_policy = str(placement_policy)
+        self.host_partial_reduce_enabled = bool(host_partial_reduce_enabled)
         if self.kv_dtype not in {"fp32", "fp16"}:
             raise ValueError(f"Unsupported resident kv dtype: {self.kv_dtype}")
         kvslot_dir = os.path.join(repo_root, "src", "pim", "upmem_kvslot")
@@ -1299,6 +1434,7 @@ class UpmemKVSlotStore(ResidentKVStore):
             "qk_softmax_weighted_value_sum_batch_total": 0.0,
             "qk_softmax_weighted_value_sum_batch_dpu": 0.0,
             "qk_softmax_weighted_value_sum_batch_host_fallback": 0.0,
+            "qk_softmax_weighted_value_sum_batch_host_reduce": 0.0,
         }
         self.op_timing_counts: Dict[str, int] = {key: 0 for key in self.op_timing_totals_s}
         self.batch_item_totals: Dict[str, int] = {
@@ -1322,6 +1458,7 @@ class UpmemKVSlotStore(ResidentKVStore):
             "qk_softmax_weighted_value_sum_batch_segmented_logical_items": 0,
             "qk_softmax_weighted_value_sum_batch_dpu_items": 0,
             "qk_softmax_weighted_value_sum_batch_host_fallback_items": 0,
+            "qk_softmax_weighted_value_sum_batch_host_reduce_items": 0,
         }
 
     def set_experimental_flags(
@@ -1330,6 +1467,7 @@ class UpmemKVSlotStore(ResidentKVStore):
         context_fused_enabled: bool | None = None,
         shape_rounds_enabled: bool | None = None,
         rank_spread_alloc_enabled: bool | None = None,
+        host_partial_reduce_enabled: bool | None = None,
     ) -> None:
         if context_fused_enabled is not None:
             self.helper.set_env_flag("CLOVER_KVSLOT_CONTEXT_FUSED", bool(context_fused_enabled))
@@ -1337,6 +1475,73 @@ class UpmemKVSlotStore(ResidentKVStore):
             self.helper.set_env_flag("CLOVER_KVSLOT_SHAPE_ROUNDS", bool(shape_rounds_enabled))
         if rank_spread_alloc_enabled is not None:
             self.helper.set_env_flag("CLOVER_KVSLOT_RANK_SPREAD_ALLOC", bool(rank_spread_alloc_enabled))
+        if host_partial_reduce_enabled is not None:
+            self.host_partial_reduce_enabled = bool(host_partial_reduce_enabled)
+
+    def _merge_partial_contexts(
+        self,
+        partial_entries: list[Dict[str, object]],
+        partial_outputs: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    ) -> Dict[int, torch.Tensor]:
+        host_reduce = _load_host_reduction_module()
+        if host_reduce is not None:
+            ordered_indices: list[int] = []
+            local_max_parts: list[torch.Tensor] = []
+            local_sum_parts: list[torch.Tensor] = []
+            local_output_parts: list[torch.Tensor] = []
+
+            for entry, (segment_context, segment_row_max, segment_row_sum) in zip(partial_entries, partial_outputs):
+                logical_idx = int(entry["logical_idx"])
+                score_scale = float(entry["payload"][4])
+                segment_context = segment_context.to(torch.float32).contiguous()
+                segment_row_max = (segment_row_max.to(torch.float32) * score_scale).contiguous()
+                segment_row_sum = segment_row_sum.to(torch.float32).contiguous()
+                local_output = (segment_context * segment_row_sum.unsqueeze(1)).contiguous()
+                ordered_indices.append(logical_idx)
+                local_max_parts.append(segment_row_max)
+                local_sum_parts.append(segment_row_sum)
+                local_output_parts.append(local_output)
+
+            if ordered_indices:
+                reduced = host_reduce.merge_partial_contexts(
+                    ordered_indices,
+                    local_max_parts,
+                    local_sum_parts,
+                    local_output_parts,
+                )
+                return {int(logical_idx): context for logical_idx, context in reduced.items()}
+
+        merged_contexts: Dict[int, torch.Tensor] = {}
+        merged_row_max: Dict[int, torch.Tensor] = {}
+        merged_row_sum: Dict[int, torch.Tensor] = {}
+
+        for entry, (segment_context, segment_row_max, segment_row_sum) in zip(partial_entries, partial_outputs):
+            logical_idx = int(entry["logical_idx"])
+            score_scale = float(entry["payload"][4])
+            segment_context = segment_context.to(torch.float32)
+            segment_row_max = segment_row_max.to(torch.float32) * score_scale
+            segment_row_sum = segment_row_sum.to(torch.float32)
+            if logical_idx not in merged_contexts:
+                merged_contexts[logical_idx] = segment_context
+                merged_row_max[logical_idx] = segment_row_max
+                merged_row_sum[logical_idx] = segment_row_sum
+                continue
+
+            prev_row_max = merged_row_max[logical_idx]
+            prev_row_sum = merged_row_sum[logical_idx]
+            prev_context = merged_contexts[logical_idx]
+            combined_row_max = torch.maximum(prev_row_max, segment_row_max)
+            prev_scale = torch.exp(prev_row_max - combined_row_max)
+            seg_scale = torch.exp(segment_row_max - combined_row_max)
+            combined_row_sum = prev_row_sum * prev_scale + segment_row_sum * seg_scale
+            safe_sum = torch.clamp(combined_row_sum, min=1e-12)
+            prev_weight = (prev_row_sum * prev_scale / safe_sum).unsqueeze(1)
+            seg_weight = (segment_row_sum * seg_scale / safe_sum).unsqueeze(1)
+            merged_contexts[logical_idx] = (prev_context * prev_weight) + (segment_context * seg_weight)
+            merged_row_max[logical_idx] = combined_row_max
+            merged_row_sum[logical_idx] = combined_row_sum
+
+        return merged_contexts
 
     def _topology_rank_index(self, physical_dpu: int) -> int | None:
         item = self._helper_topology_cache.get(int(physical_dpu))
@@ -1873,6 +2078,55 @@ class UpmemKVSlotStore(ResidentKVStore):
     def _blocked_slot_blocks(self, slot_info: Dict[str, object]) -> list[Dict[str, object]]:
         return list(slot_info.get("blocks", slot_info.get("segments", [])))
 
+    def _normalize_token_segment_plan(
+        self,
+        *,
+        seq_len: int,
+        allowed_dpus: list[int] | None = None,
+        segment_plan: list[Dict[str, int]] | None = None,
+        fallback_physical_dpu: int = 0,
+    ) -> list[_TokenSegmentSpec]:
+        if not segment_plan:
+            return [
+                _TokenSegmentSpec(
+                    physical_dpu=int(fallback_physical_dpu),
+                    token_start=0,
+                    token_end=int(seq_len),
+                )
+            ]
+
+        normalized_specs = [
+            _TokenSegmentSpec(
+                physical_dpu=int(item.get("physical_dpu", item.get("dpu_id", fallback_physical_dpu))),
+                token_start=int(item.get("token_range_start", 0)),
+                token_end=int(item.get("token_range_end", 0)),
+            )
+            for item in segment_plan
+        ]
+        normalized_specs = [spec for spec in normalized_specs if spec.token_count > 0]
+        if not normalized_specs:
+            raise ValueError("segment_plan produced no non-empty token segments")
+
+        normalized_specs = sorted(normalized_specs, key=lambda spec: (int(spec.token_start), int(spec.token_end)))
+        cursor = 0
+        allowed = None if allowed_dpus is None else {int(physical_dpu) % max(self.num_dpus, 1) for physical_dpu in allowed_dpus}
+        for spec in normalized_specs:
+            if int(spec.token_start) != int(cursor):
+                raise ValueError(
+                    f"segment_plan must be contiguous and non-overlapping: expected_start={cursor} got={spec.token_start}"
+                )
+            if int(spec.token_end) <= int(spec.token_start):
+                raise ValueError(f"invalid token segment range: {spec}")
+            if allowed is not None and (int(spec.physical_dpu) % max(self.num_dpus, 1)) not in allowed:
+                raise ValueError(
+                    "segment_plan physical_dpu is outside allowed_dpus: "
+                    f"physical_dpu={spec.physical_dpu} allowed_dpus={sorted(allowed)}"
+                )
+            cursor = int(spec.token_end)
+        if int(cursor) != int(seq_len):
+            raise ValueError(f"segment_plan coverage mismatch: expected_seq_len={seq_len} covered={cursor}")
+        return normalized_specs
+
     def _allocate_block_append_only(
         self,
         *,
@@ -1884,6 +2138,8 @@ class UpmemKVSlotStore(ResidentKVStore):
         block_v: torch.Tensor,
         block_capacity_override: int | None = None,
         block_kind: str = "growth",
+        physical_dpu_override: int | None = None,
+        segment_meta: Dict[str, int] | None = None,
     ) -> Dict[str, object]:
         blocks = self._blocked_slot_blocks(slot_info)
         block_idx = len(blocks)
@@ -1897,7 +2153,9 @@ class UpmemKVSlotStore(ResidentKVStore):
             block_capacity = max(int(block_k.shape[0]), int(block_capacity_override))
         block_key = self._block_slot_key(key, block_idx)
         block_elem_count = self._slot_elem_count(block_capacity, group_heads, head_dim)
-        if self.placement_policy == "load_aware":
+        if physical_dpu_override is not None:
+            block_physical_dpu = int(physical_dpu_override) % max(self.num_dpus, 1)
+        elif self.placement_policy == "load_aware":
             block_preferred_dpu = locality_anchor_dpu
             block_physical_dpu = self.choose_physical_dpu(
                 elem_count=block_elem_count,
@@ -1948,6 +2206,9 @@ class UpmemKVSlotStore(ResidentKVStore):
                 "group_heads": int(info["group_heads"]),
                 "head_dim": int(info["head_dim"]),
             }
+            if segment_meta:
+                for key_name, value in dict(segment_meta).items():
+                    block[str(key_name)] = int(value)
             self.dpu_allocations += 1
             self.dpu_live_slots += 1
             self.dpu_live_elems_by_dpu[block_physical_dpu] += block_elem_count
@@ -2009,9 +2270,94 @@ class UpmemKVSlotStore(ResidentKVStore):
                     block_v=block_initial_v,
                     block_capacity_override=self.block_tokens,
                     block_kind="base",
+                    segment_meta={
+                        "logical_segment_index": int(len(allocated_blocks)),
+                        "token_range_start": int(seq_offset),
+                        "token_range_end": int(seq_offset + block_seq_len),
+                    },
                 )
                 allocated_blocks.append(block)
                 seq_offset += block_seq_len
+            slot_info["seq_len"] = int(seq_len)
+            slot_info["capacity"] = max(int(capacity), sum(int(block["capacity"]) for block in allocated_blocks))
+            return slot_info
+        except Exception:
+            if allocated_blocks:
+                self._free_block_infos(allocated_blocks)
+            raise
+
+    def _allocate_segmented_group(
+        self,
+        *,
+        key: tuple[str, str],
+        initial_k: torch.Tensor,
+        initial_v: torch.Tensor,
+        capacity: int,
+        physical_dpu: int,
+        group_heads: int,
+        head_dim: int,
+        allowed_dpus: list[int] | None = None,
+        segment_plan: list[Dict[str, int]] | None = None,
+    ) -> Dict[str, object]:
+        allocated_blocks: list[Dict[str, object]] = []
+        seq_len = int(initial_k.shape[0])
+        normalized_segments = self._normalize_token_segment_plan(
+            seq_len=seq_len,
+            allowed_dpus=allowed_dpus,
+            segment_plan=segment_plan,
+            fallback_physical_dpu=physical_dpu,
+        )
+        unique_segment_dpus = []
+        seen_dpus = set()
+        for segment in normalized_segments:
+            normalized_dpu = int(segment.physical_dpu) % max(self.num_dpus, 1)
+            if normalized_dpu in seen_dpus:
+                continue
+            seen_dpus.add(normalized_dpu)
+            unique_segment_dpus.append(normalized_dpu)
+
+        slot_info = {
+            "backend": "dpu_segmented",
+            "blocks": allocated_blocks,
+            "segments": allocated_blocks,
+            "seq_len": 0,
+            "capacity": int(capacity),
+            "group_heads": int(group_heads),
+            "head_dim": int(head_dim),
+            "block_tokens": int(self.block_tokens),
+            "growth_block_tokens": int(self.growth_block_tokens),
+            "base_physical_dpu": int(physical_dpu),
+            "allowed_physical_dpus": list(unique_segment_dpus),
+            "planner_segment_count": int(len(normalized_segments)),
+        }
+        try:
+            for logical_segment_index, segment in enumerate(normalized_segments):
+                segment_start = int(segment.token_start)
+                segment_end = int(segment.token_end)
+                segment_physical_dpu = int(segment.physical_dpu) % max(self.num_dpus, 1)
+                block_cursor = int(segment_start)
+                while block_cursor < segment_end:
+                    block_end = min(segment_end, block_cursor + int(self.block_tokens))
+                    block_initial_k = initial_k[block_cursor:block_end].contiguous()
+                    block_initial_v = initial_v[block_cursor:block_end].contiguous()
+                    block = self._allocate_block_append_only(
+                        key=key,
+                        slot_info=slot_info,
+                        group_heads=group_heads,
+                        head_dim=head_dim,
+                        block_k=block_initial_k,
+                        block_v=block_initial_v,
+                        block_capacity_override=int(block_end - block_cursor),
+                        block_kind="base",
+                        physical_dpu_override=segment_physical_dpu,
+                        segment_meta={
+                            "logical_segment_index": int(logical_segment_index),
+                            "token_range_start": int(block_cursor),
+                            "token_range_end": int(block_end),
+                        },
+                    )
+                    allocated_blocks.append(block)
+                    block_cursor = int(block_end)
             slot_info["seq_len"] = int(seq_len)
             slot_info["capacity"] = max(int(capacity), sum(int(block["capacity"]) for block in allocated_blocks))
             return slot_info
@@ -2030,6 +2376,7 @@ class UpmemKVSlotStore(ResidentKVStore):
         preferred_dpu: int | None = None,
         force_host_fallback: bool = False,
         allowed_dpus: list[int] | None = None,
+        segment_plan: list[Dict[str, int]] | None = None,
     ) -> Dict[str, object]:
         started_at = time.perf_counter()
         key = self._slot_key(k_slot, v_slot)
@@ -2046,16 +2393,29 @@ class UpmemKVSlotStore(ResidentKVStore):
         )
         if not force_host_fallback and self._supports_dpu_shape(group_heads, head_dim):
             try:
-                blocked_slot_info = self._allocate_blocked_group(
-                    key=key,
-                    initial_k=initial_k,
-                    initial_v=initial_v,
-                    capacity=capacity,
-                    physical_dpu=physical_dpu,
-                    group_heads=group_heads,
-                    head_dim=head_dim,
-                    allowed_dpus=allowed_dpus,
-                )
+                if segment_plan:
+                    blocked_slot_info = self._allocate_segmented_group(
+                        key=key,
+                        initial_k=initial_k,
+                        initial_v=initial_v,
+                        capacity=capacity,
+                        physical_dpu=physical_dpu,
+                        group_heads=group_heads,
+                        head_dim=head_dim,
+                        allowed_dpus=allowed_dpus,
+                        segment_plan=segment_plan,
+                    )
+                else:
+                    blocked_slot_info = self._allocate_blocked_group(
+                        key=key,
+                        initial_k=initial_k,
+                        initial_v=initial_v,
+                        capacity=capacity,
+                        physical_dpu=physical_dpu,
+                        group_heads=group_heads,
+                        head_dim=head_dim,
+                        allowed_dpus=allowed_dpus,
+                    )
             except Exception:
                 self.dpu_allocate_failures += 1
                 blocked_slot_info = None
@@ -2065,7 +2425,18 @@ class UpmemKVSlotStore(ResidentKVStore):
                 return {
                     "backend": str(blocked_slot_info.get("backend", "dpu_blocked")),
                     "physical_dpu": int(blocked_slot_info.get("base_physical_dpu", physical_dpu)),
-                    "storage": "dpu_blocked",
+                    "storage": str(blocked_slot_info.get("backend", "dpu_blocked")),
+                    "segments": [
+                        {
+                            "physical_dpu": int(block.get("physical_dpu", physical_dpu)),
+                            "token_start": int(block.get("token_range_start", 0)),
+                            "token_end": int(block.get("token_range_end", block.get("seq_len", 0))),
+                            "seq_len": int(block.get("seq_len", 0)),
+                            "capacity": int(block.get("capacity", 0)),
+                            "logical_segment_index": int(block.get("logical_segment_index", 0)),
+                        }
+                        for block in blocked_slot_info.get("blocks", blocked_slot_info.get("segments", []))
+                    ],
                 }
             slot_id = self._assign_slot_id(key, preferred_dpu=physical_dpu)
         else:
@@ -2116,6 +2487,8 @@ class UpmemKVSlotStore(ResidentKVStore):
             initial_v,
             capacity,
             preferred_dpu=preferred_dpu,
+            allowed_dpus=allowed_dpus,
+            segment_plan=segment_plan,
         )
         self.slot_mapping[key] = {
             "backend": "host_fallback",
@@ -2146,6 +2519,7 @@ class UpmemKVSlotStore(ResidentKVStore):
             blocks = slot_info.get("blocks", slot_info.get("segments", []))
             group_heads = int(slot_info["group_heads"])
             head_dim = int(slot_info["head_dim"])
+            append_base_seq_len = int(slot_info["seq_len"])
             if append_total <= 0:
                 out = {
                     "seq_len": int(slot_info["seq_len"]),
@@ -2179,6 +2553,11 @@ class UpmemKVSlotStore(ResidentKVStore):
                         block_v=block_v,
                         block_capacity_override=self.growth_block_tokens,
                         block_kind="growth",
+                        segment_meta={
+                            "logical_segment_index": int(len(staged_blocks)),
+                            "token_range_start": int(append_base_seq_len + append_offset),
+                            "token_range_end": int(append_base_seq_len + append_offset + take_len),
+                        },
                     )
                     staged_blocks.append(new_block)
                     new_blocks.append(new_block)
@@ -2192,6 +2571,9 @@ class UpmemKVSlotStore(ResidentKVStore):
                     )
                     tail_block["seq_len"] = int(result["seq_len"])
                     tail_block["capacity"] = int(result["capacity"])
+                    tail_start = int(tail_block.get("token_range_start", append_base_seq_len - int(tail_block["seq_len"]) + tail_take_len))
+                    tail_block["token_range_start"] = int(tail_start)
+                    tail_block["token_range_end"] = int(tail_start + int(tail_block["seq_len"]))
             except Exception:
                 if new_blocks:
                     self._free_block_infos(new_blocks)
@@ -2283,7 +2665,10 @@ class UpmemKVSlotStore(ResidentKVStore):
                         "slot_id": int(block["slot_id"]),
                         "physical_dpu": int(block["physical_dpu"]),
                         "block_index": int(block.get("block_index", 0)),
+                        "logical_segment_index": int(block.get("logical_segment_index", 0)),
                         "block_kind": str(block.get("block_kind", "growth")),
+                        "token_range_start": int(block.get("token_range_start", 0)),
+                        "token_range_end": int(block.get("token_range_end", block.get("seq_len", 0))),
                         "rank_index": self._topology_rank_index(int(block["physical_dpu"])),
                         "rank_id": self._topology_rank_id(int(block["physical_dpu"])),
                         "seq_len": int(block["seq_len"]),
@@ -2296,7 +2681,10 @@ class UpmemKVSlotStore(ResidentKVStore):
                     {
                         "slot_id": int(block["slot_id"]),
                         "physical_dpu": int(block["physical_dpu"]),
+                        "logical_segment_index": int(block.get("logical_segment_index", 0)),
                         "block_kind": str(block.get("block_kind", "growth")),
+                        "token_range_start": int(block.get("token_range_start", 0)),
+                        "token_range_end": int(block.get("token_range_end", block.get("seq_len", 0))),
                         "rank_index": self._topology_rank_index(int(block["physical_dpu"])),
                         "rank_id": self._topology_rank_id(int(block["physical_dpu"])),
                         "seq_len": int(block["seq_len"]),
@@ -2397,6 +2785,7 @@ class UpmemKVSlotStore(ResidentKVStore):
             "num_dpus": self.num_dpus,
             "kv_dtype": self.kv_dtype,
             "placement_policy": self.placement_policy,
+            "host_partial_reduce_enabled": bool(self.host_partial_reduce_enabled),
             "helper_env": dict(self.helper.helper_env),
             "helper_profile": helper_profile,
             "helper_topology": helper_topology,
@@ -2978,9 +3367,6 @@ class UpmemKVSlotStore(ResidentKVStore):
 
         if segmented_queries:
             partial_entries: list[Dict[str, object]] = []
-            merged_contexts: Dict[int, torch.Tensor] = {}
-            merged_row_max: Dict[int, torch.Tensor] = {}
-            merged_row_sum: Dict[int, torch.Tensor] = {}
 
             for logical_idx, (k_slot, v_slot, local_head_indices, window, queries, score_scale) in segmented_queries:
                 key = self._slot_key(k_slot, v_slot)
@@ -3030,34 +3416,43 @@ class UpmemKVSlotStore(ResidentKVStore):
                 )
                 self._record_timing("qk_softmax_weighted_value_sum_batch_dpu", dpu_started_at)
                 self.batch_item_totals["qk_softmax_weighted_value_sum_batch_dpu_items"] += len(ordered_entries)
+                reduce_started_at = time.perf_counter()
+                if self.host_partial_reduce_enabled:
+                    merged_contexts = self._merge_partial_contexts(ordered_entries, partial_outputs)
+                else:
+                    merged_contexts: Dict[int, torch.Tensor] = {}
+                    merged_row_max: Dict[int, torch.Tensor] = {}
+                    merged_row_sum: Dict[int, torch.Tensor] = {}
+                    for entry, (segment_context, segment_row_max, segment_row_sum) in zip(ordered_entries, partial_outputs):
+                        logical_idx = int(entry["logical_idx"])
+                        score_scale = float(entry["payload"][4])
+                        segment_context = segment_context.to(torch.float32)
+                        segment_row_max = segment_row_max.to(torch.float32) * score_scale
+                        segment_row_sum = segment_row_sum.to(torch.float32)
+                        if logical_idx not in merged_contexts:
+                            merged_contexts[logical_idx] = segment_context
+                            merged_row_max[logical_idx] = segment_row_max
+                            merged_row_sum[logical_idx] = segment_row_sum
+                            continue
 
-                for entry, (segment_context, segment_row_max, segment_row_sum) in zip(ordered_entries, partial_outputs):
-                    logical_idx = int(entry["logical_idx"])
-                    segment_context = segment_context.to(torch.float32)
-                    segment_row_max = segment_row_max.to(torch.float32)
-                    segment_row_sum = segment_row_sum.to(torch.float32)
-                    if logical_idx not in merged_contexts:
-                        merged_contexts[logical_idx] = segment_context
-                        merged_row_max[logical_idx] = segment_row_max
-                        merged_row_sum[logical_idx] = segment_row_sum
-                        continue
+                        prev_row_max = merged_row_max[logical_idx]
+                        prev_row_sum = merged_row_sum[logical_idx]
+                        prev_context = merged_contexts[logical_idx]
+                        combined_row_max = torch.maximum(prev_row_max, segment_row_max)
+                        prev_scale = torch.exp(prev_row_max - combined_row_max)
+                        seg_scale = torch.exp(segment_row_max - combined_row_max)
+                        combined_row_sum = prev_row_sum * prev_scale + segment_row_sum * seg_scale
+                        safe_sum = torch.clamp(combined_row_sum, min=1e-12)
+                        prev_weight = (prev_row_sum * prev_scale / safe_sum).unsqueeze(1)
+                        seg_weight = (segment_row_sum * seg_scale / safe_sum).unsqueeze(1)
+                        merged_contexts[logical_idx] = (prev_context * prev_weight) + (segment_context * seg_weight)
+                        merged_row_max[logical_idx] = combined_row_max
+                        merged_row_sum[logical_idx] = combined_row_sum
+                self._record_timing("qk_softmax_weighted_value_sum_batch_host_reduce", reduce_started_at)
+                self.batch_item_totals["qk_softmax_weighted_value_sum_batch_host_reduce_items"] += len(ordered_entries)
 
-                    prev_row_max = merged_row_max[logical_idx]
-                    prev_row_sum = merged_row_sum[logical_idx]
-                    prev_context = merged_contexts[logical_idx]
-                    combined_row_max = torch.maximum(prev_row_max, segment_row_max)
-                    prev_scale = torch.exp(prev_row_max - combined_row_max)
-                    seg_scale = torch.exp(segment_row_max - combined_row_max)
-                    combined_row_sum = prev_row_sum * prev_scale + segment_row_sum * seg_scale
-                    safe_sum = torch.clamp(combined_row_sum, min=1e-12)
-                    prev_weight = (prev_row_sum * prev_scale / safe_sum).unsqueeze(1)
-                    seg_weight = (segment_row_sum * seg_scale / safe_sum).unsqueeze(1)
-                    merged_contexts[logical_idx] = (prev_context * prev_weight) + (segment_context * seg_weight)
-                    merged_row_max[logical_idx] = combined_row_max
-                    merged_row_sum[logical_idx] = combined_row_sum
-
-            for logical_idx, context in merged_contexts.items():
-                contexts[logical_idx] = context
+                for logical_idx, context in merged_contexts.items():
+                    contexts[logical_idx] = context
 
         self._record_timing("qk_softmax_weighted_value_sum_batch_total", total_started_at)
         self.batch_item_totals["qk_softmax_weighted_value_sum_batch_total"] += len(slot_queries)

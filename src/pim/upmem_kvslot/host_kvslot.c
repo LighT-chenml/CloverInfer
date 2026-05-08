@@ -2802,7 +2802,7 @@ static int execute_batched_qk_round(
             score_bytes,
             DPU_XFER_DEFAULT));
     }
-    if (num_heads > 0 && items[round_indices[0]].slot_args.mode == KVSLOT_QK_SLOT_MODE_RAW_SCORES) {
+    if (num_heads > 0) {
         DPU_FOREACH(launch_set, dpu) {
             qk_slot_item_t *item = find_qk_round_item_for_dpu(runner, items_by_dpu, dpu);
             DPU_ASSERT(dpu_prepare_xfer(dpu, item != NULL ? (void *)item->raw_row_max_bits : (void *)dummy_row_max_bits));

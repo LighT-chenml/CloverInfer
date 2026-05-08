@@ -324,6 +324,8 @@ class GlobalScheduler:
                 packing_hint.get("rankset_count", len(inferred_rankset_plan)) or len(inferred_rankset_plan)
             ),
             "packing_rankset_plan": inferred_rankset_plan,
+            "packing_sharding_plan": dict(packing_hint.get("sharding_plan", {}) or {}),
+            "packing_planner_mode": str(packing_hint.get("planner_mode", "") or ""),
         }
 
     def _decode_state_context_len(self, state: Dict[str, object]) -> int:
@@ -1505,6 +1507,13 @@ class GlobalScheduler:
                 "capacity_aware_lookahead_window": int(self.clover_capacity_aware_lookahead_window),
                 "capacity_aware_max_tokens_per_dpu": int(self.clover_capacity_aware_max_tokens_per_dpu),
                 "capacity_aware_last_batch": dict(self.capacity_aware_last_batch),
+                "planner_modes": sorted(
+                    {
+                        str(state.get("packing_planner_mode", "") or "")
+                        for state in list(self._decode_pending_queue)
+                        if str(state.get("packing_planner_mode", "") or "")
+                    }
+                ),
             }
             metrics["scheduler_rankset_overlap"] = {
                 "enabled": bool(self.clover_rankset_overlap_enabled),
@@ -1664,6 +1673,9 @@ class GlobalScheduler:
                         ),
                         "target_heads_per_group_experimental": int(
                             self.cluster_config.clover_target_heads_per_group_experimental
+                        ),
+                        "host_partial_reduce_enabled": bool(
+                            getattr(self.cluster_config, "clover_host_partial_reduce_enabled", True)
                         ),
                         "rankset_overlap_async_dispatch_enabled": bool(
                             getattr(self.cluster_config, "clover_rankset_overlap_async_dispatch_enabled", False)

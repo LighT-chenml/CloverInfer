@@ -51,6 +51,7 @@ class ClusterConfig(BaseModel):
     clover_pim_rank_spread_alloc_experimental_enabled: bool = False
     clover_fine_head_grouping_experimental_enabled: bool = False
     clover_target_heads_per_group_experimental: int = 0
+    clover_host_partial_reduce_enabled: bool = True
     clover_predictive_scheduling_enabled: bool = False
     clover_predictive_scheduling_alpha: float = 0.2
     clover_predictive_scheduling_min_samples: int = 4

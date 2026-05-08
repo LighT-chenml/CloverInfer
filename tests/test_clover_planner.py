@@ -36,3 +36,24 @@ def test_update_sharding_replans_with_new_requests():
         assert "base" in request_map
         assert "new" in request_map
 
+
+def test_plan_sharding_supports_fewer_dpus_than_heads():
+    plan = plan_sharding(
+        [
+            {"request_id": "r0", "seq_len": 10},
+            {"request_id": "r1", "seq_len": 6},
+        ],
+        D=4,
+        H=12,
+    )
+    assert plan["metadata"]["effective_group_count"] == 4
+    assert plan["metadata"]["planner_mode"] == "single_dpu_multi_head_group"
+    assert len(plan["head_group_ranges"]) == 4
+    assert len(plan["dpu_groups"]) == 4
+    total_group_heads = 0
+    for head_id, head_range in plan["head_group_ranges"].items():
+        total_group_heads += int(head_range["group_heads"])
+        shards = plan["per_head_shards"][head_id]["r0"]
+        assert len(shards) == 1
+        assert shards[0]["group_heads"] == head_range["group_heads"]
+    assert total_group_heads == 12

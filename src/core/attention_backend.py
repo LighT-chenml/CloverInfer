@@ -6,10 +6,11 @@ import os
 import time
 import struct
 import subprocess
-from typing import Dict, List
+from typing import Dict, List, Sequence, Tuple
 
 import torch
 
+from .clover_planner import plan_sharding
 from .resident_kv_store import HostResidentKVStore, UpmemKVSlotStore
 
 
@@ -23,6 +24,8 @@ class HeadGroupState:
     head_dim: int
     k_slot: str
     v_slot: str
+    physical_dpus: List[int] | None = None
+    token_segments: List[Dict[str, int]] | None = None
 
     @property
     def group_heads(self) -> int:
@@ -52,6 +55,7 @@ class RequestState:
     num_layers: int
     layer_states: List[LayerState]
     preferred_dpu_stripe: List[int]
+    sharding_plan: Dict[str, object] | None = None
     stripe_version: int = 0
     stripe_expand_count: int = 0
     last_stripe_update_reason: str = ""
@@ -262,6 +266,7 @@ class PimNaiveAttentionBackend:
         qk_mixed_enabled: bool = True,
         qk_mixed_heads: int = 2,
         qk_mixed_window: int = 128,
+        host_partial_reduce_enabled: bool = True,
     ):
         self.repo_root = repo_root or os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         self.num_dpus = num_dpus
@@ -269,8 +274,8 @@ class PimNaiveAttentionBackend:
         self.block_tokens = max(1, int(block_tokens))
         self.resident_store_backend = resident_store_backend
         self.max_resident_groups_per_layer = max(0, int(max_resident_groups_per_layer))
-        self.head_grouping_policy = str(head_grouping_policy)
-        self.dpu_placement_policy = str(dpu_placement_policy)
+        self.head_grouping_policy = "balanced" if str(head_grouping_policy) == "auto" else str(head_grouping_policy)
+        self.dpu_placement_policy = "rotated" if str(dpu_placement_policy) == "auto" else str(dpu_placement_policy)
         self.resident_kv_dtype = str(resident_kv_dtype)
         self.qk_check_interval = qk_check_interval
         self.qk_check_limit = qk_check_limit
@@ -303,6 +308,7 @@ class PimNaiveAttentionBackend:
         self.qk_mixed_enabled = bool(qk_mixed_enabled)
         self.qk_mixed_heads = max(0, int(qk_mixed_heads))
         self.qk_mixed_window = max(1, int(qk_mixed_window))
+        self.host_partial_reduce_enabled = bool(host_partial_reduce_enabled)
         self.qk_mixed_count = 0
         self.qk_mixed_last_max_abs_diff = 0.0
         self.qk_mixed_last_head_diffs = []
@@ -323,6 +329,7 @@ class PimNaiveAttentionBackend:
                 kv_dtype=self.resident_kv_dtype,
                 block_tokens=self.block_tokens,
                 placement_policy=self.dpu_placement_policy,
+                host_partial_reduce_enabled=self.host_partial_reduce_enabled,
             )
             self.resident_store.set_experimental_flags(shape_rounds_enabled=True)
         elif resident_store_backend == "host":
@@ -349,6 +356,7 @@ class PimNaiveAttentionBackend:
     def _group_footprint_summary(self, group: HeadGroupState) -> Dict[str, object]:
         return {
             "dpu_id": int(group.dpu_id),
+            "physical_dpus": [int(physical_dpu) for physical_dpu in list(group.physical_dpus or [group.dpu_id])],
             "heads": [int(group.head_start), int(group.head_end)],
             "group_heads": int(group.group_heads),
             "seq_len": int(group.seq_len),
@@ -356,6 +364,14 @@ class PimNaiveAttentionBackend:
             "head_dim": int(group.head_dim),
             "live_elems": int(group.live_elems),
             "capacity_elems": int(group.capacity_elems),
+            "token_segments": [
+                {
+                    "physical_dpu": int(segment.get("physical_dpu", group.dpu_id)),
+                    "token_range_start": int(segment.get("token_range_start", 0)),
+                    "token_range_end": int(segment.get("token_range_end", 0)),
+                }
+                for segment in list(group.token_segments or [])
+            ],
             "resident_slot": self.resident_store.slot_debug(group.k_slot, group.v_slot),
         }
 
@@ -380,9 +396,14 @@ class PimNaiveAttentionBackend:
         per_dpu_capacity_elems = [0 for _ in range(self.num_dpus)]
         for layer_state in request_state.layer_states:
             for group in layer_state.head_groups:
-                physical_dpu = int(group.dpu_id) % max(self.num_dpus, 1)
-                per_dpu_live_elems[physical_dpu] += int(group.live_elems)
-                per_dpu_capacity_elems[physical_dpu] += int(group.capacity_elems)
+                group_physical_dpus = [int(physical_dpu) % max(self.num_dpus, 1) for physical_dpu in list(group.physical_dpus or [group.dpu_id])]
+                if not group_physical_dpus:
+                    group_physical_dpus = [int(group.dpu_id) % max(self.num_dpus, 1)]
+                share_live = int(group.live_elems) / float(len(group_physical_dpus))
+                share_capacity = int(group.capacity_elems) / float(len(group_physical_dpus))
+                for physical_dpu in group_physical_dpus:
+                    per_dpu_live_elems[physical_dpu] += int(round(share_live))
+                    per_dpu_capacity_elems[physical_dpu] += int(round(share_capacity))
         return {
             "request_id": request_state.request_id,
             "context_len": int(request_state.context_len),
@@ -413,8 +434,10 @@ class PimNaiveAttentionBackend:
         rankset_entries: Dict[str, Dict[str, object]] = {}
         for layer_state in request_state.layer_states:
             for group in layer_state.head_groups:
-                group_physical_dpu = int(group.dpu_id)
-                group_rank_index = self._stripe_rank_index([group_physical_dpu])
+                group_physical_dpus = [int(physical_dpu) for physical_dpu in list(group.physical_dpus or [group.dpu_id])]
+                if not group_physical_dpus:
+                    group_physical_dpus = [int(group.dpu_id)]
+                group_rank_index = self._stripe_rank_index(group_physical_dpus)
                 if group_rank_index is None:
                     group_rankset_id = rankset_id or "rank-unknown"
                 else:
@@ -430,14 +453,24 @@ class PimNaiveAttentionBackend:
                         "layer_group_map": {},
                     }
                     rankset_entries[group_rankset_id] = entry
-                entry["physical_dpus"].add(group_physical_dpu)
+                for group_physical_dpu in group_physical_dpus:
+                    entry["physical_dpus"].add(int(group_physical_dpu))
                 layer_groups = entry["layer_group_map"].setdefault(str(layer_state.layer_idx), [])
                 layer_groups.append(
                     {
                         "head_start": int(group.head_start),
                         "head_end": int(group.head_end),
                         "group_heads": int(group.group_heads),
-                        "physical_dpu": int(group_physical_dpu),
+                        "physical_dpu": int(group.dpu_id),
+                        "physical_dpus": [int(physical_dpu) for physical_dpu in group_physical_dpus],
+                        "token_segments": [
+                            {
+                                "physical_dpu": int(segment.get("physical_dpu", group.dpu_id)),
+                                "token_range_start": int(segment.get("token_range_start", 0)),
+                                "token_range_end": int(segment.get("token_range_end", 0)),
+                            }
+                            for segment in list(group.token_segments or [])
+                        ],
                         "k_slot": str(group.k_slot),
                         "v_slot": str(group.v_slot),
                     }
@@ -461,6 +494,15 @@ class PimNaiveAttentionBackend:
                             "head_end": int(group["head_end"]),
                             "group_heads": int(group["group_heads"]),
                             "physical_dpu": int(group["physical_dpu"]),
+                            "physical_dpus": [int(physical_dpu) for physical_dpu in list(group.get("physical_dpus", []) or [])],
+                            "token_segments": [
+                                {
+                                    "physical_dpu": int(segment.get("physical_dpu", group["physical_dpu"])),
+                                    "token_range_start": int(segment.get("token_range_start", 0)),
+                                    "token_range_end": int(segment.get("token_range_end", 0)),
+                                }
+                                for segment in list(group.get("token_segments", []) or [])
+                            ],
                             "k_slot": str(group["k_slot"]),
                             "v_slot": str(group["v_slot"]),
                         }
@@ -489,7 +531,7 @@ class PimNaiveAttentionBackend:
                     "layer_group_map": {},
                 }
             )
-        return {
+        hint = {
             "context_len": int(request_state.context_len),
             "preferred_dpu_stripe": stripe,
             "stripe_width": len(stripe),
@@ -498,9 +540,208 @@ class PimNaiveAttentionBackend:
             "rankset_count": len(rankset_plan),
             "rankset_plan": rankset_plan,
         }
+        if request_state.sharding_plan:
+            hint["sharding_plan"] = dict(request_state.sharding_plan)
+            hint["planner_mode"] = str(
+                dict(request_state.sharding_plan.get("metadata", {}) or {}).get("planner_mode", "")
+            )
+        return hint
 
     def _request_hash(self, request_id: str) -> int:
         return sum(ord(ch) for ch in str(request_id))
+
+    def _planner_metadata(self, sharding_plan: Dict[str, object] | None) -> Dict[str, object]:
+        return dict((sharding_plan or {}).get("metadata", {}) or {})
+
+    def _normalize_physical_dpu_list(self, physical_dpus: Sequence[int] | None) -> List[int]:
+        if self.num_dpus <= 0:
+            return [0]
+        normalized: List[int] = []
+        seen = set()
+        for physical_dpu in list(physical_dpus or []):
+            value = int(physical_dpu) % self.num_dpus
+            if value in seen:
+                continue
+            seen.add(value)
+            normalized.append(value)
+        return normalized
+
+    def _coarsen_planner_group_specs(
+        self,
+        group_specs: Sequence[Tuple[int, int, List[int]]],
+        target_group_count: int,
+    ) -> List[Tuple[int, int, List[int]]]:
+        if target_group_count <= 0 or target_group_count >= len(group_specs):
+            return [(head_start, head_end, list(logical_dpus)) for head_start, head_end, logical_dpus in group_specs]
+
+        total_groups = len(group_specs)
+        base_width = total_groups // target_group_count
+        extra_groups = total_groups % target_group_count
+        merged_specs: List[Tuple[int, int, List[int]]] = []
+        cursor = 0
+        for merged_idx in range(target_group_count):
+            width = base_width + (1 if merged_idx < extra_groups else 0)
+            chunk = list(group_specs[cursor : cursor + width])
+            cursor += width
+            if not chunk:
+                continue
+            merged_logical_dpus: List[int] = []
+            seen = set()
+            for _, _, logical_dpus in chunk:
+                for logical_dpu in logical_dpus:
+                    normalized = int(logical_dpu)
+                    if normalized in seen:
+                        continue
+                    seen.add(normalized)
+                    merged_logical_dpus.append(normalized)
+            merged_specs.append((int(chunk[0][0]), int(chunk[-1][1]), merged_logical_dpus))
+        return merged_specs
+
+    def _planner_group_specs(
+        self,
+        sharding_plan: Dict[str, object] | None,
+        seq_len: int,
+        num_heads: int,
+        head_dim: int,
+    ) -> List[Tuple[int, int, List[int]]]:
+        if not sharding_plan:
+            return []
+
+        head_group_ranges = dict(sharding_plan.get("head_group_ranges", {}) or {})
+        dpu_groups = dict(sharding_plan.get("dpu_groups", {}) or {})
+        if not head_group_ranges or not dpu_groups:
+            return []
+
+        group_specs: List[Tuple[int, int, List[int]]] = []
+        for head_group_id in sorted(head_group_ranges.keys(), key=lambda item: int(item)):
+            head_range = dict(head_group_ranges.get(head_group_id, {}) or {})
+            head_start = int(head_range.get("head_start", 0))
+            head_end = int(head_range.get("head_end", 0))
+            logical_dpus = [int(dpu_id) for dpu_id in list(dpu_groups.get(head_group_id, []) or [])]
+            if head_start < 0 or head_end > int(num_heads) or head_start >= head_end or not logical_dpus:
+                return []
+            group_specs.append((head_start, head_end, logical_dpus))
+
+        if not group_specs:
+            return []
+
+        next_expected_head = 0
+        for head_start, head_end, _ in group_specs:
+            if int(head_start) != int(next_expected_head):
+                return []
+            next_expected_head = int(head_end)
+        if int(next_expected_head) != int(num_heads):
+            return []
+
+        planner_mode = str(self._planner_metadata(sharding_plan).get("planner_mode", "") or "")
+        if planner_mode == "single_dpu_multi_head_group":
+            return group_specs
+
+        target_group_count = self._effective_head_group_count(seq_len, num_heads, head_dim)
+        return self._coarsen_planner_group_specs(group_specs, target_group_count)
+
+    def _planner_segment_plan(
+        self,
+        sharding_plan: Dict[str, object] | None,
+        *,
+        request_id: str,
+        seq_len: int,
+        head_start: int,
+        head_end: int,
+        allowed_dpus: List[int],
+    ) -> List[Dict[str, int]]:
+        def _balanced_segments() -> List[Dict[str, int]]:
+            if not allowed_dpus:
+                return []
+            cursor = 0
+            remaining_tokens = int(seq_len)
+            remaining_dpus = len(allowed_dpus)
+            segments = []
+            for physical_dpu in allowed_dpus:
+                if remaining_tokens <= 0:
+                    break
+                chunk = int(math.ceil(float(remaining_tokens) / float(max(1, remaining_dpus))))
+                token_end = min(int(seq_len), int(cursor + chunk))
+                segments.append(
+                    {
+                        "dpu_id": int(physical_dpu),
+                        "token_range_start": int(cursor),
+                        "token_range_end": int(token_end),
+                    }
+                )
+                remaining_tokens -= int(token_end - cursor)
+                cursor = int(token_end)
+                remaining_dpus -= 1
+            return segments
+
+        if not sharding_plan:
+            return []
+
+        per_head_shards = dict(sharding_plan.get("per_head_shards", {}) or {})
+        target_request_map = None
+        target_group_heads = max(0, int(head_end) - int(head_start))
+        for head_group_id, request_map in per_head_shards.items():
+            head_group_range = dict(dict(sharding_plan.get("head_group_ranges", {}) or {}).get(head_group_id, {}) or {})
+            if int(head_group_range.get("head_start", -1)) != int(head_start):
+                continue
+            if int(head_group_range.get("head_end", -1)) != int(head_end):
+                continue
+            if int(head_group_range.get("group_heads", target_group_heads) or target_group_heads) != int(target_group_heads):
+                continue
+            target_request_map = dict(request_map or {})
+            break
+        if target_request_map is None:
+            return _balanced_segments()
+
+        request_shards = list(target_request_map.get(str(request_id), []) or [])
+        if not request_shards:
+            return _balanced_segments()
+
+        if not allowed_dpus:
+            return []
+        logical_to_physical = {
+            logical_idx: int(allowed_dpus[logical_idx % len(allowed_dpus)])
+            for logical_idx in range(len(allowed_dpus))
+        }
+        segment_plan = []
+        for shard in sorted(request_shards, key=lambda item: int(item.get("token_range_start", 0))):
+            logical_dpu = int(shard.get("dpu_id", 0))
+            segment_plan.append(
+                {
+                    "dpu_id": int(logical_to_physical.get(logical_dpu, allowed_dpus[logical_dpu % len(allowed_dpus)])),
+                    "token_range_start": int(shard.get("token_range_start", 0)),
+                    "token_range_end": int(shard.get("token_range_end", 0)),
+                }
+            )
+        covered = sum(int(item["token_range_end"]) - int(item["token_range_start"]) for item in segment_plan)
+        if covered != int(seq_len):
+            return _balanced_segments()
+        return segment_plan
+
+    def _map_logical_dpus_to_physical(
+        self,
+        logical_dpu_ids: Sequence[int],
+        preferred_dpu_stripe: List[int] | None = None,
+        dpu_rotation: int = 0,
+    ) -> List[int]:
+        if self.num_dpus <= 0:
+            return [0]
+
+        physical_pool = self._normalize_physical_dpu_list(preferred_dpu_stripe)
+        if not physical_pool:
+            physical_pool = list(range(self.num_dpus))
+
+        mapped: List[int] = []
+        seen = set()
+        for logical_dpu in logical_dpu_ids:
+            physical_dpu = physical_pool[(int(logical_dpu) + int(dpu_rotation)) % len(physical_pool)]
+            if physical_dpu in seen:
+                continue
+            seen.add(physical_dpu)
+            mapped.append(int(physical_dpu))
+        if mapped:
+            return mapped
+        return [int(physical_pool[int(dpu_rotation) % len(physical_pool)])]
 
     def _stripe_rank_index(self, stripe: List[int]) -> int | None:
         if (
@@ -721,43 +962,65 @@ class PimNaiveAttentionBackend:
         layer_value: torch.Tensor,
         decode_reserve_tokens: int = 0,
         preferred_dpu_stripe: List[int] | None = None,
+        sharding_plan: Dict[str, object] | None = None,
     ) -> List[HeadGroupState]:
         seq_len, num_heads, head_dim = (int(dim) for dim in layer_key.shape)
         if num_heads <= 0:
             raise ValueError(f"layer {layer_idx} in request {request_id} has no attention heads")
 
-        num_groups = self._effective_head_group_count(seq_len, num_heads, head_dim)
         capacity = max(self.length, seq_len + max(0, int(decode_reserve_tokens)))
         head_groups = []
         request_hash = sum(ord(ch) for ch in request_id)
         dpu_rotation = (request_hash + int(layer_idx)) % max(self.num_dpus, 1)
-        group_ranges: List[tuple[int, int]] = []
-        if self.head_grouping_policy == "legacy":
-            heads_per_group = math.ceil(num_heads / num_groups)
-            for group_idx in range(num_groups):
-                head_start = group_idx * heads_per_group
-                head_end = min(num_heads, head_start + heads_per_group)
-                if head_start >= head_end:
-                    break
-                group_ranges.append((head_start, head_end))
-        else:
-            base_heads_per_group = num_heads // num_groups
-            extra_head_groups = num_heads % num_groups
-            head_start = 0
-            for _ in range(num_groups):
-                group_heads = base_heads_per_group + (1 if len(group_ranges) < extra_head_groups else 0)
-                head_end = min(num_heads, head_start + group_heads)
-                if head_start >= head_end:
-                    break
-                group_ranges.append((head_start, head_end))
-                head_start = head_end
+        group_specs = self._planner_group_specs(sharding_plan, seq_len, num_heads, head_dim)
+        if not group_specs:
+            num_groups = self._effective_head_group_count(seq_len, num_heads, head_dim)
+            group_ranges: List[tuple[int, int]] = []
+            if self.head_grouping_policy == "legacy":
+                heads_per_group = math.ceil(num_heads / num_groups)
+                for group_idx in range(num_groups):
+                    head_start = group_idx * heads_per_group
+                    head_end = min(num_heads, head_start + heads_per_group)
+                    if head_start >= head_end:
+                        break
+                    group_ranges.append((head_start, head_end))
+            else:
+                base_heads_per_group = num_heads // num_groups
+                extra_head_groups = num_heads % num_groups
+                head_start = 0
+                for _ in range(num_groups):
+                    group_heads = base_heads_per_group + (1 if len(group_ranges) < extra_head_groups else 0)
+                    head_end = min(num_heads, head_start + group_heads)
+                    if head_start >= head_end:
+                        break
+                    group_ranges.append((head_start, head_end))
+                    head_start = head_end
+            group_specs = [(head_start, head_end, []) for head_start, head_end in group_ranges]
 
-        for group_idx, (head_start, head_end) in enumerate(group_ranges):
+        for group_idx, (head_start, head_end, logical_dpu_ids) in enumerate(group_specs):
+            allowed_dpus = (
+                self._map_logical_dpus_to_physical(
+                    logical_dpu_ids,
+                    preferred_dpu_stripe=preferred_dpu_stripe,
+                    dpu_rotation=dpu_rotation,
+                )
+                if logical_dpu_ids
+                else self._normalize_physical_dpu_list(preferred_dpu_stripe)
+            )
+            segment_plan = self._planner_segment_plan(
+                sharding_plan,
+                request_id=request_id,
+                seq_len=seq_len,
+                head_start=head_start,
+                head_end=head_end,
+                allowed_dpus=allowed_dpus,
+            )
+            use_segment_plan = len({int(item.get("dpu_id", -1)) for item in segment_plan}) > 1
             physical_dpu = self._choose_group_physical_dpu(
                 group_idx=group_idx,
-                num_groups=len(group_ranges),
+                num_groups=len(group_specs),
                 dpu_rotation=dpu_rotation,
-                preferred_dpu_stripe=preferred_dpu_stripe,
+                preferred_dpu_stripe=allowed_dpus or preferred_dpu_stripe,
             )
             k_slot = f"{request_id}:layer{layer_idx}:group{group_idx}:k"
             v_slot = f"{request_id}:layer{layer_idx}:group{group_idx}:v"
@@ -771,9 +1034,19 @@ class PimNaiveAttentionBackend:
                 capacity=capacity,
                 preferred_dpu=physical_dpu,
                 force_host_fallback=self.max_resident_groups_per_layer > 0 and group_idx >= self.max_resident_groups_per_layer,
-                allowed_dpus=preferred_dpu_stripe,
+                allowed_dpus=allowed_dpus or preferred_dpu_stripe,
+                segment_plan=segment_plan if use_segment_plan else None,
             )
             actual_physical_dpu = allocation_info.get("physical_dpu", physical_dpu)
+            allocation_segments = list(allocation_info.get("segments", []) or [])
+            group_physical_dpus = sorted(
+                {
+                    int(segment.get("physical_dpu", actual_physical_dpu if actual_physical_dpu is not None else physical_dpu))
+                    for segment in allocation_segments
+                }
+            )
+            if not group_physical_dpus:
+                group_physical_dpus = [physical_dpu if actual_physical_dpu is None else int(actual_physical_dpu)]
             head_groups.append(
                 HeadGroupState(
                     dpu_id=physical_dpu if actual_physical_dpu is None else int(actual_physical_dpu),
@@ -784,6 +1057,15 @@ class PimNaiveAttentionBackend:
                     head_dim=head_dim,
                     k_slot=k_slot,
                     v_slot=v_slot,
+                    physical_dpus=group_physical_dpus,
+                    token_segments=[
+                        {
+                            "physical_dpu": int(segment.get("physical_dpu", group_physical_dpus[0])),
+                            "token_range_start": int(segment.get("token_start", segment.get("token_range_start", 0))),
+                            "token_range_end": int(segment.get("token_end", segment.get("token_range_end", 0))),
+                        }
+                        for segment in allocation_segments
+                    ],
                 )
             )
         return head_groups
@@ -793,6 +1075,7 @@ class PimNaiveAttentionBackend:
         request_id: str,
         initial_kv: List[Dict[str, torch.Tensor]],
         decode_reserve_tokens: int = 0,
+        sharding_plan: Dict[str, object] | None = None,
     ) -> List[int]:
         if self.num_dpus <= 0:
             self.init_rank_last_reason = "no_dpus"
@@ -805,6 +1088,11 @@ class PimNaiveAttentionBackend:
             decode_reserve_tokens=decode_reserve_tokens,
         )
         initial_context_len = int(initial_kv[0]["key"].shape[0]) if initial_kv else 0
+        planner_metadata = self._planner_metadata(sharding_plan)
+        planner_mode = str(planner_metadata.get("planner_mode", "") or "")
+        planner_group_count = max(0, int(planner_metadata.get("effective_group_count", 0) or 0))
+        if planner_mode == "single_dpu_multi_head_group":
+            max_layer_groups = max(max_layer_groups, planner_group_count)
 
         request_hash = self._request_hash(request_id)
         # The last compact experiment proved that capacity-only shrinking makes
@@ -837,6 +1125,16 @@ class PimNaiveAttentionBackend:
         elif max_layer_groups > 4 and initial_context_len >= int(self.length) + max(96, self.block_tokens // 2):
             target_medium_width = max(target_medium_width, 16)
         stripe_width = max(min_dpus_by_capacity, target_medium_width)
+        planner_dpu_group_width = 1
+        planner_dpu_groups = dict((sharding_plan or {}).get("dpu_groups", {}) or {})
+        if planner_dpu_groups:
+            planner_dpu_group_width = max(
+                1,
+                max(len(list(group_dpus or [])) for group_dpus in planner_dpu_groups.values()),
+            )
+        stripe_width = max(stripe_width, planner_dpu_group_width)
+        if planner_mode == "single_dpu_multi_head_group":
+            stripe_width = max(stripe_width, planner_group_count)
         stripe_width = min(self.num_dpus, max(1, stripe_width))
 
         target_rank_index, target_reason = self._choose_active_rank_for_request(
@@ -1062,11 +1360,24 @@ class PimNaiveAttentionBackend:
         if not initial_kv:
             raise ValueError("initial_kv must contain at least one layer")
 
-        context_len = int(initial_kv[0]["key"].shape[0])
+        first_layer_key = initial_kv[0]["key"].detach().cpu().contiguous()
+        if first_layer_key.dim() != 3:
+            raise ValueError(
+                f"initial key for request {request_id} layer 0 must be 3D, "
+                f"got shape {tuple(first_layer_key.shape)}"
+            )
+
+        context_len = int(first_layer_key.shape[0])
+        sharding_plan = plan_sharding(
+            [{"request_id": str(request_id), "seq_len": int(context_len)}],
+            D=max(1, int(self.num_dpus)),
+            H=max(1, int(first_layer_key.shape[1])),
+        )
         preferred_dpu_stripe = self._preferred_dpu_stripe_for_request(
             request_id,
             initial_kv,
             decode_reserve_tokens=decode_reserve_tokens,
+            sharding_plan=sharding_plan,
         )
         for layer_idx, layer in enumerate(initial_kv):
             layer_key = layer["key"].detach().cpu().contiguous()
@@ -1089,6 +1400,7 @@ class PimNaiveAttentionBackend:
                         layer["value"].detach().cpu().contiguous(),
                         decode_reserve_tokens,
                         preferred_dpu_stripe=preferred_dpu_stripe,
+                        sharding_plan=sharding_plan,
                     ),
                 )
             )
@@ -1099,6 +1411,7 @@ class PimNaiveAttentionBackend:
             num_layers=len(layer_states),
             layer_states=layer_states,
             preferred_dpu_stripe=preferred_dpu_stripe,
+            sharding_plan=sharding_plan,
             stripe_version=0,
             stripe_expand_count=0,
             last_stripe_update_reason="init",
@@ -1138,6 +1451,23 @@ class PimNaiveAttentionBackend:
             )
             group.seq_len = int(append_info["seq_len"])
             group.capacity = int(append_info["capacity"])
+            slot_debug = self.resident_store.slot_debug(group.k_slot, group.v_slot)
+            slot_segments = list(slot_debug.get("segments", []) or [])
+            if slot_segments:
+                group.physical_dpus = sorted(
+                    {
+                        int(segment.get("physical_dpu", group.dpu_id))
+                        for segment in slot_segments
+                    }
+                )
+                group.token_segments = [
+                    {
+                        "physical_dpu": int(segment.get("physical_dpu", group.dpu_id)),
+                        "token_range_start": int(segment.get("token_range_start", 0)),
+                        "token_range_end": int(segment.get("token_range_end", 0)),
+                    }
+                    for segment in slot_segments
+                ]
             if group.seq_len != expected_seq_len:
                 raise RuntimeError(
                     f"resident store seq_len mismatch after append for request={request_state.request_id} "
@@ -1910,6 +2240,12 @@ class PimNaiveAttentionBackend:
                         "num_layers": int(request_state.num_layers),
                         "preferred_dpu_stripe": [int(physical_dpu) for physical_dpu in request_state.preferred_dpu_stripe],
                         "stripe_width": len(request_state.preferred_dpu_stripe),
+                        "planner_mode": str(
+                            dict((request_state.sharding_plan or {}).get("metadata", {}) or {}).get(
+                                "planner_mode",
+                                "",
+                            )
+                        ),
                         "stripe_version": int(request_state.stripe_version),
                         "stripe_expand_count": int(request_state.stripe_expand_count),
                         "last_stripe_update_reason": request_state.last_stripe_update_reason,
@@ -1950,6 +2286,7 @@ class PimNaiveAttentionBackend:
             "qk_mixed_enabled": self.qk_mixed_enabled,
             "qk_mixed_heads": self.qk_mixed_heads,
             "qk_mixed_window": self.qk_mixed_window,
+            "host_partial_reduce_enabled": self.host_partial_reduce_enabled,
             "qk_mixed_count": self.qk_mixed_count,
             "qk_mixed_last_max_abs_diff": self.qk_mixed_last_max_abs_diff,
             "qk_mixed_last_head_diffs": self.qk_mixed_last_head_diffs,

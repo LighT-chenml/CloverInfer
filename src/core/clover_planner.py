@@ -20,20 +20,43 @@ class TokenRange:
 
 
 @dataclass(frozen=True)
+class HeadRange:
+    start: int
+    end: int
+
+    @property
+    def length(self) -> int:
+        return max(0, int(self.end) - int(self.start))
+
+    def to_dict(self) -> Dict[str, int]:
+        return {
+            "head_start": int(self.start),
+            "head_end": int(self.end),
+            "group_heads": int(self.length),
+        }
+
+
+@dataclass(frozen=True)
 class RequestShard:
     request_id: str
     head_id: int
+    head_range: HeadRange
     dpu_id: int
     token_range: TokenRange
 
     def to_dict(self) -> Dict[str, int | str]:
+        weighted_token_count = int(self.token_range.length) * int(self.head_range.length)
         return {
             "request_id": str(self.request_id),
             "head_id": int(self.head_id),
+            "head_start": int(self.head_range.start),
+            "head_end": int(self.head_range.end),
+            "group_heads": int(self.head_range.length),
             "dpu_id": int(self.dpu_id),
             "token_range_start": int(self.token_range.start),
             "token_range_end": int(self.token_range.end),
             "token_count": int(self.token_range.length),
+            "weighted_token_count": int(weighted_token_count),
         }
 
 
@@ -41,6 +64,7 @@ class RequestShard:
 class ShardingPlan:
     num_dpus: int
     num_heads: int
+    head_group_ranges: Dict[int, HeadRange]
     dpu_groups: Dict[int, List[int]]
     shards_by_head: Dict[int, Dict[str, List[RequestShard]]]
     dpu_loads: Dict[int, int]
@@ -51,6 +75,10 @@ class ShardingPlan:
         return {
             "num_dpus": int(self.num_dpus),
             "num_heads": int(self.num_heads),
+            "head_group_ranges": {
+                int(head_id): head_range.to_dict()
+                for head_id, head_range in self.head_group_ranges.items()
+            },
             "dpu_groups": {
                 int(head_id): [int(dpu_id) for dpu_id in dpu_ids]
                 for head_id, dpu_ids in self.dpu_groups.items()
@@ -83,30 +111,52 @@ def _normalize_request(request: RequestLike) -> Dict[str, object]:
     }
 
 
-def _build_head_groups(num_dpus: int, num_heads: int) -> Dict[int, List[int]]:
+def _partition_contiguous(total_items: int, num_parts: int) -> List[Tuple[int, int]]:
+    if total_items < 0:
+        raise ValueError(f"total_items must be non-negative, got {total_items}")
+    if num_parts <= 0:
+        raise ValueError(f"num_parts must be positive, got {num_parts}")
+    if total_items < num_parts:
+        raise ValueError(
+            f"cannot partition {total_items} items into {num_parts} non-empty parts"
+        )
+
+    base = total_items // num_parts
+    extra = total_items % num_parts
+    cursor = 0
+    spans: List[Tuple[int, int]] = []
+    for part_idx in range(num_parts):
+        width = base + (1 if part_idx < extra else 0)
+        spans.append((cursor, cursor + width))
+        cursor += width
+    return spans
+
+
+def _build_head_groups(num_dpus: int, num_heads: int) -> Tuple[Dict[int, HeadRange], Dict[int, List[int]]]:
     if num_heads <= 0:
         raise ValueError("num_heads must be positive")
     if num_dpus <= 0:
         raise ValueError("num_dpus must be positive")
-    if num_dpus < num_heads:
-        raise ValueError(
-            f"num_dpus ({num_dpus}) must be >= num_heads ({num_heads}) for head-group sharding"
-        )
-    if num_dpus % num_heads != 0:
-        raise ValueError(
-            f"num_dpus ({num_dpus}) must be divisible by num_heads ({num_heads})"
-        )
-    group_size = num_dpus // num_heads
-    return {
-        head_id: list(range(head_id * group_size, (head_id + 1) * group_size))
-        for head_id in range(num_heads)
-    }
+    effective_group_count = min(num_dpus, num_heads)
+    head_ranges = _partition_contiguous(num_heads, effective_group_count)
+    dpu_ranges = _partition_contiguous(num_dpus, effective_group_count)
+    return (
+        {
+            head_id: HeadRange(start=int(start), end=int(end))
+            for head_id, (start, end) in enumerate(head_ranges)
+        },
+        {
+            head_id: list(range(int(start), int(end)))
+            for head_id, (start, end) in enumerate(dpu_ranges)
+        },
+    )
 
 
 def _slice_tokens_balanced(
     seq_len: int,
     dpu_ids: Sequence[int],
     dpu_loads: MutableMapping[int, int],
+    load_scale: int = 1,
 ) -> List[Tuple[int, TokenRange]]:
     if seq_len <= 0:
         return []
@@ -128,7 +178,7 @@ def _slice_tokens_balanced(
         start = cursor
         end = min(seq_len, cursor + chunk)
         out.append((int(dpu_id), TokenRange(start, end)))
-        dpu_loads[int(dpu_id)] = int(dpu_loads.get(int(dpu_id), 0)) + (end - start)
+        dpu_loads[int(dpu_id)] = int(dpu_loads.get(int(dpu_id), 0)) + ((end - start) * max(1, int(load_scale)))
         cursor = end
         remaining_tokens -= end - start
         remaining_dpus -= 1
@@ -145,7 +195,7 @@ def _plan_for_requests(
     num_heads: int,
 ) -> ShardingPlan:
     normalized = [_normalize_request(request) for request in requests]
-    dpu_groups = _build_head_groups(num_dpus, num_heads)
+    head_group_ranges, dpu_groups = _build_head_groups(num_dpus, num_heads)
     dpu_loads = {dpu_id: 0 for dpu_id in range(num_dpus)}
     shards_by_head = _empty_shards_by_head(num_heads)
 
@@ -158,11 +208,18 @@ def _plan_for_requests(
         request_id = str(request["request_id"])
         seq_len = int(request["seq_len"])
         for head_id, group_dpus in dpu_groups.items():
-            slices = _slice_tokens_balanced(seq_len, group_dpus, dpu_loads)
+            head_range = head_group_ranges[int(head_id)]
+            slices = _slice_tokens_balanced(
+                seq_len,
+                group_dpus,
+                dpu_loads,
+                load_scale=head_range.length,
+            )
             shards_by_head[head_id][request_id] = [
                 RequestShard(
                     request_id=request_id,
                     head_id=int(head_id),
+                    head_range=head_range,
                     dpu_id=int(dpu_id),
                     token_range=token_range,
                 )
@@ -174,6 +231,7 @@ def _plan_for_requests(
     return ShardingPlan(
         num_dpus=int(num_dpus),
         num_heads=int(num_heads),
+        head_group_ranges=head_group_ranges,
         dpu_groups=dpu_groups,
         shards_by_head=shards_by_head,
         dpu_loads=dpu_loads,
@@ -181,6 +239,14 @@ def _plan_for_requests(
         metadata={
             "request_count": len(normalized),
             "planner": "balanced_contiguous_token_sharding",
+            "effective_group_count": int(len(dpu_groups)),
+            "planner_mode": (
+                "multi_dpu_per_head_group"
+                if num_dpus > num_heads
+                else "single_dpu_multi_head_group"
+                if num_dpus < num_heads
+                else "one_dpu_per_head_group"
+            ),
         },
     )
 
@@ -232,4 +298,3 @@ def update_sharding(
     plan.metadata["updated_from_existing"] = True
     plan.metadata["new_request_count"] = len(list(new_requests))
     return plan.to_dict()
-
