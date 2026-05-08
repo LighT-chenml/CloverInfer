@@ -61,27 +61,23 @@ resolve_remote_conda_prefix() {
     candidates+=("${requested_prefix}")
   fi
   candidates+=("$@")
-
-  local joined_candidates=""
+  local quoted_candidates=()
   local prefix
   for prefix in "${candidates[@]}"; do
-    if [[ -n "${joined_candidates}" ]]; then
-      joined_candidates+=" "
-    fi
-    joined_candidates+="${prefix@Q}"
+    quoted_candidates+=("$(printf '%q' "${prefix}")")
   done
 
-  ssh_remote "${host}" "bash -lc '
-    set -e
-    for prefix in ${joined_candidates}; do
-      if [[ -x \"\${prefix}/bin/python\" ]]; then
-        printf \"%s\" \"\${prefix}\"
-        exit 0
-      fi
-    done
-    echo \"Unable to find a remote clover_infer env among: ${candidates[*]}\" >&2
-    exit 1
-  '"
+  ssh_remote "${host}" "bash -s -- ${quoted_candidates[*]}" <<'EOF'
+set -e
+for prefix in "$@"; do
+  if [[ -x "${prefix}/bin/python" ]]; then
+    printf '%s' "${prefix}"
+    exit 0
+  fi
+done
+echo "Unable to find a remote clover_infer env among: $*" >&2
+exit 1
+EOF
 }
 
 resolve_ray_bin() {
@@ -106,23 +102,26 @@ resolve_ray_bin() {
 resolve_remote_ray_bin() {
   local host="$1"
   local conda_prefix="$2"
-  ssh_remote "${host}" "bash -lc '
-    set -e
-    ray_bin=${conda_prefix@Q}/bin/ray
-    python_bin=${conda_prefix@Q}/bin/python
-    if [[ -x \"\${python_bin}\" ]] && \"\${python_bin}\" -m ray.scripts.scripts --version >/dev/null 2>&1; then
-      printf \"%q -m ray.scripts.scripts\" \"\${python_bin}\"
-    elif [[ -x \"\${ray_bin}\" ]]; then
-      printf \"%q\" \"\${ray_bin}\"
-    elif command -v ray >/dev/null 2>&1; then
-      printf \"%q\" \"\$(command -v ray)\"
-    elif [[ -x \"\${HOME}/.local/bin/ray\" ]]; then
-      printf \"%q\" \"\${HOME}/.local/bin/ray\"
-    else
-      echo \"Unable to find a Ray CLI for conda prefix ${conda_prefix}\" >&2
-      exit 1
-    fi
-  '"
+  local quoted_prefix
+  quoted_prefix="$(printf '%q' "${conda_prefix}")"
+  ssh_remote "${host}" "bash -s -- ${quoted_prefix}" <<'EOF'
+set -e
+conda_prefix="$1"
+ray_bin="${conda_prefix}/bin/ray"
+python_bin="${conda_prefix}/bin/python"
+if [[ -x "${python_bin}" ]] && "${python_bin}" -m ray.scripts.scripts --version >/dev/null 2>&1; then
+  printf '%q -m ray.scripts.scripts' "${python_bin}"
+elif [[ -x "${ray_bin}" ]]; then
+  printf '%q' "${ray_bin}"
+elif command -v ray >/dev/null 2>&1; then
+  printf '%q' "$(command -v ray)"
+elif [[ -x "${HOME}/.local/bin/ray" ]]; then
+  printf '%q' "${HOME}/.local/bin/ray"
+else
+  echo "Unable to find a Ray CLI for conda prefix ${conda_prefix}" >&2
+  exit 1
+fi
+EOF
 }
 
 CONDA_PREFIX_HEAD="$(

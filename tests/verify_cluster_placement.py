@@ -79,6 +79,14 @@ def parse_args():
     parser.add_argument("--clover-predictive-scheduling-alpha", type=float, default=0.2)
     parser.add_argument("--clover-predictive-scheduling-min-samples", type=int, default=4)
     parser.add_argument("--clover-predictive-scheduling-context-bucket-tokens", type=int, default=256)
+    parser.add_argument("--clover-capacity-aware-batching-enabled", action="store_true")
+    parser.add_argument("--no-clover-capacity-aware-batching-enabled", action="store_true")
+    parser.add_argument("--clover-capacity-aware-time-gap-threshold", type=float, default=0.0)
+    parser.add_argument("--clover-capacity-aware-lookahead-window", type=int, default=1)
+    parser.add_argument("--clover-capacity-aware-pim-a", type=float, default=1.0)
+    parser.add_argument("--clover-capacity-aware-pim-b", type=float, default=0.0)
+    parser.add_argument("--clover-capacity-aware-host-c", type=float, default=1.0)
+    parser.add_argument("--clover-capacity-aware-max-tokens-per-dpu", type=int, default=0)
     parser.add_argument("--decode-step-sync-window-s", type=float, default=0.0)
     parser.add_argument("--decode-step-sync-max-size", type=int, default=8)
     parser.add_argument("--attention-decode-wave-persist-enabled", action="store_true")
@@ -116,6 +124,11 @@ def main():
         raise ValueError(
             "cannot set both --clover-predictive-scheduling-enabled and "
             "--no-clover-predictive-scheduling-enabled"
+        )
+    if args.clover_capacity_aware_batching_enabled and args.no_clover_capacity_aware_batching_enabled:
+        raise ValueError(
+            "cannot set both --clover-capacity-aware-batching-enabled and "
+            "--no-clover-capacity-aware-batching-enabled"
         )
     pim_qk_mixed_enabled = True
     if args.pim_qk_mixed_enabled:
@@ -155,6 +168,9 @@ def main():
     clover_predictive_scheduling_enabled = bool(args.clover_predictive_scheduling_enabled)
     if args.no_clover_predictive_scheduling_enabled:
         clover_predictive_scheduling_enabled = False
+    clover_capacity_aware_batching_enabled = bool(args.clover_capacity_aware_batching_enabled)
+    if args.no_clover_capacity_aware_batching_enabled:
+        clover_capacity_aware_batching_enabled = False
 
     ray.init(
         address=args.address,
@@ -228,6 +244,13 @@ def main():
         clover_predictive_scheduling_alpha=args.clover_predictive_scheduling_alpha,
         clover_predictive_scheduling_min_samples=args.clover_predictive_scheduling_min_samples,
         clover_predictive_scheduling_context_bucket_tokens=args.clover_predictive_scheduling_context_bucket_tokens,
+        clover_capacity_aware_batching_enabled=clover_capacity_aware_batching_enabled,
+        clover_capacity_aware_time_gap_threshold=args.clover_capacity_aware_time_gap_threshold,
+        clover_capacity_aware_lookahead_window=args.clover_capacity_aware_lookahead_window,
+        clover_capacity_aware_pim_a=args.clover_capacity_aware_pim_a,
+        clover_capacity_aware_pim_b=args.clover_capacity_aware_pim_b,
+        clover_capacity_aware_host_c=args.clover_capacity_aware_host_c,
+        clover_capacity_aware_max_tokens_per_dpu=args.clover_capacity_aware_max_tokens_per_dpu,
     )
     model = ModelConfig(model_path=args.model, max_new_tokens=args.max_new_tokens)
 
@@ -288,6 +311,8 @@ def main():
         if args.attention_backend == "cloverinfer":
             assert dense_batching["predictive_enabled"] == clover_predictive_scheduling_enabled, dense_batching
             assert "predictive_last_batch" in dense_batching, dense_batching
+            assert dense_batching["capacity_aware_enabled"] == clover_capacity_aware_batching_enabled, dense_batching
+            assert "capacity_aware_last_batch" in dense_batching, dense_batching
         if args.attention_backend in {"pim_naive", "cloverinfer"}:
             debug = metrics["attention_backend"]["backend_debug"]
             assert debug["resident_append_ops"] > 0, debug

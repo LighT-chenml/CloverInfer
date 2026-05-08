@@ -8,6 +8,13 @@ from typing import Dict, List
 import ray
 
 from .config import ClusterConfig, ModelConfig
+from .clover_planner import plan_sharding
+from .clover_scheduler_components import (
+    CapacityAwareMicroBatchScheduler,
+    default_capacity_checker,
+    default_predict_host_time,
+    default_predict_pim_time,
+)
 from .nodes import AttentionNode, DecodeDenseNode, PrefillNode
 
 
@@ -146,6 +153,50 @@ class GlobalScheduler:
         self.predictive_ready_requests = 0
         self.predictive_unready_requests = 0
         self.predictive_last_batch: Dict[str, object] = {}
+        self.clover_capacity_aware_batching_enabled = bool(
+            getattr(cluster_config, "clover_capacity_aware_batching_enabled", False)
+        ) and str(cluster_config.attention_backend) == "cloverinfer"
+        self.clover_capacity_aware_time_gap_threshold = float(
+            getattr(cluster_config, "clover_capacity_aware_time_gap_threshold", 0.0)
+        )
+        self.clover_capacity_aware_lookahead_window = max(
+            1, int(getattr(cluster_config, "clover_capacity_aware_lookahead_window", 1))
+        )
+        self.clover_capacity_aware_pim_a = float(
+            getattr(cluster_config, "clover_capacity_aware_pim_a", 1.0)
+        )
+        self.clover_capacity_aware_pim_b = float(
+            getattr(cluster_config, "clover_capacity_aware_pim_b", 0.0)
+        )
+        self.clover_capacity_aware_host_c = float(
+            getattr(cluster_config, "clover_capacity_aware_host_c", 1.0)
+        )
+        self.clover_capacity_aware_max_tokens_per_dpu = max(
+            0, int(getattr(cluster_config, "clover_capacity_aware_max_tokens_per_dpu", 0))
+        )
+        self.capacity_aware_batch_decisions = 0
+        self.capacity_aware_batch_fallbacks = 0
+        self.capacity_aware_last_batch: Dict[str, object] = {}
+        self._capacity_aware_scheduler: CapacityAwareMicroBatchScheduler | None = None
+        if self.clover_capacity_aware_batching_enabled:
+            self._capacity_aware_scheduler = CapacityAwareMicroBatchScheduler(
+                planner=plan_sharding,
+                predict_pim_time=lambda reqs, plan: default_predict_pim_time(
+                    reqs,
+                    plan,
+                    a=self.clover_capacity_aware_pim_a,
+                    b=self.clover_capacity_aware_pim_b,
+                ),
+                predict_host_time=lambda total_tokens: default_predict_host_time(
+                    total_tokens,
+                    c=self.clover_capacity_aware_host_c,
+                ),
+                capacity_checker=default_capacity_checker,
+                num_dpus=int(cluster_config.pim_num_dpus),
+                num_heads=int(model_config.num_heads),
+                time_gap_threshold=self.clover_capacity_aware_time_gap_threshold,
+                lookahead_window=self.clover_capacity_aware_lookahead_window,
+            )
         self.clover_rankset_overlap_enabled = bool(
             getattr(cluster_config, "clover_rankset_overlap_enabled", False)
         ) and str(cluster_config.attention_backend) == "cloverinfer"
@@ -674,6 +725,27 @@ class GlobalScheduler:
                 ]
         self.predictive_last_batch = batch_summary
 
+    def _capacity_aware_request_view(self, state: Dict[str, object]) -> Dict[str, object]:
+        return {
+            "request_id": str(state["request_id"]),
+            "seq_len": int(self._decode_state_context_len(state)),
+            "num_new_tokens": 1,
+            "_state": state,
+        }
+
+    def _record_capacity_aware_batch(self, request_views: List[Dict[str, object]], batch_meta: Dict[str, object]) -> None:
+        self.capacity_aware_last_batch = {
+            "enabled": bool(self.clover_capacity_aware_batching_enabled),
+            "request_ids": [str(item["request_id"]) for item in request_views],
+            "context_lens": [int(item["seq_len"]) for item in request_views],
+            "predicted_pim_time": float(batch_meta.get("predicted_pim_time", 0.0)),
+            "predicted_host_time": float(batch_meta.get("predicted_host_time", 0.0)),
+            "time_gap": float(batch_meta.get("time_gap", 0.0)),
+            "capacity_ok": bool(batch_meta.get("capacity_ok", False)),
+            "capacity_usage_ratio": float(batch_meta.get("capacity_usage_ratio", 0.0)),
+            "selection_reason": str(batch_meta.get("selection_reason", "")),
+        }
+
     def _decode_batch_candidate_score(
         self,
         seed_state: Dict[str, object],
@@ -699,6 +771,49 @@ class GlobalScheduler:
     def _take_decode_batch(self, batch_size: int) -> List[Dict[str, object]]:
         if batch_size <= 0 or not self._decode_pending_queue:
             return []
+        if self.clover_capacity_aware_batching_enabled and self._capacity_aware_scheduler is not None:
+            queue_items = list(self._decode_pending_queue)
+            request_views = [self._capacity_aware_request_view(state) for state in queue_items]
+            max_capacity = self.clover_capacity_aware_max_tokens_per_dpu
+            if max_capacity > 0:
+                try:
+                    decision = self._capacity_aware_scheduler.build_micro_batch(
+                        request_views,
+                        max_capacity,
+                        max_batch_size=batch_size,
+                    )
+                    chosen_ids = {str(item["request_id"]) for item in decision.micro_batch.requests}
+                    batch = [
+                        state
+                        for state in queue_items
+                        if str(state["request_id"]) in chosen_ids
+                    ]
+                    self._decode_pending_queue = deque(
+                        state
+                        for state in queue_items
+                        if str(state["request_id"]) not in chosen_ids
+                    )
+                    self.capacity_aware_batch_decisions += 1
+                    self._record_capacity_aware_batch(
+                        decision.micro_batch.requests,
+                        decision.micro_batch.to_dict(),
+                    )
+                    context_lens = [self._decode_state_context_len(state) for state in batch]
+                    if context_lens:
+                        self.decode_continuous_batch_total_context_span += max(context_lens) - min(context_lens)
+                    known_rank_hints = [
+                        rank_hint
+                        for rank_hint in (self._decode_state_rank_hint(state) for state in batch)
+                        if rank_hint is not None
+                    ]
+                    if len(known_rank_hints) >= 2:
+                        if len(set(known_rank_hints)) == 1:
+                            self.decode_continuous_batch_same_rank_flushes += 1
+                        else:
+                            self.decode_continuous_batch_mixed_rank_flushes += 1
+                    return batch
+                except Exception:
+                    self.capacity_aware_batch_fallbacks += 1
         if batch_size >= len(self._decode_pending_queue):
             batch = list(self._decode_pending_queue)
             self._decode_pending_queue.clear()
@@ -1383,6 +1498,13 @@ class GlobalScheduler:
                 "predictive_min_samples": int(self.clover_predictive_scheduling_min_samples),
                 "predictive_alpha": float(self.clover_predictive_scheduling_alpha),
                 "predictive_last_batch": dict(self.predictive_last_batch),
+                "capacity_aware_enabled": bool(self.clover_capacity_aware_batching_enabled),
+                "capacity_aware_decisions": int(self.capacity_aware_batch_decisions),
+                "capacity_aware_fallbacks": int(self.capacity_aware_batch_fallbacks),
+                "capacity_aware_time_gap_threshold": float(self.clover_capacity_aware_time_gap_threshold),
+                "capacity_aware_lookahead_window": int(self.clover_capacity_aware_lookahead_window),
+                "capacity_aware_max_tokens_per_dpu": int(self.clover_capacity_aware_max_tokens_per_dpu),
+                "capacity_aware_last_batch": dict(self.capacity_aware_last_batch),
             }
             metrics["scheduler_rankset_overlap"] = {
                 "enabled": bool(self.clover_rankset_overlap_enabled),

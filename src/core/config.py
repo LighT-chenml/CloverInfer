@@ -55,6 +55,13 @@ class ClusterConfig(BaseModel):
     clover_predictive_scheduling_alpha: float = 0.2
     clover_predictive_scheduling_min_samples: int = 4
     clover_predictive_scheduling_context_bucket_tokens: int = 256
+    clover_capacity_aware_batching_enabled: bool = False
+    clover_capacity_aware_time_gap_threshold: float = 0.0
+    clover_capacity_aware_lookahead_window: int = 1
+    clover_capacity_aware_pim_a: float = 1.0
+    clover_capacity_aware_pim_b: float = 0.0
+    clover_capacity_aware_host_c: float = 1.0
+    clover_capacity_aware_max_tokens_per_dpu: int = 0
     clover_rankset_overlap_enabled: bool = False
     clover_rankset_overlap_max_ranksets_per_batch: int = 0
     clover_rankset_overlap_transfer_granularity: str = "stripe"
