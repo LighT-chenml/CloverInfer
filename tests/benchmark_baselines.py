@@ -409,6 +409,19 @@ def make_cluster_config(args, attention_backend: str) -> ClusterConfig:
         clover_host_qk_mixed_enabled=args.clover_host_qk_mixed_enabled,
         clover_pim_attention_enabled=(attention_backend == "cloverinfer"),
         clover_pim_context_fused_experimental_enabled=args.clover_pim_context_fused_experimental_enabled,
+        clover_predictive_scheduling_enabled=(
+            args.clover_predictive_scheduling_enabled if attention_backend == "cloverinfer" else False
+        ),
+        clover_predictive_scheduling_alpha=args.clover_predictive_scheduling_alpha,
+        clover_predictive_scheduling_min_samples=args.clover_predictive_scheduling_min_samples,
+        clover_predictive_scheduling_context_bucket_tokens=args.clover_predictive_scheduling_context_bucket_tokens,
+        clover_rankset_overlap_enabled=(
+            args.clover_rankset_overlap_enabled if attention_backend == "cloverinfer" else False
+        ),
+        clover_rankset_overlap_max_ranksets_per_batch=args.clover_rankset_overlap_max_ranksets_per_batch,
+        clover_rankset_overlap_transfer_granularity=args.clover_rankset_overlap_transfer_granularity,
+        decode_continuous_batch_window_s=args.decode_continuous_batch_window_s,
+        decode_continuous_batch_max_size=args.decode_continuous_batch_max_size,
         attention_rpc_cross_key_batch_enabled=(attention_backend == "cloverinfer"),
         attention_actor_side_batching_enabled=False,
     )
@@ -636,6 +649,22 @@ def main():
     parser.add_argument("--no-clover-host-qk-mixed-enabled", action="store_true")
     parser.add_argument("--clover-pim-context-fused-experimental-enabled", action="store_true")
     parser.add_argument("--no-clover-pim-context-fused-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-predictive-scheduling-enabled", action="store_true")
+    parser.add_argument("--no-clover-predictive-scheduling-enabled", action="store_true")
+    parser.add_argument("--clover-predictive-scheduling-alpha", type=float, default=0.2)
+    parser.add_argument("--clover-predictive-scheduling-min-samples", type=int, default=4)
+    parser.add_argument("--clover-predictive-scheduling-context-bucket-tokens", type=int, default=256)
+    parser.add_argument("--clover-rankset-overlap-enabled", action="store_true")
+    parser.add_argument("--no-clover-rankset-overlap-enabled", action="store_true")
+    parser.add_argument("--clover-rankset-overlap-max-ranksets-per-batch", type=int, default=0)
+    parser.add_argument(
+        "--clover-rankset-overlap-transfer-granularity",
+        default="stripe",
+        choices=["stripe", "rankset"],
+    )
+    parser.add_argument("--decode-continuous-batch-window-s", type=float, default=0.0)
+    parser.add_argument("--decode-continuous-batch-window-ms", type=float, default=0.0)
+    parser.add_argument("--decode-continuous-batch-max-size", type=int, default=8)
     parser.add_argument(
         "--output",
         default=os.path.join(REPO_ROOT, "artifacts", "baseline_comparison.jsonl"),
@@ -675,6 +704,16 @@ def main():
         raise ValueError(
             "cannot set both --clover-pim-context-fused-experimental-enabled and "
             "--no-clover-pim-context-fused-experimental-enabled"
+        )
+    if args.clover_predictive_scheduling_enabled and args.no_clover_predictive_scheduling_enabled:
+        raise ValueError(
+            "cannot set both --clover-predictive-scheduling-enabled and "
+            "--no-clover-predictive-scheduling-enabled"
+        )
+    if args.clover_rankset_overlap_enabled and args.no_clover_rankset_overlap_enabled:
+        raise ValueError(
+            "cannot set both --clover-rankset-overlap-enabled and "
+            "--no-clover-rankset-overlap-enabled"
         )
 
     if not args.pim_qk_mixed_enabled and not args.no_pim_qk_mixed_enabled:
@@ -722,6 +761,22 @@ def main():
     )
     if args.no_clover_pim_context_fused_experimental_enabled:
         args.clover_pim_context_fused_experimental_enabled = False
+    args.clover_predictive_scheduling_enabled = bool(args.clover_predictive_scheduling_enabled)
+    if args.no_clover_predictive_scheduling_enabled:
+        args.clover_predictive_scheduling_enabled = False
+    args.clover_rankset_overlap_enabled = bool(args.clover_rankset_overlap_enabled)
+    if args.no_clover_rankset_overlap_enabled:
+        args.clover_rankset_overlap_enabled = False
+    if args.clover_rankset_overlap_max_ranksets_per_batch < 0:
+        raise ValueError("--clover-rankset-overlap-max-ranksets-per-batch must be non-negative")
+    if args.decode_continuous_batch_window_s < 0.0:
+        raise ValueError("--decode-continuous-batch-window-s must be non-negative")
+    if args.decode_continuous_batch_window_ms < 0.0:
+        raise ValueError("--decode-continuous-batch-window-ms must be non-negative")
+    if args.decode_continuous_batch_max_size <= 0:
+        raise ValueError("--decode-continuous-batch-max-size must be positive")
+    if args.decode_continuous_batch_window_ms > 0.0:
+        args.decode_continuous_batch_window_s += args.decode_continuous_batch_window_ms / 1000.0
 
     tokenizer = None
     if int(args.prompt_token_length) > 0:
@@ -751,6 +806,11 @@ def main():
         "prompt_token_length_override": int(args.prompt_token_length),
         "concurrency": max(1, int(args.concurrency)),
         "max_new_tokens": int(args.max_new_tokens),
+        "clover_rankset_overlap_enabled": bool(args.clover_rankset_overlap_enabled),
+        "clover_rankset_overlap_max_ranksets_per_batch": int(args.clover_rankset_overlap_max_ranksets_per_batch),
+        "clover_rankset_overlap_transfer_granularity": str(args.clover_rankset_overlap_transfer_granularity),
+        "decode_continuous_batch_window_s": float(args.decode_continuous_batch_window_s),
+        "decode_continuous_batch_max_size": int(args.decode_continuous_batch_max_size),
         "resource_layout": {
             "prefill_resource": str(args.prefill_resource),
             "decode_dense_resource": str(args.decode_dense_resource),

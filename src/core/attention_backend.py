@@ -409,11 +409,26 @@ class PimNaiveAttentionBackend:
                 rank_index = self.resident_store._topology_rank_index(int(stripe[0]))
             except Exception:
                 rank_index = None
+        rankset_id = None if rank_index is None else f"rank{int(rank_index)}:w{len(stripe)}"
+        rankset_plan = []
+        if stripe:
+            rankset_plan.append(
+                {
+                    "rankset_id": rankset_id or "rank-unknown",
+                    "rank_index": None if rank_index is None else int(rank_index),
+                    "physical_dpus": list(stripe),
+                    "stripe_width": len(stripe),
+                    "transfer_granularity": "stripe",
+                }
+            )
         return {
             "context_len": int(request_state.context_len),
             "preferred_dpu_stripe": stripe,
             "stripe_width": len(stripe),
             "rank_index": None if rank_index is None else int(rank_index),
+            "rankset_id": rankset_id,
+            "rankset_count": len(rankset_plan),
+            "rankset_plan": rankset_plan,
         }
 
     def _request_hash(self, request_id: str) -> int:

@@ -123,6 +123,61 @@ class GlobalScheduler:
         self._decode_pending_queue = deque()
         self._decode_driver_task: asyncio.Task | None = None
         self._background_completion_tasks: set[asyncio.Task] = set()
+        self.clover_predictive_scheduling_enabled = bool(
+            getattr(cluster_config, "clover_predictive_scheduling_enabled", False)
+        ) and str(cluster_config.attention_backend) == "cloverinfer"
+        self.clover_predictive_scheduling_alpha = min(
+            1.0,
+            max(0.0, float(getattr(cluster_config, "clover_predictive_scheduling_alpha", 0.2))),
+        )
+        self.clover_predictive_scheduling_min_samples = max(
+            1, int(getattr(cluster_config, "clover_predictive_scheduling_min_samples", 4))
+        )
+        self.clover_predictive_scheduling_context_bucket_tokens = max(
+            1, int(getattr(cluster_config, "clover_predictive_scheduling_context_bucket_tokens", 256))
+        )
+        self._predictive_models: dict[str, dict[tuple[str, int, int], dict[str, float]]] = {
+            "dense": {},
+            "attention": {},
+        }
+        self.predictive_batch_decisions = 0
+        self.predictive_batch_fallbacks = 0
+        self.predictive_model_updates = 0
+        self.predictive_ready_requests = 0
+        self.predictive_unready_requests = 0
+        self.predictive_last_batch: Dict[str, object] = {}
+        self.clover_rankset_overlap_enabled = bool(
+            getattr(cluster_config, "clover_rankset_overlap_enabled", False)
+        ) and str(cluster_config.attention_backend) == "cloverinfer"
+        self.clover_rankset_overlap_max_ranksets_per_batch = max(
+            0, int(getattr(cluster_config, "clover_rankset_overlap_max_ranksets_per_batch", 0))
+        )
+        self.clover_rankset_overlap_transfer_granularity = str(
+            getattr(cluster_config, "clover_rankset_overlap_transfer_granularity", "stripe")
+        )
+        self.rankset_overlap_plan_batches = 0
+        self.rankset_overlap_plan_items = 0
+        self.rankset_overlap_plan_ranksets = 0
+        self.rankset_overlap_plan_max_ranksets = 0
+        self.rankset_overlap_plan_same_rankset_batches = 0
+        self.rankset_overlap_plan_mixed_rankset_batches = 0
+        self.rankset_overlap_task_graph_layers = 0
+        self.rankset_overlap_task_graph_work_items = 0
+        self.rankset_overlap_task_graph_max_work_items = 0
+        self.rankset_overlap_partial_ready_reports = 0
+        self.rankset_overlap_partial_ready_work_items = 0
+        self.rankset_overlap_partial_ready_max_work_items = 0
+        self.rankset_overlap_first_work_item_completion_s_total = 0.0
+        self.rankset_overlap_first_work_item_completion_s_count = 0
+        self.rankset_overlap_last_work_item_completion_s_total = 0.0
+        self.rankset_overlap_last_work_item_completion_s_count = 0
+        self.rankset_overlap_work_item_span_s_total = 0.0
+        self.rankset_overlap_work_item_span_s_count = 0
+        self.rankset_overlap_work_item_duration_s_total = 0.0
+        self.rankset_overlap_work_item_duration_s_count = 0
+        self.rankset_overlap_last_batch: Dict[str, object] = {}
+        self.rankset_overlap_last_task_graph: Dict[str, object] = {}
+        self.rankset_overlap_last_execution_summary: Dict[str, object] = {}
 
     def _attention_batch_target_size(self) -> int:
         return max(1, min(self._active_decode_requests, self.attention_batch_max_size))
@@ -169,6 +224,25 @@ class GlobalScheduler:
             int(physical_dpu)
             for physical_dpu in packing_hint.get("preferred_dpu_stripe", []) or []
         ]
+        inferred_rank_hint = packing_hint.get("rank_index")
+        inferred_rankset_id = packing_hint.get("rankset_id")
+        if inferred_rankset_id in (None, "") and preferred_stripe:
+            stripe_width = int(packing_hint.get("stripe_width", len(preferred_stripe) or 0))
+            if inferred_rank_hint is None:
+                inferred_rankset_id = f"stripe:w{max(1, stripe_width)}"
+            else:
+                inferred_rankset_id = f"rank{int(inferred_rank_hint)}:w{max(1, stripe_width)}"
+        inferred_rankset_plan = list(packing_hint.get("rankset_plan", []) or [])
+        if not inferred_rankset_plan and preferred_stripe:
+            inferred_rankset_plan = [
+                {
+                    "rankset_id": str(inferred_rankset_id or "rank-unknown"),
+                    "rank_index": None if inferred_rank_hint is None else int(inferred_rank_hint),
+                    "physical_dpus": list(preferred_stripe),
+                    "stripe_width": int(packing_hint.get("stripe_width", len(preferred_stripe) or 0)),
+                    "transfer_granularity": str(self.clover_rankset_overlap_transfer_granularity),
+                }
+            ]
         return {
             "request_id": request_id,
             "prompt_len": int(prompt_len),
@@ -183,9 +257,14 @@ class GlobalScheduler:
             "pending_free": False,
             "done": False,
             "completion_future": None,
-            "packing_rank_hint": packing_hint.get("rank_index"),
+            "packing_rank_hint": inferred_rank_hint,
             "packing_stripe_width": int(packing_hint.get("stripe_width", len(preferred_stripe) or 0)),
             "packing_preferred_dpu_stripe": preferred_stripe,
+            "packing_rankset_id": inferred_rankset_id,
+            "packing_rankset_count": int(
+                packing_hint.get("rankset_count", len(inferred_rankset_plan)) or len(inferred_rankset_plan)
+            ),
+            "packing_rankset_plan": inferred_rankset_plan,
         }
 
     def _decode_state_context_len(self, state: Dict[str, object]) -> int:
@@ -200,6 +279,304 @@ class GlobalScheduler:
     def _decode_state_stripe(self, state: Dict[str, object]) -> tuple[int, ...]:
         stripe = state.get("packing_preferred_dpu_stripe", [])
         return tuple(int(physical_dpu) for physical_dpu in stripe)
+
+    def _decode_state_rankset_id(self, state: Dict[str, object]) -> str | None:
+        rankset_id = state.get("packing_rankset_id")
+        if rankset_id in (None, ""):
+            return None
+        return str(rankset_id)
+
+    def _plan_rankset_overlap_batch(self, batch: List[Dict[str, object]]) -> Dict[str, object]:
+        rankset_ids = [
+            rankset_id
+            for rankset_id in (self._decode_state_rankset_id(state) for state in batch)
+            if rankset_id is not None
+        ]
+        unique_rankset_ids = list(dict.fromkeys(rankset_ids))
+        planned_rankset_count = len(unique_rankset_ids)
+        self.rankset_overlap_plan_batches += 1
+        self.rankset_overlap_plan_items += len(batch)
+        self.rankset_overlap_plan_ranksets += planned_rankset_count
+        self.rankset_overlap_plan_max_ranksets = max(
+            self.rankset_overlap_plan_max_ranksets,
+            planned_rankset_count,
+        )
+        if planned_rankset_count <= 1:
+            self.rankset_overlap_plan_same_rankset_batches += 1
+        else:
+            self.rankset_overlap_plan_mixed_rankset_batches += 1
+        batch_summary = {
+            "enabled": bool(self.clover_rankset_overlap_enabled),
+            "transfer_granularity": str(self.clover_rankset_overlap_transfer_granularity),
+            "request_ids": [str(state["request_id"]) for state in batch],
+            "rankset_ids": unique_rankset_ids,
+            "rankset_count": int(planned_rankset_count),
+            "per_request_rankset_count": [int(state.get("packing_rankset_count", 0) or 0) for state in batch],
+            "planned_rankset_cap": int(self.clover_rankset_overlap_max_ranksets_per_batch),
+        }
+        self.rankset_overlap_last_batch = batch_summary
+        return batch_summary
+
+    def _build_rankset_task_graph(
+        self,
+        batch: List[Dict[str, object]],
+        layer_idx: int,
+        batch_plan: Dict[str, object],
+    ) -> Dict[str, object]:
+        grouped: Dict[str, Dict[str, object]] = {}
+        fallback_rankset_id = "rankset-unknown"
+        for state in batch:
+            request_id = str(state["request_id"])
+            request_ranksets = list(state.get("packing_rankset_plan", []) or [])
+            if not request_ranksets:
+                request_ranksets = [
+                    {
+                        "rankset_id": str(self._decode_state_rankset_id(state) or fallback_rankset_id),
+                        "rank_index": self._decode_state_rank_hint(state),
+                        "physical_dpus": list(self._decode_state_stripe(state)),
+                        "stripe_width": int(state.get("packing_stripe_width", 0) or 0),
+                        "transfer_granularity": str(self.clover_rankset_overlap_transfer_granularity),
+                    }
+                ]
+            for request_rankset in request_ranksets:
+                rankset_id = str(request_rankset.get("rankset_id", fallback_rankset_id))
+                work_item = grouped.get(rankset_id)
+                if work_item is None:
+                    work_item = {
+                        "work_item_id": f"layer{int(layer_idx)}:{rankset_id}",
+                        "layer_idx": int(layer_idx),
+                        "rankset_id": rankset_id,
+                        "rank_index": request_rankset.get("rank_index"),
+                        "physical_dpus": list(request_rankset.get("physical_dpus", []) or []),
+                        "stripe_width": int(request_rankset.get("stripe_width", 0) or 0),
+                        "transfer_granularity": str(
+                            request_rankset.get(
+                                "transfer_granularity",
+                                self.clover_rankset_overlap_transfer_granularity,
+                            )
+                        ),
+                        "request_ids": [],
+                        "status": "planned",
+                    }
+                    grouped[rankset_id] = work_item
+                work_item["request_ids"].append(request_id)
+
+        work_items = sorted(grouped.values(), key=lambda item: str(item["work_item_id"]))
+        if self.clover_rankset_overlap_max_ranksets_per_batch > 0:
+            work_items = work_items[: self.clover_rankset_overlap_max_ranksets_per_batch]
+        self.rankset_overlap_task_graph_layers += 1
+        self.rankset_overlap_task_graph_work_items += len(work_items)
+        self.rankset_overlap_task_graph_max_work_items = max(
+            self.rankset_overlap_task_graph_max_work_items,
+            len(work_items),
+        )
+        task_graph = {
+            "enabled": bool(self.clover_rankset_overlap_enabled),
+            "layer_idx": int(layer_idx),
+            "batch_request_ids": [str(state["request_id"]) for state in batch],
+            "transfer_granularity": str(self.clover_rankset_overlap_transfer_granularity),
+            "batch_rankset_count": int(batch_plan.get("rankset_count", 0)),
+            "work_item_count": int(len(work_items)),
+            "work_items": work_items,
+            "execution_mode": "scaffold_serial_attention",
+        }
+        self.rankset_overlap_last_task_graph = task_graph
+        return task_graph
+
+    def _record_rankset_execution(self, state: Dict[str, object], execution: Dict[str, object]) -> None:
+        execution = dict(execution or {})
+        work_item_events = list(execution.get("work_item_events", []) or [])
+        execution["work_item_events"] = work_item_events
+        state["last_rankset_execution"] = execution
+        if not work_item_events:
+            self.rankset_overlap_last_execution_summary = {
+                "request_id": str(state.get("request_id", "")),
+                "execution_mode": str(execution.get("execution_mode", "")),
+                "fallback_to_full_batch": bool(execution.get("fallback_to_full_batch", False)),
+                "fallback_reason": str(execution.get("fallback_reason", "")),
+                "executed_work_item_count": int(execution.get("executed_work_item_count", 0)),
+                "partial_ready_work_items": 0,
+                "first_work_item_completion_s": 0.0,
+                "last_work_item_completion_s": 0.0,
+                "work_item_completion_span_s": 0.0,
+                "work_item_duration_sum_s": 0.0,
+            }
+            return
+
+        self.rankset_overlap_partial_ready_reports += 1
+        self.rankset_overlap_partial_ready_work_items += len(work_item_events)
+        self.rankset_overlap_partial_ready_max_work_items = max(
+            self.rankset_overlap_partial_ready_max_work_items,
+            len(work_item_events),
+        )
+        timeline_start_at = min(float(event.get("started_at", 0.0)) for event in work_item_events)
+        first_finished_at = min(float(event.get("finished_at", timeline_start_at)) for event in work_item_events)
+        last_finished_at = max(float(event.get("finished_at", timeline_start_at)) for event in work_item_events)
+        completion_span_s = max(0.0, last_finished_at - first_finished_at)
+        first_completion_s = max(0.0, first_finished_at - timeline_start_at)
+        last_completion_s = max(0.0, last_finished_at - timeline_start_at)
+        duration_sum_s = sum(max(0.0, float(event.get("duration_s", 0.0))) for event in work_item_events)
+        self.rankset_overlap_first_work_item_completion_s_total += first_completion_s
+        self.rankset_overlap_first_work_item_completion_s_count += 1
+        self.rankset_overlap_last_work_item_completion_s_total += last_completion_s
+        self.rankset_overlap_last_work_item_completion_s_count += 1
+        self.rankset_overlap_work_item_span_s_total += completion_span_s
+        self.rankset_overlap_work_item_span_s_count += 1
+        self.rankset_overlap_work_item_duration_s_total += duration_sum_s
+        self.rankset_overlap_work_item_duration_s_count += len(work_item_events)
+        self.rankset_overlap_last_execution_summary = {
+            "request_id": str(state.get("request_id", "")),
+            "execution_mode": str(execution.get("execution_mode", "")),
+            "fallback_to_full_batch": bool(execution.get("fallback_to_full_batch", False)),
+            "fallback_reason": str(execution.get("fallback_reason", "")),
+            "executed_work_item_count": int(execution.get("executed_work_item_count", 0)),
+            "partial_ready_work_items": int(len(work_item_events)),
+            "timeline_start_at": float(timeline_start_at),
+            "first_work_item_completion_s": float(first_completion_s),
+            "last_work_item_completion_s": float(last_completion_s),
+            "work_item_completion_span_s": float(completion_span_s),
+            "work_item_duration_sum_s": float(duration_sum_s),
+            "work_item_ids": [str(event.get("work_item_id", "")) for event in work_item_events],
+        }
+
+    def _predictive_context_bucket(self, context_len: int) -> int:
+        bucket = int(self.clover_predictive_scheduling_context_bucket_tokens)
+        context_len = max(1, int(context_len))
+        return ((context_len + bucket - 1) // bucket) * bucket
+
+    def _predictive_feature_keys(self, state: Dict[str, object]) -> list[tuple[str, int, int]]:
+        context_bucket = self._predictive_context_bucket(self._decode_state_context_len(state))
+        stripe_width = max(1, int(state.get("packing_stripe_width", 0) or 1))
+        return [
+            ("exact", context_bucket, stripe_width),
+            ("context", context_bucket, 0),
+            ("global", 0, 0),
+        ]
+
+    def _update_predictive_component(
+        self,
+        component: str,
+        state: Dict[str, object],
+        observed_s: float,
+    ) -> None:
+        observed_s = max(0.0, float(observed_s))
+        model = self._predictive_models[component]
+        alpha = float(self.clover_predictive_scheduling_alpha)
+        for key in self._predictive_feature_keys(state):
+            entry = model.get(key)
+            if entry is None:
+                model[key] = {
+                    "avg_s": observed_s,
+                    "count": 1.0,
+                }
+                continue
+            entry["avg_s"] = (1.0 - alpha) * float(entry.get("avg_s", observed_s)) + alpha * observed_s
+            entry["count"] = float(entry.get("count", 0.0)) + 1.0
+
+    def _lookup_predictive_component(
+        self,
+        component: str,
+        state: Dict[str, object],
+    ) -> tuple[float | None, int, str]:
+        model = self._predictive_models[component]
+        for level, context_bucket, stripe_width in self._predictive_feature_keys(state):
+            entry = model.get((level, context_bucket, stripe_width))
+            if entry is None:
+                continue
+            return (
+                float(entry.get("avg_s", 0.0)),
+                int(entry.get("count", 0.0)),
+                str(level),
+            )
+        return (None, 0, "missing")
+
+    def _predictive_state_costs(self, state: Dict[str, object]) -> Dict[str, object] | None:
+        dense_avg, dense_count, dense_level = self._lookup_predictive_component("dense", state)
+        attention_avg, attention_count, attention_level = self._lookup_predictive_component("attention", state)
+        if dense_avg is None or attention_avg is None:
+            return None
+        ready = (
+            dense_count >= self.clover_predictive_scheduling_min_samples
+            and attention_count >= self.clover_predictive_scheduling_min_samples
+        )
+        if ready:
+            self.predictive_ready_requests += 1
+        else:
+            self.predictive_unready_requests += 1
+        return {
+            "dense_s": float(dense_avg),
+            "attention_s": float(attention_avg),
+            "dense_count": int(dense_count),
+            "attention_count": int(attention_count),
+            "dense_level": dense_level,
+            "attention_level": attention_level,
+            "ready": bool(ready),
+        }
+
+    def _predictive_batch_candidate_score(
+        self,
+        seed_state: Dict[str, object],
+        selected_states: List[Dict[str, object]],
+        candidate_state: Dict[str, object],
+        queue_index: int,
+    ) -> tuple[float, float, float, int, int, int, int] | None:
+        predicted_items = []
+        for state in [*selected_states, candidate_state]:
+            predicted = self._predictive_state_costs(state)
+            if predicted is None or not bool(predicted["ready"]):
+                return None
+            predicted_items.append(predicted)
+
+        dense_total = sum(float(item["dense_s"]) for item in predicted_items)
+        attention_total = sum(float(item["attention_s"]) for item in predicted_items)
+        device_bubble = abs(dense_total - attention_total)
+        device_diffs = [float(item["dense_s"]) - float(item["attention_s"]) for item in predicted_items]
+        diff_spread = max(device_diffs) - min(device_diffs) if device_diffs else 0.0
+        rank_penalty, stripe_penalty, context_gap, width_gap, _ = self._decode_batch_candidate_score(
+            seed_state,
+            candidate_state,
+            queue_index,
+        )
+        predicted_batch_cost = max(dense_total, attention_total)
+        return (
+            float(predicted_batch_cost),
+            float(device_bubble),
+            float(diff_spread),
+            int(rank_penalty),
+            int(stripe_penalty),
+            int(context_gap + width_gap),
+            int(queue_index),
+        )
+
+    def _record_predictive_batch(self, batch: List[Dict[str, object]], predictive_used: bool) -> None:
+        batch_summary = {
+            "enabled": bool(self.clover_predictive_scheduling_enabled),
+            "used": bool(predictive_used),
+            "request_ids": [str(state["request_id"]) for state in batch],
+            "context_lens": [int(self._decode_state_context_len(state)) for state in batch],
+            "rank_hints": [
+                None if self._decode_state_rank_hint(state) is None else int(self._decode_state_rank_hint(state))
+                for state in batch
+            ],
+            "stripe_widths": [int(state.get("packing_stripe_width", 0)) for state in batch],
+        }
+        if predictive_used:
+            predicted_states = [self._predictive_state_costs(state) for state in batch]
+            if all(item is not None for item in predicted_states):
+                dense_total = sum(float(item["dense_s"]) for item in predicted_states if item is not None)
+                attention_total = sum(float(item["attention_s"]) for item in predicted_states if item is not None)
+                batch_summary["predicted_dense_s"] = float(dense_total)
+                batch_summary["predicted_attention_s"] = float(attention_total)
+                batch_summary["predicted_bubble_s"] = float(abs(dense_total - attention_total))
+                batch_summary["prediction_levels"] = [
+                    {
+                        "dense": str(item["dense_level"]),
+                        "attention": str(item["attention_level"]),
+                    }
+                    for item in predicted_states
+                    if item is not None
+                ]
+        self.predictive_last_batch = batch_summary
 
     def _decode_batch_candidate_score(
         self,
@@ -229,6 +606,7 @@ class GlobalScheduler:
         if batch_size >= len(self._decode_pending_queue):
             batch = list(self._decode_pending_queue)
             self._decode_pending_queue.clear()
+            self._record_predictive_batch(batch, predictive_used=False)
             context_lens = [self._decode_state_context_len(state) for state in batch]
             if context_lens:
                 self.decode_continuous_batch_total_context_span += max(context_lens) - min(context_lens)
@@ -247,18 +625,40 @@ class GlobalScheduler:
         queue_items = list(self._decode_pending_queue)
         seed_state = queue_items[0]
         selected_indices = [0]
-        scored_candidates = sorted(
-            [
-                (
-                    self._decode_batch_candidate_score(seed_state, candidate_state, queue_index),
-                    queue_index,
+        selected_states = [seed_state]
+        predictive_used = False
+        while len(selected_indices) < batch_size:
+            predictive_candidates = []
+            heuristic_candidates = []
+            selected_index_set = set(selected_indices)
+            for queue_index, candidate_state in enumerate(queue_items[1:], start=1):
+                if queue_index in selected_index_set:
+                    continue
+                heuristic_candidates.append(
+                    (
+                        self._decode_batch_candidate_score(seed_state, candidate_state, queue_index),
+                        queue_index,
+                    )
                 )
-                for queue_index, candidate_state in enumerate(queue_items[1:], start=1)
-            ],
-            key=lambda item: item[0],
-        )
-        for _, queue_index in scored_candidates[: max(0, batch_size - 1)]:
-            selected_indices.append(int(queue_index))
+                if self.clover_predictive_scheduling_enabled:
+                    predictive_score = self._predictive_batch_candidate_score(
+                        seed_state,
+                        selected_states,
+                        candidate_state,
+                        queue_index,
+                    )
+                    if predictive_score is not None:
+                        predictive_candidates.append((predictive_score, queue_index))
+
+            if self.clover_predictive_scheduling_enabled and predictive_candidates:
+                predictive_candidates.sort(key=lambda item: item[0])
+                chosen_index = int(predictive_candidates[0][1])
+                predictive_used = True
+            else:
+                heuristic_candidates.sort(key=lambda item: item[0])
+                chosen_index = int(heuristic_candidates[0][1])
+            selected_indices.append(chosen_index)
+            selected_states.append(queue_items[chosen_index])
 
         selected_index_set = set(selected_indices)
         batch = [queue_items[idx] for idx in selected_indices]
@@ -267,6 +667,11 @@ class GlobalScheduler:
             for idx, item in enumerate(queue_items)
             if idx not in selected_index_set
         )
+        if self.clover_predictive_scheduling_enabled and predictive_used:
+            self.predictive_batch_decisions += 1
+        elif self.clover_predictive_scheduling_enabled:
+            self.predictive_batch_fallbacks += 1
+        self._record_predictive_batch(batch, predictive_used=predictive_used)
 
         if any(idx != expected for expected, idx in enumerate(selected_indices)):
             self.decode_continuous_batch_reordered_flushes += 1
@@ -605,6 +1010,7 @@ class GlobalScheduler:
 
         attention = self.attention_nodes[0]
         dense = self.decode_dense_nodes[0]
+        rankset_overlap_plan = self._plan_rankset_overlap_batch(batch)
         positions = [int(state["prompt_len"]) + int(state["step"]) - 1 for state in batch]
         token_ids = [int(state["current_token"]) for state in batch]
         request_ids = [str(state["request_id"]) for state in batch]
@@ -625,6 +1031,7 @@ class GlobalScheduler:
 
         for layer_idx in range(self.runtime_model_spec["num_layers"]):
             context_lens = [int(state["prompt_len"]) + int(state["step"]) for state in batch]
+            rankset_task_graph = self._build_rankset_task_graph(batch, layer_idx, rankset_overlap_plan)
 
             rpc_started = time.perf_counter()
             prepared_items = await dense.prepare_attention_batch.remote(
@@ -635,6 +1042,9 @@ class GlobalScheduler:
             )
             prepare_rpc_s = time.perf_counter() - rpc_started
             for state, prepared in zip(batch, prepared_items):
+                prepared["rankset_overlap_plan"] = dict(rankset_overlap_plan)
+                prepared["rankset_task_graph"] = dict(rankset_task_graph)
+                prepared["request_rankset_plan"] = list(state.get("packing_rankset_plan", []) or [])
                 state["stage_timing"]["counts"]["decode_layers"] += 1
                 state["stage_timing"]["scheduler"]["prepare_attention_rpc_s"] += (
                     prepare_rpc_s / max(len(batch), 1)
@@ -653,6 +1063,10 @@ class GlobalScheduler:
                 )
                 state["stage_timing"]["actors"]["attention_decode_compute_s"] += float(
                     result.get("profile", {}).get("compute_s", 0.0)
+                )
+                self._record_rankset_execution(
+                    state,
+                    dict(result.get("rankset_execution", {}) or {}),
                 )
                 contexts.append(result["context"])
 
@@ -699,6 +1113,30 @@ class GlobalScheduler:
             next_token = int(state["current_token"])
             max_tokens = int(state["max_tokens"])
             total_tokens = len(state["generated_ids"])
+            dense_step_s = (
+                float(state["stage_timing"]["scheduler"]["start_token_rpc_s"])
+                + float(state["stage_timing"]["actors"]["dense_start_token_compute_s"])
+                + float(state["stage_timing"]["scheduler"]["prepare_attention_rpc_s"])
+                + float(state["stage_timing"]["actors"]["dense_prepare_attention_compute_s"])
+                + float(state["stage_timing"]["scheduler"]["finish_layer_rpc_s"])
+                + float(state["stage_timing"]["actors"]["dense_finish_layer_compute_s"])
+                + float(state["stage_timing"]["scheduler"]["sample_next_token_rpc_s"])
+                + float(state["stage_timing"]["actors"]["dense_sample_next_token_compute_s"])
+            ) - float(state.get("_predictive_dense_accum_s", 0.0))
+            attention_step_s = (
+                float(state["stage_timing"]["scheduler"]["attention_decode_rpc_s"])
+                + float(state["stage_timing"]["actors"]["attention_decode_compute_s"])
+            ) - float(state.get("_predictive_attention_accum_s", 0.0))
+            state["_predictive_dense_accum_s"] = (
+                float(state.get("_predictive_dense_accum_s", 0.0)) + max(0.0, dense_step_s)
+            )
+            state["_predictive_attention_accum_s"] = (
+                float(state.get("_predictive_attention_accum_s", 0.0)) + max(0.0, attention_step_s)
+            )
+            if self.clover_predictive_scheduling_enabled:
+                self._update_predictive_component("dense", state, dense_step_s)
+                self._update_predictive_component("attention", state, attention_step_s)
+                self.predictive_model_updates += 1
             if next_token == 2 or total_tokens >= max_tokens:
                 self._track_background_completion(self._complete_decode_state(state))
             else:
@@ -839,6 +1277,66 @@ class GlobalScheduler:
                 ),
                 "target_size": int(self._decode_continuous_batch_target_size()),
                 "pending": len(self._decode_pending_queue),
+                "predictive_enabled": bool(self.clover_predictive_scheduling_enabled),
+                "predictive_batch_decisions": int(self.predictive_batch_decisions),
+                "predictive_batch_fallbacks": int(self.predictive_batch_fallbacks),
+                "predictive_model_updates": int(self.predictive_model_updates),
+                "predictive_ready_requests": int(self.predictive_ready_requests),
+                "predictive_unready_requests": int(self.predictive_unready_requests),
+                "predictive_context_bucket_tokens": int(self.clover_predictive_scheduling_context_bucket_tokens),
+                "predictive_min_samples": int(self.clover_predictive_scheduling_min_samples),
+                "predictive_alpha": float(self.clover_predictive_scheduling_alpha),
+                "predictive_last_batch": dict(self.predictive_last_batch),
+            }
+            metrics["scheduler_rankset_overlap"] = {
+                "enabled": bool(self.clover_rankset_overlap_enabled),
+                "transfer_granularity": str(self.clover_rankset_overlap_transfer_granularity),
+                "max_ranksets_per_batch": int(self.clover_rankset_overlap_max_ranksets_per_batch),
+                "plan_batches": int(self.rankset_overlap_plan_batches),
+                "plan_items": int(self.rankset_overlap_plan_items),
+                "plan_ranksets": int(self.rankset_overlap_plan_ranksets),
+                "plan_max_ranksets": int(self.rankset_overlap_plan_max_ranksets),
+                "same_rankset_batches": int(self.rankset_overlap_plan_same_rankset_batches),
+                "mixed_rankset_batches": int(self.rankset_overlap_plan_mixed_rankset_batches),
+                "task_graph_layers": int(self.rankset_overlap_task_graph_layers),
+                "task_graph_work_items": int(self.rankset_overlap_task_graph_work_items),
+                "task_graph_max_work_items": int(self.rankset_overlap_task_graph_max_work_items),
+                "partial_ready_reports": int(self.rankset_overlap_partial_ready_reports),
+                "partial_ready_work_items": int(self.rankset_overlap_partial_ready_work_items),
+                "partial_ready_max_work_items": int(self.rankset_overlap_partial_ready_max_work_items),
+                "avg_first_work_item_completion_s": (
+                    float(self.rankset_overlap_first_work_item_completion_s_total)
+                    / float(self.rankset_overlap_first_work_item_completion_s_count)
+                    if self.rankset_overlap_first_work_item_completion_s_count > 0
+                    else 0.0
+                ),
+                "avg_last_work_item_completion_s": (
+                    float(self.rankset_overlap_last_work_item_completion_s_total)
+                    / float(self.rankset_overlap_last_work_item_completion_s_count)
+                    if self.rankset_overlap_last_work_item_completion_s_count > 0
+                    else 0.0
+                ),
+                "avg_work_item_completion_span_s": (
+                    float(self.rankset_overlap_work_item_span_s_total)
+                    / float(self.rankset_overlap_work_item_span_s_count)
+                    if self.rankset_overlap_work_item_span_s_count > 0
+                    else 0.0
+                ),
+                "avg_work_item_duration_s": (
+                    float(self.rankset_overlap_work_item_duration_s_total)
+                    / float(self.rankset_overlap_work_item_duration_s_count)
+                    if self.rankset_overlap_work_item_duration_s_count > 0
+                    else 0.0
+                ),
+                "avg_ranksets_per_batch": (
+                    float(self.rankset_overlap_plan_ranksets) / float(self.rankset_overlap_plan_batches)
+                    if self.rankset_overlap_plan_batches > 0
+                    else 0.0
+                ),
+                "last_batch": dict(self.rankset_overlap_last_batch),
+                "last_task_graph": dict(self.rankset_overlap_last_task_graph),
+                "last_execution_summary": dict(self.rankset_overlap_last_execution_summary),
+                "last_execution": dict(state.get("last_rankset_execution", {}) or {}),
             }
             metrics["attention_backend_before_free"] = attention_debug_before_free
             metrics["attention_backend"] = (

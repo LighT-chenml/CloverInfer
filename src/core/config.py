@@ -51,6 +51,13 @@ class ClusterConfig(BaseModel):
     clover_pim_rank_spread_alloc_experimental_enabled: bool = False
     clover_fine_head_grouping_experimental_enabled: bool = False
     clover_target_heads_per_group_experimental: int = 0
+    clover_predictive_scheduling_enabled: bool = False
+    clover_predictive_scheduling_alpha: float = 0.2
+    clover_predictive_scheduling_min_samples: int = 4
+    clover_predictive_scheduling_context_bucket_tokens: int = 256
+    clover_rankset_overlap_enabled: bool = False
+    clover_rankset_overlap_max_ranksets_per_batch: int = 0
+    clover_rankset_overlap_transfer_granularity: str = "stripe"
     decode_step_sync_window_s: float = 0.0
     decode_step_sync_max_size: int = 8
     attention_decode_wave_persist_enabled: bool = False

@@ -1,0 +1,16 @@
+{
+  "case_index": 19,
+  "case": {
+    "case_slug": "opt-125m__humaneval__p256__o16__c4",
+    "model_label": "opt-125m",
+    "model_slug": "opt-125m",
+    "model_path": "/home/cml/CloverInfer/model/opt-125m",
+    "dataset_label": "humaneval",
+    "dataset_slug": "humaneval",
+    "dataset_path": "dataset/humaneval.jsonl",
+    "dataset_format": "auto",
+    "prompt_token_length": 256,
+    "max_new_tokens": 16,
+    "concurrency": 4
+  }
+}

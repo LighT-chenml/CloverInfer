@@ -1,0 +1,78 @@
+{
+  "created_at": 1778155540.07695,
+  "output_dir": "artifacts/experiment_matrix/cloverinfer_predictive_matrix_20260507",
+  "address": "192.168.123.4:26379",
+  "cluster_layout": {
+    "prefill_ip": "192.168.123.4",
+    "decode_dense_ip": "192.168.123.3",
+    "attention_ip": "192.168.123.7",
+    "prefill_resource": "prefill_gpu",
+    "decode_dense_resource": "decode_dense_gpu",
+    "attention_resource": "attention_pim"
+  },
+  "models": [
+    {
+      "label": "opt-125m",
+      "slug": "opt-125m",
+      "path": "/home/cml/CloverInfer/model/opt-125m"
+    }
+  ],
+  "datasets": [
+    {
+      "label": "qasper",
+      "slug": "qasper",
+      "path": "dataset/longbench/qasper.jsonl",
+      "format": "auto"
+    },
+    {
+      "label": "humaneval",
+      "slug": "humaneval",
+      "path": "dataset/humaneval.jsonl",
+      "format": "auto"
+    },
+    {
+      "label": "sharegpt",
+      "slug": "sharegpt",
+      "path": "dataset/sharegpt_processed.json",
+      "format": "sharegpt_json"
+    }
+  ],
+  "prompt_token_lengths": [
+    256,
+    512
+  ],
+  "output_token_lengths": [
+    16,
+    32,
+    64
+  ],
+  "concurrency_values": [
+    4,
+    6,
+    8
+  ],
+  "limit": 8,
+  "dtype": "float16",
+  "baselines": "CloverInfer",
+  "decode_continuous_batch_window_s": 0.0,
+  "decode_continuous_batch_window_ms": 2.0,
+  "decode_continuous_batch_max_size": 3,
+  "resolved_baselines": [
+    {
+      "canonical_key": "cloverinfer",
+      "canonical_name": "CloverInfer",
+      "internal_baseline": "disagg_cloverinfer",
+      "alias_note": "CloverInfer resolves to the current disagg_cloverinfer implementation.",
+      "requested_aliases": [
+        "CloverInfer"
+      ],
+      "resolved_aliases": [
+        "cloverinfer",
+        "clover-infer",
+        "disagg_cloverinfer"
+      ]
+    }
+  ],
+  "num_cases": 54,
+  "dry_run": false
+}

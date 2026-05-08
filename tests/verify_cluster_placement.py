@@ -74,6 +74,11 @@ def parse_args():
     parser.add_argument("--clover-shadow-check-layer-interval", type=int, default=4)
     parser.add_argument("--clover-host-qk-mixed-enabled", action="store_true")
     parser.add_argument("--no-clover-host-qk-mixed-enabled", action="store_true")
+    parser.add_argument("--clover-predictive-scheduling-enabled", action="store_true")
+    parser.add_argument("--no-clover-predictive-scheduling-enabled", action="store_true")
+    parser.add_argument("--clover-predictive-scheduling-alpha", type=float, default=0.2)
+    parser.add_argument("--clover-predictive-scheduling-min-samples", type=int, default=4)
+    parser.add_argument("--clover-predictive-scheduling-context-bucket-tokens", type=int, default=256)
     parser.add_argument("--decode-step-sync-window-s", type=float, default=0.0)
     parser.add_argument("--decode-step-sync-max-size", type=int, default=8)
     parser.add_argument("--attention-decode-wave-persist-enabled", action="store_true")
@@ -107,6 +112,11 @@ def main():
         raise ValueError("cannot set both --clover-op-profiling-enabled and --no-clover-op-profiling-enabled")
     if args.clover_host_qk_mixed_enabled and args.no_clover_host_qk_mixed_enabled:
         raise ValueError("cannot set both --clover-host-qk-mixed-enabled and --no-clover-host-qk-mixed-enabled")
+    if args.clover_predictive_scheduling_enabled and args.no_clover_predictive_scheduling_enabled:
+        raise ValueError(
+            "cannot set both --clover-predictive-scheduling-enabled and "
+            "--no-clover-predictive-scheduling-enabled"
+        )
     pim_qk_mixed_enabled = True
     if args.pim_qk_mixed_enabled:
         pim_qk_mixed_enabled = True
@@ -142,6 +152,9 @@ def main():
         clover_host_qk_mixed_enabled = True
     if args.no_clover_host_qk_mixed_enabled:
         clover_host_qk_mixed_enabled = False
+    clover_predictive_scheduling_enabled = bool(args.clover_predictive_scheduling_enabled)
+    if args.no_clover_predictive_scheduling_enabled:
+        clover_predictive_scheduling_enabled = False
 
     ray.init(
         address=args.address,
@@ -211,6 +224,10 @@ def main():
         clover_shadow_check_token_interval=args.clover_shadow_check_token_interval,
         clover_shadow_check_layer_interval=args.clover_shadow_check_layer_interval,
         clover_host_qk_mixed_enabled=clover_host_qk_mixed_enabled,
+        clover_predictive_scheduling_enabled=clover_predictive_scheduling_enabled,
+        clover_predictive_scheduling_alpha=args.clover_predictive_scheduling_alpha,
+        clover_predictive_scheduling_min_samples=args.clover_predictive_scheduling_min_samples,
+        clover_predictive_scheduling_context_bucket_tokens=args.clover_predictive_scheduling_context_bucket_tokens,
     )
     model = ModelConfig(model_path=args.model, max_new_tokens=args.max_new_tokens)
 
@@ -267,6 +284,10 @@ def main():
         assert stage_timing["counts"]["decode_layers"] >= stage_timing["counts"]["decode_steps"]
         assert stage_timing["scheduler"]["total_rpc_s"] >= 0
         assert stage_timing["actors"]["total_compute_s"] >= 0
+        dense_batching = metrics["scheduler_dense_continuous_batching"]
+        if args.attention_backend == "cloverinfer":
+            assert dense_batching["predictive_enabled"] == clover_predictive_scheduling_enabled, dense_batching
+            assert "predictive_last_batch" in dense_batching, dense_batching
         if args.attention_backend in {"pim_naive", "cloverinfer"}:
             debug = metrics["attention_backend"]["backend_debug"]
             assert debug["resident_append_ops"] > 0, debug

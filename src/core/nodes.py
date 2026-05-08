@@ -109,6 +109,10 @@ class AttentionNode:
         self.decode_batch_flushes = 0
         self.decode_batch_total_items = 0
         self.decode_batch_max_observed = 0
+        self.rankset_task_graph_exec_batches = 0
+        self.rankset_task_graph_exec_work_items = 0
+        self.rankset_task_graph_exec_max_work_items = 0
+        self.rankset_task_graph_exec_fallback_batches = 0
         self._decode_batch_queue: list[tuple[dict, asyncio.Future]] = []
         self._decode_batch_task: asyncio.Task | None = None
         print(f"AttentionNode {node_id} initialized with {backend} backend")
@@ -124,6 +128,12 @@ class AttentionNode:
             "total_items": int(self.decode_batch_total_items),
             "max_observed_size": int(self.decode_batch_max_observed),
             "pending": len(self._decode_batch_queue),
+        }
+        info["rankset_task_graph_execution"] = {
+            "batches": int(self.rankset_task_graph_exec_batches),
+            "work_items": int(self.rankset_task_graph_exec_work_items),
+            "max_work_items": int(self.rankset_task_graph_exec_max_work_items),
+            "fallback_batches": int(self.rankset_task_graph_exec_fallback_batches),
         }
         if hasattr(self.backend, "get_debug_info"):
             info["backend_debug"] = self.backend.get_debug_info()
@@ -148,6 +158,171 @@ class AttentionNode:
             },
         }
 
+    def _fallback_rankset_execution(
+        self,
+        payloads,
+        execution_mode: str,
+        fallback_reason: str,
+    ):
+        started_at = time.perf_counter()
+        contexts = self.backend.decode_layer_batch(payloads)
+        per_item_compute_s = float(time.perf_counter() - started_at) / max(len(contexts), 1)
+        self.rankset_task_graph_exec_fallback_batches += 1
+        return [
+            {
+                "context": context,
+                "profile": {
+                    "compute_s": per_item_compute_s,
+                    "batch_size": len(contexts),
+                },
+                "rankset_execution": {
+                    "enabled": bool(dict(payload.get("rankset_task_graph", {}) or {}).get("enabled", False)),
+                    "layer_idx": int(payload.get("layer_idx", 0)),
+                    "request_id": str(payload.get("request_id", "")),
+                    "execution_mode": execution_mode,
+                    "work_item_count": int(dict(payload.get("rankset_task_graph", {}) or {}).get("work_item_count", 0)),
+                    "executed_work_item_ids": [],
+                    "executed_work_item_count": 0,
+                    "rankset_ids": [
+                        str(item.get("rankset_id"))
+                        for item in list(payload.get("request_rankset_plan", []) or [])
+                        if item.get("rankset_id") is not None
+                    ],
+                    "request_rankset_count": int(len(list(payload.get("request_rankset_plan", []) or []))),
+                    "fallback_to_full_batch": True,
+                    "fallback_reason": str(fallback_reason),
+                    "work_item_events": [],
+                },
+            }
+            for payload, context in zip(payloads, contexts)
+        ]
+
+    def _execute_rankset_task_graph_batch(self, payloads):
+        if not payloads:
+            return []
+        task_graph = dict(payloads[0].get("rankset_task_graph", {}) or {})
+        if not bool(task_graph.get("enabled", False)):
+            return self._fallback_rankset_execution(
+                payloads,
+                execution_mode="scaffold_serial_attention",
+                fallback_reason="task_graph_disabled",
+            )
+
+        work_items = list(task_graph.get("work_items", []) or [])
+        if not work_items:
+            return self._fallback_rankset_execution(
+                payloads,
+                execution_mode="scaffold_serial_attention",
+                fallback_reason="task_graph_empty",
+            )
+
+        payload_by_request_id = {}
+        for payload in payloads:
+            request_id = str(payload.get("request_id", ""))
+            if request_id in payload_by_request_id:
+                return self._fallback_rankset_execution(
+                    payloads,
+                    execution_mode="scaffold_serial_attention",
+                    fallback_reason="duplicate_request_id_in_payload_batch",
+                )
+            payload_by_request_id[request_id] = payload
+
+        request_to_work_items = {}
+        covered_request_ids = []
+        for work_item in work_items:
+            for request_id in work_item.get("request_ids", []) or []:
+                request_id = str(request_id)
+                request_to_work_items.setdefault(request_id, []).append(str(work_item.get("work_item_id", "")))
+                covered_request_ids.append(request_id)
+
+        payload_request_ids = set(payload_by_request_id.keys())
+        covered_request_id_set = set(covered_request_ids)
+        if payload_request_ids != covered_request_id_set:
+            return self._fallback_rankset_execution(
+                payloads,
+                execution_mode="scaffold_serial_attention",
+                fallback_reason="task_graph_request_coverage_mismatch",
+            )
+        if any(len(work_item_ids) != 1 for work_item_ids in request_to_work_items.values()):
+            return self._fallback_rankset_execution(
+                payloads,
+                execution_mode="scaffold_serial_attention",
+                fallback_reason="multi_work_item_per_request_not_supported_yet",
+            )
+
+        results_by_request_id = {}
+        executed_work_item_ids = []
+        work_item_events = []
+        self.rankset_task_graph_exec_batches += 1
+        self.rankset_task_graph_exec_work_items += len(work_items)
+        self.rankset_task_graph_exec_max_work_items = max(
+            self.rankset_task_graph_exec_max_work_items,
+            len(work_items),
+        )
+
+        for work_item in work_items:
+            work_item_id = str(work_item.get("work_item_id", ""))
+            subpayloads = [
+                payload_by_request_id[str(request_id)]
+                for request_id in work_item.get("request_ids", []) or []
+                if str(request_id) in payload_by_request_id
+            ]
+            if not subpayloads:
+                continue
+            started_at = time.perf_counter()
+            contexts = self.backend.decode_layer_batch(subpayloads)
+            finished_at = time.perf_counter()
+            batch_compute_s = float(finished_at - started_at)
+            per_item_compute_s = batch_compute_s / max(len(contexts), 1)
+            executed_work_item_ids.append(work_item_id)
+            work_item_events.append(
+                {
+                    "work_item_id": work_item_id,
+                    "layer_idx": int(work_item.get("layer_idx", 0)),
+                    "rankset_id": str(work_item.get("rankset_id", "")),
+                    "request_ids": [str(request_id) for request_id in work_item.get("request_ids", []) or []],
+                    "batch_size": int(len(subpayloads)),
+                    "started_at": float(started_at),
+                    "finished_at": float(finished_at),
+                    "duration_s": float(batch_compute_s),
+                }
+            )
+            for payload, context in zip(subpayloads, contexts):
+                request_id = str(payload.get("request_id", ""))
+                results_by_request_id[request_id] = {
+                    "context": context,
+                    "profile": {
+                        "compute_s": per_item_compute_s,
+                        "batch_size": len(subpayloads),
+                    },
+                    "rankset_execution": {
+                        "enabled": True,
+                        "layer_idx": int(payload.get("layer_idx", 0)),
+                        "request_id": request_id,
+                        "execution_mode": "rankset_task_graph_serial",
+                        "work_item_count": int(task_graph.get("work_item_count", 0)),
+                        "executed_work_item_ids": list(executed_work_item_ids),
+                        "executed_work_item_count": int(len(executed_work_item_ids)),
+                        "rankset_ids": [
+                            str(item.get("rankset_id"))
+                            for item in list(payload.get("request_rankset_plan", []) or [])
+                            if item.get("rankset_id") is not None
+                        ],
+                        "request_rankset_count": int(len(list(payload.get("request_rankset_plan", []) or []))),
+                        "fallback_to_full_batch": False,
+                        "fallback_reason": "",
+                        "work_item_events": list(work_item_events),
+                    },
+                }
+
+        if len(results_by_request_id) != len(payloads):
+            return self._fallback_rankset_execution(
+                payloads,
+                execution_mode="scaffold_serial_attention",
+                fallback_reason="task_graph_execution_incomplete",
+            )
+        return [results_by_request_id[str(payload.get("request_id", ""))] for payload in payloads]
+
     async def _flush_decode_layer_batch(self):
         try:
             if self.decode_batch_window_s > 0:
@@ -160,21 +335,11 @@ class AttentionNode:
                 self.decode_batch_flushes += 1
                 self.decode_batch_total_items += len(payloads)
                 self.decode_batch_max_observed = max(self.decode_batch_max_observed, len(payloads))
-                started_at = time.perf_counter()
                 try:
-                    contexts = self.backend.decode_layer_batch(payloads)
-                    per_item_compute_s = float(time.perf_counter() - started_at) / max(len(payloads), 1)
-                    for future, context in zip(futures, contexts):
+                    results = self._execute_rankset_task_graph_batch(payloads)
+                    for future, result in zip(futures, results):
                         if not future.done():
-                            future.set_result(
-                                {
-                                    "context": context,
-                                    "profile": {
-                                        "compute_s": per_item_compute_s,
-                                        "batch_size": len(payloads),
-                                    },
-                                }
-                            )
+                            future.set_result(result)
                 except Exception as exc:
                     for future in futures:
                         if not future.done():
@@ -212,19 +377,7 @@ class AttentionNode:
         return await future
 
     def decode_layer_batch(self, payloads):
-        started_at = time.perf_counter()
-        contexts = self.backend.decode_layer_batch(payloads)
-        per_item_compute_s = float(time.perf_counter() - started_at) / max(len(contexts), 1)
-        return [
-            {
-                "context": context,
-                "profile": {
-                    "compute_s": per_item_compute_s,
-                    "batch_size": len(contexts),
-                },
-            }
-            for context in contexts
-        ]
+        return self._execute_rankset_task_graph_batch(payloads)
 
     def get_context_len(self, request_id: str):
         return self.backend.get_context_len(request_id)

@@ -219,6 +219,42 @@ def build_case_command(args, case: Dict[str, object], output_path: str) -> List[
         "--no-clover-pim-context-fused-experimental-enabled",
         args.no_clover_pim_context_fused_experimental_enabled,
     )
+    append_optional_flag(cmd, "--clover-predictive-scheduling-enabled", args.clover_predictive_scheduling_enabled)
+    append_optional_flag(
+        cmd,
+        "--no-clover-predictive-scheduling-enabled",
+        args.no_clover_predictive_scheduling_enabled,
+    )
+    append_key_value(cmd, "--clover-predictive-scheduling-alpha", args.clover_predictive_scheduling_alpha)
+    append_key_value(
+        cmd,
+        "--clover-predictive-scheduling-min-samples",
+        args.clover_predictive_scheduling_min_samples,
+    )
+    append_key_value(
+        cmd,
+        "--clover-predictive-scheduling-context-bucket-tokens",
+        args.clover_predictive_scheduling_context_bucket_tokens,
+    )
+    append_optional_flag(cmd, "--clover-rankset-overlap-enabled", args.clover_rankset_overlap_enabled)
+    append_optional_flag(
+        cmd,
+        "--no-clover-rankset-overlap-enabled",
+        args.no_clover_rankset_overlap_enabled,
+    )
+    append_key_value(
+        cmd,
+        "--clover-rankset-overlap-max-ranksets-per-batch",
+        args.clover_rankset_overlap_max_ranksets_per_batch,
+    )
+    append_key_value(
+        cmd,
+        "--clover-rankset-overlap-transfer-granularity",
+        args.clover_rankset_overlap_transfer_granularity,
+    )
+    append_key_value(cmd, "--decode-continuous-batch-window-s", args.decode_continuous_batch_window_s)
+    append_key_value(cmd, "--decode-continuous-batch-window-ms", args.decode_continuous_batch_window_ms)
+    append_key_value(cmd, "--decode-continuous-batch-max-size", args.decode_continuous_batch_max_size)
     return cmd
 
 
@@ -330,6 +366,22 @@ def main():
     parser.add_argument("--no-clover-host-qk-mixed-enabled", action="store_true")
     parser.add_argument("--clover-pim-context-fused-experimental-enabled", action="store_true")
     parser.add_argument("--no-clover-pim-context-fused-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-predictive-scheduling-enabled", action="store_true")
+    parser.add_argument("--no-clover-predictive-scheduling-enabled", action="store_true")
+    parser.add_argument("--clover-predictive-scheduling-alpha", type=float, default=0.2)
+    parser.add_argument("--clover-predictive-scheduling-min-samples", type=int, default=4)
+    parser.add_argument("--clover-predictive-scheduling-context-bucket-tokens", type=int, default=256)
+    parser.add_argument("--clover-rankset-overlap-enabled", action="store_true")
+    parser.add_argument("--no-clover-rankset-overlap-enabled", action="store_true")
+    parser.add_argument("--clover-rankset-overlap-max-ranksets-per-batch", type=int, default=0)
+    parser.add_argument(
+        "--clover-rankset-overlap-transfer-granularity",
+        default="stripe",
+        choices=["stripe", "rankset"],
+    )
+    parser.add_argument("--decode-continuous-batch-window-s", type=float, default=0.0)
+    parser.add_argument("--decode-continuous-batch-window-ms", type=float, default=0.0)
+    parser.add_argument("--decode-continuous-batch-max-size", type=int, default=8)
     parser.add_argument("--output-dir", default=os.path.join(REPO_ROOT, "artifacts", "experiment_matrix"))
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--continue-on-error", action="store_true")
@@ -368,6 +420,12 @@ def main():
         "limit": int(args.limit),
         "dtype": args.dtype,
         "baselines": args.baselines,
+        "clover_rankset_overlap_enabled": bool(args.clover_rankset_overlap_enabled),
+        "clover_rankset_overlap_max_ranksets_per_batch": int(args.clover_rankset_overlap_max_ranksets_per_batch),
+        "clover_rankset_overlap_transfer_granularity": str(args.clover_rankset_overlap_transfer_granularity),
+        "decode_continuous_batch_window_s": float(args.decode_continuous_batch_window_s),
+        "decode_continuous_batch_window_ms": float(args.decode_continuous_batch_window_ms),
+        "decode_continuous_batch_max_size": int(args.decode_continuous_batch_max_size),
         "resolved_baselines": baseline_specs,
         "num_cases": len(case_configs),
         "dry_run": bool(args.dry_run),
