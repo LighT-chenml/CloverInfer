@@ -2828,7 +2828,6 @@ class UpmemKVSlotStore(ResidentKVStore):
 
         outputs: list[torch.Tensor | None] = [None for _ in slot_queries]
         dpu_entries: list[Dict[str, object]] = []
-        grouped_dpu_entries: list[Dict[str, object]] = []
         host_fallback_queries: list[tuple[int, tuple[str, str, list[int], int, torch.Tensor]]] = []
         segmented_outputs: Dict[int, list[tuple[int, torch.Tensor]]] = {}
 
@@ -2842,61 +2841,37 @@ class UpmemKVSlotStore(ResidentKVStore):
                 if actual_window <= 0:
                     outputs[idx] = torch.empty((len(local_head_indices), 0), dtype=torch.float32)
                     continue
-                per_dpu_grouped: Dict[int, list[tuple[int, int, list[int], torch.Tensor, int]]] = {}
                 for segment_ordinal, (block, take_len) in enumerate(self._active_block_plan(slot_info, actual_window)):
+                    # Keep segmented raw-score QK requests ungrouped even when
+                    # multiple active blocks land on the same physical DPU.
+                    #
+                    # The UPMEM grouped-qk helper path is currently unstable
+                    # once decode growth creates a base+growth block mix on the
+                    # same DPU. Launching each segment independently preserves
+                    # correctness, and we still concatenate the per-segment
+                    # score tiles in host order below.
                     physical_dpu = int(block["physical_dpu"])
                     normalized_local_head_indices = [int(v) for v in local_head_indices]
-                    per_dpu_grouped.setdefault(physical_dpu, []).append(
-                        (
-                            int(block["slot_id"]),
-                            int(take_len),
-                            normalized_local_head_indices,
-                            queries,
-                            int(segment_ordinal),
-                        )
+                    dpu_entries.append(
+                        {
+                            "payload": (
+                                int(block["slot_id"]),
+                                normalized_local_head_indices,
+                                int(take_len),
+                                queries,
+                            ),
+                            "physical_dpu": int(physical_dpu),
+                            "shape_key": (
+                                len(normalized_local_head_indices),
+                                int(take_len),
+                                int(queries.shape[1]),
+                            ),
+                            "slot_id": int(block["slot_id"]),
+                            "logical_idx": int(idx),
+                            "segment_ordinal": int(segment_ordinal),
+                            "ref_kind": "segmented",
+                        }
                     )
-                for physical_dpu, group_items in per_dpu_grouped.items():
-                    if len(group_items) > 1:
-                        grouped_dpu_entries.append(
-                            {
-                                "payload": [
-                                    (slot_id, take_len, segment_local_head_indices, segment_queries)
-                                    for slot_id, take_len, segment_local_head_indices, segment_queries, _ in group_items
-                                ],
-                                "physical_dpu": int(physical_dpu),
-                                "shape_key": (
-                                    len(group_items[0][2]),
-                                    sum(int(take_len) for _, take_len, _, _, _ in group_items),
-                                    int(group_items[0][3].shape[1]),
-                                ),
-                                "slot_id": int(group_items[0][0]),
-                                "logical_idx": int(idx),
-                                "segment_ordinal": min(int(segment_ordinal) for _, _, _, _, segment_ordinal in group_items),
-                                "ref_kind": "segmented_grouped",
-                            }
-                        )
-                    else:
-                        slot_id, take_len, segment_local_head_indices, segment_queries, segment_ordinal = group_items[0]
-                        dpu_entries.append(
-                            {
-                                "payload": (
-                                    int(slot_id),
-                                    segment_local_head_indices,
-                                    int(take_len),
-                                    segment_queries,
-                                ),
-                                "physical_dpu": int(physical_dpu),
-                                "shape_key": (
-                                    len(segment_local_head_indices),
-                                    int(take_len),
-                                    int(segment_queries.shape[1]),
-                                ),
-                                "slot_id": int(slot_id),
-                                "logical_idx": int(idx),
-                                "segment_ordinal": int(segment_ordinal),
-                                "ref_kind": "segmented",
-                            }
-                        )
             elif slot_info["backend"] == "dpu":
                 actual_window = min(int(window), int(slot_info["seq_len"]))
                 dpu_entries.append(
@@ -2931,58 +2906,6 @@ class UpmemKVSlotStore(ResidentKVStore):
             self.batch_item_totals["qk_slot_scores_batch_host_fallback_items"] += len(host_fallback_queries)
             for (idx, _), output in zip(host_fallback_queries, host_outputs):
                 outputs[idx] = output
-
-        if grouped_dpu_entries:
-            ordered_grouped_entries = sorted(
-                grouped_dpu_entries,
-                key=lambda item: self._helper_submit_sort_key(
-                    physical_dpu=int(item["physical_dpu"]),
-                    shape_key=tuple(item["shape_key"]),
-                    slot_id=int(item["slot_id"]),
-                    logical_idx=int(item["logical_idx"]),
-                    segment_ordinal=int(item["segment_ordinal"]),
-                ),
-            )
-            try:
-                dpu_started_at = time.perf_counter()
-                grouped_outputs = self.helper.qk_slot_scores_grouped_batch(
-                    [item["payload"] for item in ordered_grouped_entries]
-                )
-                self._record_timing("qk_slot_scores_batch_dpu", dpu_started_at)
-                self.batch_item_totals["qk_slot_scores_batch_dpu_items"] += len(ordered_grouped_entries)
-                for entry, scores in zip(ordered_grouped_entries, grouped_outputs):
-                    segmented_outputs.setdefault(int(entry["logical_idx"]), []).append(
-                        (int(entry["segment_ordinal"]), scores)
-                    )
-            except RuntimeError:
-                for entry in ordered_grouped_entries:
-                    base_segment_ordinal = int(entry["segment_ordinal"])
-                    for segment_offset, (
-                        slot_id,
-                        take_len,
-                        segment_local_head_indices,
-                        segment_queries,
-                    ) in enumerate(entry["payload"]):
-                        dpu_entries.append(
-                            {
-                                "payload": (
-                                    int(slot_id),
-                                    [int(v) for v in segment_local_head_indices],
-                                    int(take_len),
-                                    segment_queries,
-                                ),
-                                "physical_dpu": int(entry["physical_dpu"]),
-                                "shape_key": (
-                                    len(segment_local_head_indices),
-                                    int(take_len),
-                                    int(segment_queries.shape[1]),
-                                ),
-                                "slot_id": int(slot_id),
-                                "logical_idx": int(entry["logical_idx"]),
-                                "segment_ordinal": base_segment_ordinal + int(segment_offset),
-                                "ref_kind": "segmented",
-                            }
-                        )
 
         if dpu_entries:
             ordered_entries = sorted(
