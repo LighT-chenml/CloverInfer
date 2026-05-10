@@ -1704,6 +1704,9 @@ class GlobalScheduler:
                         "pim_rank_spread_alloc_experimental_enabled": bool(
                             self.cluster_config.clover_pim_rank_spread_alloc_experimental_enabled
                         ),
+                        "pim_slot_spill_alloc_experimental_enabled": bool(
+                            self.cluster_config.clover_pim_slot_spill_alloc_experimental_enabled
+                        ),
                         "fine_head_grouping_experimental_enabled": bool(
                             self.cluster_config.clover_fine_head_grouping_experimental_enabled
                         ),

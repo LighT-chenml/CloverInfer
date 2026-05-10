@@ -32,6 +32,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         pim_attention_enabled: bool = False,
         pim_context_fused_experimental_enabled: bool = False,
         pim_rank_spread_alloc_experimental_enabled: bool = False,
+        pim_slot_spill_alloc_experimental_enabled: bool = False,
         fine_head_grouping_experimental_enabled: bool = False,
         target_heads_per_group_experimental: int = 0,
         **kwargs,
@@ -46,6 +47,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         self.pim_attention_enabled = bool(pim_attention_enabled)
         self.pim_context_fused_experimental_enabled = bool(pim_context_fused_experimental_enabled)
         self.pim_rank_spread_alloc_experimental_enabled = bool(pim_rank_spread_alloc_experimental_enabled)
+        self.pim_slot_spill_alloc_experimental_enabled = bool(pim_slot_spill_alloc_experimental_enabled)
         self.fine_head_grouping_experimental_enabled = bool(fine_head_grouping_experimental_enabled)
         self.target_heads_per_group_experimental = max(0, int(target_heads_per_group_experimental))
         self.backend_variant = "cloverinfer"
@@ -90,6 +92,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                 context_fused_enabled=self.pim_context_fused_experimental_enabled,
                 shape_rounds_enabled=self.fine_head_grouping_experimental_enabled,
                 rank_spread_alloc_enabled=self.pim_rank_spread_alloc_experimental_enabled,
+                slot_spill_alloc_enabled=self.pim_slot_spill_alloc_experimental_enabled,
             )
 
     def _timed(self, name: str):
@@ -682,6 +685,30 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                 self.qk_check_failures += 1
                 raise
 
+    def _compute_host_context_fallback(
+        self,
+        record: Dict[str, object],
+        reason: str,
+    ) -> None:
+        if record.get("keys") is None or record.get("values") is None:
+            with self._timed("resident_materialize_s"):
+                record["keys"], record["values"] = self._materialize_layer_kv(
+                    record["request_state"],
+                    record["layer_idx"],
+                )
+        if record.get("scores") is None:
+            record["scores"] = self._compute_host_scores(record)
+        with self._timed("softmax_av_s"):
+            weights = torch.softmax(record["scores"], dim=-1)
+        with self._timed("host_context_compute_s"):
+            record["context"] = torch.einsum(
+                "hl,lhd->hd",
+                weights,
+                record["values"].float(),
+            ).to(record["query_dtype"])
+        self.resident_runtime_fallbacks += 1
+        self.resident_runtime_fallback_reason = str(reason)
+
     def _finalize_decode_records(self, records: List[Dict[str, object]]) -> List[torch.Tensor]:
         with self._timed("finalize_decode_records_s"):
             outputs: List[torch.Tensor] = []
@@ -697,6 +724,12 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                         (k_slot, v_slot, score_mat.contiguous())
                         for k_slot, v_slot, score_mat in record.get("resident_slot_scores", [])
                     ]
+                    if not slot_scores:
+                        self._compute_host_context_fallback(
+                            record,
+                            "missing_resident_slot_scores_before_fused_av",
+                        )
+                        continue
                     flat_slot_scores.extend(slot_scores)
                     slot_score_refs.append((record_idx, len(slot_scores)))
                     if record.get("should_shadow_check", False) and record["values"] is not None:
@@ -775,6 +808,11 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
 
             for record in records:
                 record.pop("resident_slot_scores", None)
+                if "context" not in record:
+                    self._compute_host_context_fallback(
+                        record,
+                        "missing_context_after_resident_av",
+                    )
                 if self.cpu_shadow_enabled:
                     if record["layer_idx"] == record["request_state"].num_layers - 1:
                         self.cpu_backend.context_lens[record["request_id"]] += 1

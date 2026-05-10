@@ -133,3 +133,30 @@ def test_partial_reduce_uses_cpp_module_when_available():
     merged = UpmemKVSlotStore._merge_partial_contexts(store, entries, outputs)
     assert 0 in merged
     assert merged[0].shape == (1, 2)
+
+
+def test_slot_capacity_choice_spills_outside_full_allowed_stripe():
+    store = object.__new__(UpmemKVSlotStore)
+    store.num_dpus = 4
+    store.POOL_CAPACITY_ELEMS = 1024
+    store.dpu_live_elems_by_dpu = [0, 0, 0, 0]
+    store._next_slot_seq_by_dpu = [64, 64, 0, 0]
+    store._free_slot_ids_by_dpu = [[], [], [], []]
+    store._helper_topology_cache = {}
+    store.slot_spill_alloc_enabled = True
+    store.slot_spill_allocations = 0
+
+    class _Helper:
+        MAX_SLOTS_PER_DPU = 64
+
+    store.helper = _Helper()
+
+    chosen = UpmemKVSlotStore._choose_physical_dpu_with_slot_capacity(
+        store,
+        preferred_dpu=0,
+        elem_count=1,
+        allowed_dpus=[0, 1],
+    )
+
+    assert chosen in {2, 3}
+    assert store.slot_spill_allocations == 1

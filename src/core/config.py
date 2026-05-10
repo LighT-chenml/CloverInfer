@@ -49,6 +49,7 @@ class ClusterConfig(BaseModel):
     clover_pim_attention_enabled: bool = False
     clover_pim_context_fused_experimental_enabled: bool = False
     clover_pim_rank_spread_alloc_experimental_enabled: bool = False
+    clover_pim_slot_spill_alloc_experimental_enabled: bool = False
     clover_fine_head_grouping_experimental_enabled: bool = False
     clover_target_heads_per_group_experimental: int = 0
     clover_host_partial_reduce_enabled: bool = True

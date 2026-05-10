@@ -445,6 +445,16 @@ def make_cluster_config(args, attention_backend: str) -> ClusterConfig:
         clover_host_qk_mixed_enabled=args.clover_host_qk_mixed_enabled,
         clover_pim_attention_enabled=(attention_backend == "cloverinfer"),
         clover_pim_context_fused_experimental_enabled=args.clover_pim_context_fused_experimental_enabled,
+        clover_pim_rank_spread_alloc_experimental_enabled=(
+            args.clover_pim_rank_spread_alloc_experimental_enabled if attention_backend == "cloverinfer" else False
+        ),
+        clover_pim_slot_spill_alloc_experimental_enabled=(
+            args.clover_pim_slot_spill_alloc_experimental_enabled if attention_backend == "cloverinfer" else False
+        ),
+        clover_fine_head_grouping_experimental_enabled=(
+            args.clover_fine_head_grouping_experimental_enabled if attention_backend == "cloverinfer" else False
+        ),
+        clover_target_heads_per_group_experimental=args.clover_target_heads_per_group_experimental,
         clover_predictive_scheduling_enabled=(
             args.clover_predictive_scheduling_enabled if attention_backend == "cloverinfer" else False
         ),
@@ -698,6 +708,13 @@ def main():
     parser.add_argument("--no-clover-host-qk-mixed-enabled", action="store_true")
     parser.add_argument("--clover-pim-context-fused-experimental-enabled", action="store_true")
     parser.add_argument("--no-clover-pim-context-fused-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-pim-rank-spread-alloc-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-rank-spread-alloc-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-pim-slot-spill-alloc-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-slot-spill-alloc-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-fine-head-grouping-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-fine-head-grouping-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-target-heads-per-group-experimental", type=int, default=0)
     parser.add_argument("--clover-predictive-scheduling-enabled", action="store_true")
     parser.add_argument("--no-clover-predictive-scheduling-enabled", action="store_true")
     parser.add_argument("--clover-predictive-scheduling-alpha", type=float, default=0.2)
@@ -764,6 +781,30 @@ def main():
         raise ValueError(
             "cannot set both --clover-pim-context-fused-experimental-enabled and "
             "--no-clover-pim-context-fused-experimental-enabled"
+        )
+    if (
+        args.clover_pim_rank_spread_alloc_experimental_enabled
+        and args.no_clover_pim_rank_spread_alloc_experimental_enabled
+    ):
+        raise ValueError(
+            "cannot set both --clover-pim-rank-spread-alloc-experimental-enabled and "
+            "--no-clover-pim-rank-spread-alloc-experimental-enabled"
+        )
+    if (
+        args.clover_pim_slot_spill_alloc_experimental_enabled
+        and args.no_clover_pim_slot_spill_alloc_experimental_enabled
+    ):
+        raise ValueError(
+            "cannot set both --clover-pim-slot-spill-alloc-experimental-enabled and "
+            "--no-clover-pim-slot-spill-alloc-experimental-enabled"
+        )
+    if (
+        args.clover_fine_head_grouping_experimental_enabled
+        and args.no_clover_fine_head_grouping_experimental_enabled
+    ):
+        raise ValueError(
+            "cannot set both --clover-fine-head-grouping-experimental-enabled and "
+            "--no-clover-fine-head-grouping-experimental-enabled"
         )
     if args.clover_predictive_scheduling_enabled and args.no_clover_predictive_scheduling_enabled:
         raise ValueError(
@@ -834,6 +875,23 @@ def main():
     )
     if args.no_clover_pim_context_fused_experimental_enabled:
         args.clover_pim_context_fused_experimental_enabled = False
+    args.clover_pim_rank_spread_alloc_experimental_enabled = bool(
+        args.clover_pim_rank_spread_alloc_experimental_enabled
+    )
+    if args.no_clover_pim_rank_spread_alloc_experimental_enabled:
+        args.clover_pim_rank_spread_alloc_experimental_enabled = False
+    args.clover_pim_slot_spill_alloc_experimental_enabled = bool(
+        args.clover_pim_slot_spill_alloc_experimental_enabled
+    )
+    if args.no_clover_pim_slot_spill_alloc_experimental_enabled:
+        args.clover_pim_slot_spill_alloc_experimental_enabled = False
+    args.clover_fine_head_grouping_experimental_enabled = bool(
+        args.clover_fine_head_grouping_experimental_enabled
+    )
+    if args.no_clover_fine_head_grouping_experimental_enabled:
+        args.clover_fine_head_grouping_experimental_enabled = False
+    if args.clover_target_heads_per_group_experimental < 0:
+        raise ValueError("--clover-target-heads-per-group-experimental must be non-negative")
     args.clover_predictive_scheduling_enabled = bool(args.clover_predictive_scheduling_enabled)
     if args.no_clover_predictive_scheduling_enabled:
         args.clover_predictive_scheduling_enabled = False
@@ -896,6 +954,18 @@ def main():
         "clover_capacity_aware_pim_b": float(args.clover_capacity_aware_pim_b),
         "clover_capacity_aware_host_c": float(args.clover_capacity_aware_host_c),
         "clover_capacity_aware_max_tokens_per_dpu": int(args.clover_capacity_aware_max_tokens_per_dpu),
+        "clover_pim_rank_spread_alloc_experimental_enabled": bool(
+            args.clover_pim_rank_spread_alloc_experimental_enabled
+        ),
+        "clover_pim_slot_spill_alloc_experimental_enabled": bool(
+            args.clover_pim_slot_spill_alloc_experimental_enabled
+        ),
+        "clover_fine_head_grouping_experimental_enabled": bool(
+            args.clover_fine_head_grouping_experimental_enabled
+        ),
+        "clover_target_heads_per_group_experimental": int(
+            args.clover_target_heads_per_group_experimental
+        ),
         "clover_rankset_overlap_enabled": bool(args.clover_rankset_overlap_enabled),
         "clover_rankset_overlap_max_ranksets_per_batch": int(args.clover_rankset_overlap_max_ranksets_per_batch),
         "clover_rankset_overlap_transfer_granularity": str(args.clover_rankset_overlap_transfer_granularity),

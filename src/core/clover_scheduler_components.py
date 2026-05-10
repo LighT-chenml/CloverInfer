@@ -78,6 +78,7 @@ def allocator_aware_capacity_checker(
     *,
     bytes_per_token: int = 1,
     capacity_field: str = "total_free_elems",
+    require_slot_headroom: bool = False,
 ) -> CapacityChecker:
     """
     Build a capacity checker that combines planner-estimated incremental load
@@ -89,7 +90,10 @@ def allocator_aware_capacity_checker(
 
     The planner's `dpu_loads` remain an approximation of additional demand for
     the candidate batch, but the admission decision is anchored to real helper
-    state instead of a static max-token threshold alone.
+    state instead of a static max-token threshold alone.  Slot-table headroom is
+    reported separately and can be made strict for allocator tests, but the
+    online scheduler keeps it soft because decode appends often fit in existing
+    resident blocks even when a physical DPU's 64-slot table is full.
     """
 
     normalized_bytes_per_token = max(1, int(bytes_per_token))
@@ -115,16 +119,30 @@ def allocator_aware_capacity_checker(
                 "min_remaining_bytes": int(max_capacity_per_dpu),
             }
 
+        has_allocator_stats = bool(stats)
         free_by_dpu: Dict[int, int] = {}
+        free_slots_by_dpu: Dict[int, int] = {}
         for item in stats:
             dpu_id = int(item.get("dpu_id", -1))
             if dpu_id < 0:
                 continue
             free_bytes = int(item.get(capacity_field, item.get("largest_free_range", max_capacity_per_dpu)) or 0)
             free_by_dpu[dpu_id] = free_bytes
+            if "live_slot_count" in item:
+                free_slots_by_dpu[dpu_id] = max(0, 64 - int(item.get("live_slot_count", 0) or 0))
+
+        dpu_groups = {
+            int(group_id): [int(dpu_id) for dpu_id in list(group_dpus or [])]
+            for group_id, group_dpus in dict(sharding_plan.get("dpu_groups", {}) or {}).items()
+        }
+        dpu_to_group: Dict[int, int] = {}
+        for group_id, group_dpus in dpu_groups.items():
+            for dpu_id in group_dpus:
+                dpu_to_group[int(dpu_id)] = int(group_id)
 
         projected_bytes_by_dpu: Dict[int, int] = {}
         remaining_bytes_by_dpu: Dict[int, int] = {}
+        remaining_slots_by_group: Dict[int, int] = {}
         ok = True
         for dpu_id, token_load in dpu_loads.items():
             projected = int(token_load) * normalized_bytes_per_token
@@ -133,15 +151,26 @@ def allocator_aware_capacity_checker(
             remaining_bytes_by_dpu[int(dpu_id)] = free_bytes - projected
             if projected > free_bytes:
                 ok = False
+            if free_slots_by_dpu:
+                group_id = int(dpu_to_group.get(int(dpu_id), int(dpu_id)))
+                group_dpus = dpu_groups.get(group_id, [int(dpu_id)])
+                free_slots = sum(int(free_slots_by_dpu.get(int(group_dpu), 64)) for group_dpu in group_dpus)
+                remaining_slots_by_group[group_id] = min(
+                    int(remaining_slots_by_group.get(group_id, free_slots - 1)),
+                    free_slots - 1,
+                )
+                if require_slot_headroom and free_slots <= 0:
+                    ok = False
 
         peak_load = max(dpu_loads.values(), default=0)
         peak_projected_bytes = max(projected_bytes_by_dpu.values(), default=0)
-        limiting_capacity = max(
-            1,
-            min(
-                [int(max_capacity_per_dpu)] + [int(free_by_dpu.get(dpu_id, max_capacity_per_dpu)) for dpu_id in dpu_loads]
-            ),
-        )
+        if has_allocator_stats:
+            limiting_capacity = max(
+                1,
+                min(int(free_by_dpu.get(dpu_id, max_capacity_per_dpu)) for dpu_id in dpu_loads),
+            )
+        else:
+            limiting_capacity = max(1, int(max_capacity_per_dpu))
         usage_ratio = min(1.0, float(peak_projected_bytes) / float(limiting_capacity))
         return {
             "ok": bool(ok),
@@ -150,6 +179,9 @@ def allocator_aware_capacity_checker(
             "capacity_source": "allocator_stats",
             "peak_projected_bytes": int(peak_projected_bytes),
             "min_remaining_bytes": min(remaining_bytes_by_dpu.values(), default=int(max_capacity_per_dpu)),
+            "min_remaining_slots": min(remaining_slots_by_group.values(), default=64),
+            "slot_headroom_ok": min(remaining_slots_by_group.values(), default=64) >= 0,
+            "slot_headroom_strict": bool(require_slot_headroom),
         }
 
     return check_capacity
@@ -208,13 +240,16 @@ class CapacityAwareMicroBatchScheduler:
     ) -> MicroBatch:
         if max_batch_size is not None and max_batch_size <= 0:
             raise ValueError("max_batch_size must be positive when provided")
-        window = [dict(request) for request in queue[: self.lookahead_window]]
+        max_window_size = self.lookahead_window
+        if max_batch_size is not None:
+            max_window_size = max(max_window_size, int(max_batch_size))
+        window = [dict(request) for request in queue[:max_window_size]]
         if not window:
             raise ValueError("queue must not be empty")
 
-        best_batch: MicroBatch | None = None
         max_combo_size = len(window) if max_batch_size is None else min(len(window), int(max_batch_size))
-        for size in range(1, max_combo_size + 1):
+        for size in range(max_combo_size, 0, -1):
+            best_batch: MicroBatch | None = None
             for combo in itertools.combinations(window, size):
                 evaluated = self._evaluate_batch(combo, max_capacity_per_dpu, selection_reason="lookahead")
                 if not evaluated.capacity_ok:
@@ -223,13 +258,13 @@ class CapacityAwareMicroBatchScheduler:
                     best_batch = evaluated
                     continue
                 if (evaluated.time_gap, -len(evaluated.requests)) < (
-                    best_batch.time_gap,
-                    -len(best_batch.requests),
-                ):
-                    best_batch = evaluated
-        if best_batch is None:
-            return self._evaluate_batch([window[0]], max_capacity_per_dpu, selection_reason="forced_singleton")
-        return best_batch
+                        best_batch.time_gap,
+                        -len(best_batch.requests),
+                    ):
+                        best_batch = evaluated
+            if best_batch is not None:
+                return best_batch
+        return self._evaluate_batch([window[0]], max_capacity_per_dpu, selection_reason="forced_singleton")
 
     def build_micro_batch(
         self,

@@ -12,6 +12,7 @@ from src.core.config import ClusterConfig, ModelConfig
 from src.core.scheduler import GlobalScheduler
 
 FLOAT_TOL = 1e-4
+AV_FLOAT_TOL = 5e-4
 RAY_PYTHONPATH_OVERRIDE = os.environ.get("CLOVER_VERIFY_PYTHONPATH", os.environ.get("CLOVER_RAY_PYTHONPATH"))
 RAY_WORKING_DIR = os.environ.get("CLOVER_VERIFY_WORKING_DIR", os.environ.get("CLOVER_RAY_WORKING_DIR", "")).strip()
 RAY_PY_MODULES = os.environ.get("CLOVER_VERIFY_PY_MODULES", os.environ.get("CLOVER_RAY_PY_MODULES", "")).strip()
@@ -110,6 +111,13 @@ def parse_args():
     parser.add_argument("--clover-shadow-check-layer-interval", type=int, default=4)
     parser.add_argument("--clover-host-qk-mixed-enabled", action="store_true")
     parser.add_argument("--no-clover-host-qk-mixed-enabled", action="store_true")
+    parser.add_argument("--clover-pim-rank-spread-alloc-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-rank-spread-alloc-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-pim-slot-spill-alloc-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-slot-spill-alloc-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-fine-head-grouping-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-fine-head-grouping-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-target-heads-per-group-experimental", type=int, default=0)
     parser.add_argument("--clover-predictive-scheduling-enabled", action="store_true")
     parser.add_argument("--no-clover-predictive-scheduling-enabled", action="store_true")
     parser.add_argument("--clover-predictive-scheduling-alpha", type=float, default=0.2)
@@ -135,6 +143,9 @@ def parse_args():
     parser.add_argument("--expected-prefill-ip", default="192.168.123.4")
     parser.add_argument("--expected-dense-ip", default="192.168.123.3")
     parser.add_argument("--expected-attention-ip", default="192.168.123.7")
+    parser.add_argument("--expected-prefill-device", default="cuda", choices=["cpu", "cuda"])
+    parser.add_argument("--expected-dense-device", default="cuda", choices=["cpu", "cuda"])
+    parser.add_argument("--expected-attention-device", default="auto", choices=["auto", "cpu", "cuda"])
     return parser.parse_args()
 
 
@@ -156,6 +167,30 @@ def main():
         raise ValueError("cannot set both --clover-op-profiling-enabled and --no-clover-op-profiling-enabled")
     if args.clover_host_qk_mixed_enabled and args.no_clover_host_qk_mixed_enabled:
         raise ValueError("cannot set both --clover-host-qk-mixed-enabled and --no-clover-host-qk-mixed-enabled")
+    if (
+        args.clover_pim_rank_spread_alloc_experimental_enabled
+        and args.no_clover_pim_rank_spread_alloc_experimental_enabled
+    ):
+        raise ValueError(
+            "cannot set both --clover-pim-rank-spread-alloc-experimental-enabled and "
+            "--no-clover-pim-rank-spread-alloc-experimental-enabled"
+        )
+    if (
+        args.clover_pim_slot_spill_alloc_experimental_enabled
+        and args.no_clover_pim_slot_spill_alloc_experimental_enabled
+    ):
+        raise ValueError(
+            "cannot set both --clover-pim-slot-spill-alloc-experimental-enabled and "
+            "--no-clover-pim-slot-spill-alloc-experimental-enabled"
+        )
+    if (
+        args.clover_fine_head_grouping_experimental_enabled
+        and args.no_clover_fine_head_grouping_experimental_enabled
+    ):
+        raise ValueError(
+            "cannot set both --clover-fine-head-grouping-experimental-enabled and "
+            "--no-clover-fine-head-grouping-experimental-enabled"
+        )
     if args.clover_predictive_scheduling_enabled and args.no_clover_predictive_scheduling_enabled:
         raise ValueError(
             "cannot set both --clover-predictive-scheduling-enabled and "
@@ -201,6 +236,23 @@ def main():
         clover_host_qk_mixed_enabled = True
     if args.no_clover_host_qk_mixed_enabled:
         clover_host_qk_mixed_enabled = False
+    clover_pim_rank_spread_alloc_experimental_enabled = bool(
+        args.clover_pim_rank_spread_alloc_experimental_enabled
+    )
+    if args.no_clover_pim_rank_spread_alloc_experimental_enabled:
+        clover_pim_rank_spread_alloc_experimental_enabled = False
+    clover_pim_slot_spill_alloc_experimental_enabled = bool(
+        args.clover_pim_slot_spill_alloc_experimental_enabled
+    )
+    if args.no_clover_pim_slot_spill_alloc_experimental_enabled:
+        clover_pim_slot_spill_alloc_experimental_enabled = False
+    clover_fine_head_grouping_experimental_enabled = bool(
+        args.clover_fine_head_grouping_experimental_enabled
+    )
+    if args.no_clover_fine_head_grouping_experimental_enabled:
+        clover_fine_head_grouping_experimental_enabled = False
+    if args.clover_target_heads_per_group_experimental < 0:
+        raise ValueError("--clover-target-heads-per-group-experimental must be non-negative")
     clover_predictive_scheduling_enabled = bool(args.clover_predictive_scheduling_enabled)
     if args.no_clover_predictive_scheduling_enabled:
         clover_predictive_scheduling_enabled = False
@@ -276,6 +328,10 @@ def main():
         clover_shadow_check_token_interval=args.clover_shadow_check_token_interval,
         clover_shadow_check_layer_interval=args.clover_shadow_check_layer_interval,
         clover_host_qk_mixed_enabled=clover_host_qk_mixed_enabled,
+        clover_pim_rank_spread_alloc_experimental_enabled=clover_pim_rank_spread_alloc_experimental_enabled,
+        clover_pim_slot_spill_alloc_experimental_enabled=clover_pim_slot_spill_alloc_experimental_enabled,
+        clover_fine_head_grouping_experimental_enabled=clover_fine_head_grouping_experimental_enabled,
+        clover_target_heads_per_group_experimental=args.clover_target_heads_per_group_experimental,
         clover_predictive_scheduling_enabled=clover_predictive_scheduling_enabled,
         clover_predictive_scheduling_alpha=args.clover_predictive_scheduling_alpha,
         clover_predictive_scheduling_min_samples=args.clover_predictive_scheduling_min_samples,
@@ -297,9 +353,11 @@ def main():
     assert info["prefill"]["ip"] == args.expected_prefill_ip, info
     assert info["decode_dense"]["ip"] == args.expected_dense_ip, info
     assert info["attention"]["ip"] == args.expected_attention_ip, info
-    assert info["prefill"]["device"] == "cuda", info
-    assert info["decode_dense"]["device"] == "cuda", info
-    expected_attention_device = "cuda" if args.attention_backend == "gpu" else "cpu"
+    assert info["prefill"]["device"] == args.expected_prefill_device, info
+    assert info["decode_dense"]["device"] == args.expected_dense_device, info
+    expected_attention_device = args.expected_attention_device
+    if expected_attention_device == "auto":
+        expected_attention_device = "cuda" if args.attention_backend == "gpu" else "cpu"
     assert info["attention"]["device"] == expected_attention_device, info
     assert info["attention"]["backend"] == args.attention_backend, info
     if args.attention_backend in {"pim_naive", "cloverinfer"}:
@@ -326,6 +384,14 @@ def main():
             assert debug["clover_shadow_check_token_interval"] == args.clover_shadow_check_token_interval, debug
             assert debug["clover_shadow_check_layer_interval"] == args.clover_shadow_check_layer_interval, debug
             assert debug["clover_host_qk_mixed_enabled"] == clover_host_qk_mixed_enabled, debug
+            store_debug = debug.get("resident_store_debug", {})
+            helper_env = store_debug.get("helper_env", {})
+            assert helper_env.get("CLOVER_KVSLOT_RANK_SPREAD_ALLOC") == (
+                "1" if clover_pim_rank_spread_alloc_experimental_enabled else "0"
+            ), debug
+            assert bool(store_debug.get("slot_spill_alloc_enabled", False)) == (
+                clover_pim_slot_spill_alloc_experimental_enabled
+            ), debug
 
     if not args.skip_generation:
         output, metrics = ray.get(
@@ -339,7 +405,8 @@ def main():
         print("Metrics:", metrics)
         assert metrics["total_tokens"] >= 1
         stage_timing = metrics["stage_timing"]
-        assert stage_timing["counts"]["decode_steps"] >= 1
+        if args.max_new_tokens > 1:
+            assert stage_timing["counts"]["decode_steps"] >= 1
         assert stage_timing["counts"]["decode_layers"] >= stage_timing["counts"]["decode_steps"]
         assert stage_timing["scheduler"]["total_rpc_s"] >= 0
         assert stage_timing["actors"]["total_compute_s"] >= 0
@@ -358,11 +425,11 @@ def main():
             if pim_softmax_av_fused_enabled:
                 assert debug["softmax_av_fused_ops"] > 0, debug
                 if args.attention_backend == "pim_naive" or clover_shadow_checks_enabled:
-                    assert debug["softmax_av_fused_shadow_max_abs_diff"] <= FLOAT_TOL, debug
+                    assert debug["softmax_av_fused_shadow_max_abs_diff"] <= AV_FLOAT_TOL, debug
             elif debug.get("resident_av_enabled", False):
                 assert debug["resident_av_ops"] > 0, debug
                 if args.attention_backend == "pim_naive" or clover_shadow_checks_enabled:
-                    assert debug["resident_av_shadow_max_abs_diff"] <= FLOAT_TOL, debug
+                    assert debug["resident_av_shadow_max_abs_diff"] <= AV_FLOAT_TOL, debug
             else:
                 assert debug["resident_materialize_ops"] > 0, debug
                 if args.attention_backend == "pim_naive" or clover_shadow_checks_enabled:

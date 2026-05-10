@@ -1465,6 +1465,8 @@ class UpmemKVSlotStore(ResidentKVStore):
         self.dpu_allocate_failures = 0
         self.dpu_live_slots = 0
         self.dpu_capacity_fallbacks = 0
+        self.slot_spill_alloc_enabled = False
+        self.slot_spill_allocations = 0
         self.dpu_live_elems_by_dpu = [0 for _ in range(num_dpus)]
         self.op_timing_totals_s: Dict[str, float] = {
             "allocate_group": 0.0,
@@ -1516,6 +1518,7 @@ class UpmemKVSlotStore(ResidentKVStore):
         context_fused_enabled: bool | None = None,
         shape_rounds_enabled: bool | None = None,
         rank_spread_alloc_enabled: bool | None = None,
+        slot_spill_alloc_enabled: bool | None = None,
         host_partial_reduce_enabled: bool | None = None,
     ) -> None:
         if context_fused_enabled is not None:
@@ -1524,6 +1527,8 @@ class UpmemKVSlotStore(ResidentKVStore):
             self.helper.set_env_flag("CLOVER_KVSLOT_SHAPE_ROUNDS", bool(shape_rounds_enabled))
         if rank_spread_alloc_enabled is not None:
             self.helper.set_env_flag("CLOVER_KVSLOT_RANK_SPREAD_ALLOC", bool(rank_spread_alloc_enabled))
+        if slot_spill_alloc_enabled is not None:
+            self.slot_spill_alloc_enabled = bool(slot_spill_alloc_enabled)
         if host_partial_reduce_enabled is not None:
             self.host_partial_reduce_enabled = bool(host_partial_reduce_enabled)
 
@@ -1730,6 +1735,19 @@ class UpmemKVSlotStore(ResidentKVStore):
         self.op_timing_totals_s[name] += float(time.perf_counter() - started_at)
         self.op_timing_counts[name] += 1
 
+    def _complete_batch_outputs(
+        self,
+        op_name: str,
+        outputs: list[torch.Tensor | None],
+    ) -> list[torch.Tensor]:
+        missing = [idx for idx, output in enumerate(outputs) if output is None]
+        if missing:
+            raise RuntimeError(
+                f"{op_name} produced incomplete batch outputs: "
+                f"expected={len(outputs)} missing_indices={missing[:16]}"
+            )
+        return [output for output in outputs if output is not None]
+
     def _slot_key(self, k_slot: str, v_slot: str) -> tuple[str, str]:
         return (k_slot, v_slot)
 
@@ -1793,6 +1811,52 @@ class UpmemKVSlotStore(ResidentKVStore):
         next_seq = int(self._next_slot_seq_by_dpu[physical_dpu])
         free_ids = len(self._free_slot_ids_by_dpu[physical_dpu])
         return free_ids > 0 or next_seq < max_slots
+
+    def _choose_physical_dpu_with_slot_capacity(
+        self,
+        *,
+        preferred_dpu: int,
+        elem_count: int,
+        allowed_dpus: list[int] | None = None,
+    ) -> int:
+        candidates = self._allowed_candidate_dpus(
+            preferred_dpu=preferred_dpu,
+            allowed_dpus=allowed_dpus,
+        )
+        viable = [
+            int(physical_dpu)
+            for physical_dpu in candidates
+            if self._dpu_has_slot_capacity(int(physical_dpu))
+            and self.dpu_live_elems_by_dpu[int(physical_dpu)] + int(elem_count) <= self.POOL_CAPACITY_ELEMS
+        ]
+        if viable:
+            return min(
+                viable,
+                key=lambda physical_dpu: self._score_physical_dpu(
+                    physical_dpu,
+                    int(elem_count),
+                    preferred_dpu=preferred_dpu,
+                ),
+            )
+        if self.slot_spill_alloc_enabled:
+            global_candidates = self._candidate_dpus(preferred_dpu)
+            global_viable = [
+                int(physical_dpu)
+                for physical_dpu in global_candidates
+                if self._dpu_has_slot_capacity(int(physical_dpu))
+                and self.dpu_live_elems_by_dpu[int(physical_dpu)] + int(elem_count) <= self.POOL_CAPACITY_ELEMS
+            ]
+            if global_viable:
+                self.slot_spill_allocations += 1
+                return min(
+                    global_viable,
+                    key=lambda physical_dpu: self._score_physical_dpu(
+                        physical_dpu,
+                        int(elem_count),
+                        preferred_dpu=preferred_dpu,
+                    ),
+                )
+        return int(candidates[0])
 
     def _dpu_capacity_headroom(self, physical_dpu: int, elem_count: int = 0) -> int:
         return max(
@@ -2202,25 +2266,37 @@ class UpmemKVSlotStore(ResidentKVStore):
             block_capacity = max(int(block_k.shape[0]), int(block_capacity_override))
         block_key = self._block_slot_key(key, block_idx)
         block_elem_count = self._slot_elem_count(block_capacity, group_heads, head_dim)
+        normalized_allowed = None
+        if isinstance(allowed_dpus, list) and allowed_dpus:
+            normalized_allowed = [
+                int(physical_dpu) % max(self.num_dpus, 1) for physical_dpu in allowed_dpus
+            ]
         if physical_dpu_override is not None:
-            block_physical_dpu = int(physical_dpu_override) % max(self.num_dpus, 1)
+            preferred_override = int(physical_dpu_override) % max(self.num_dpus, 1)
+            block_physical_dpu = self._choose_physical_dpu_with_slot_capacity(
+                preferred_dpu=preferred_override,
+                elem_count=block_elem_count,
+                allowed_dpus=normalized_allowed,
+            )
         elif self.placement_policy == "load_aware":
             block_preferred_dpu = locality_anchor_dpu
             block_physical_dpu = self.choose_physical_dpu(
                 elem_count=block_elem_count,
                 preferred_dpu=block_preferred_dpu,
-                allowed_dpus=allowed_dpus if isinstance(allowed_dpus, list) else None,
+                allowed_dpus=normalized_allowed,
             )
         else:
-            if isinstance(allowed_dpus, list) and allowed_dpus:
-                normalized_allowed = [
-                    int(physical_dpu) % max(self.num_dpus, 1) for physical_dpu in allowed_dpus
-                ]
-                block_physical_dpu = normalized_allowed[block_idx % len(normalized_allowed)]
+            if normalized_allowed:
+                preferred_physical_dpu = normalized_allowed[block_idx % len(normalized_allowed)]
             else:
-                block_physical_dpu = (
+                preferred_physical_dpu = (
                     (base_physical_dpu + block_idx) % max(self.num_dpus, 1) if self.num_dpus > 0 else 0
                 )
+            block_physical_dpu = self._choose_physical_dpu_with_slot_capacity(
+                preferred_dpu=preferred_physical_dpu,
+                elem_count=block_elem_count,
+                allowed_dpus=normalized_allowed,
+            )
         block_slot_id = self._assign_slot_id(block_key, preferred_dpu=block_physical_dpu)
         helper_allocated = False
         counters_applied = False
@@ -2844,6 +2920,8 @@ class UpmemKVSlotStore(ResidentKVStore):
             "dpu_allocate_failures": self.dpu_allocate_failures,
             "dpu_live_slots": self.dpu_live_slots,
             "dpu_capacity_fallbacks": self.dpu_capacity_fallbacks,
+            "slot_spill_alloc_enabled": self.slot_spill_alloc_enabled,
+            "slot_spill_allocations": self.slot_spill_allocations,
             "dpu_live_elems_by_dpu": list(self.dpu_live_elems_by_dpu),
             "dpu_pool_capacity_elems": self.POOL_CAPACITY_ELEMS,
             "fallback_allocations": self.fallback_allocations,
@@ -2985,7 +3063,7 @@ class UpmemKVSlotStore(ResidentKVStore):
 
         self._record_timing("qk_slot_scores_batch_total", total_started_at)
         self.batch_item_totals["qk_slot_scores_batch_total"] += len(slot_queries)
-        return [output for output in outputs if output is not None]
+        return self._complete_batch_outputs("qk_slot_scores_batch", outputs)
 
     def weighted_value_sum(self, k_slot: str, v_slot: str, weights: torch.Tensor) -> torch.Tensor:
         key = self._slot_key(k_slot, v_slot)
@@ -3159,7 +3237,7 @@ class UpmemKVSlotStore(ResidentKVStore):
 
         self._record_timing("weighted_value_sum_batch_total", total_started_at)
         self.batch_item_totals["weighted_value_sum_batch_total"] += len(slot_weights)
-        return [context for context in contexts if context is not None]
+        return self._complete_batch_outputs("weighted_value_sum_batch", contexts)
 
     def softmax_weighted_value_sum_batch(
         self,
@@ -3244,7 +3322,7 @@ class UpmemKVSlotStore(ResidentKVStore):
 
         self._record_timing("softmax_weighted_value_sum_batch_total", total_started_at)
         self.batch_item_totals["softmax_weighted_value_sum_batch_total"] += len(slot_scores)
-        return [context for context in contexts if context is not None]
+        return self._complete_batch_outputs("softmax_weighted_value_sum_batch", contexts)
 
     def qk_softmax_weighted_value_sum_batch(
         self,
@@ -3428,4 +3506,4 @@ class UpmemKVSlotStore(ResidentKVStore):
 
         self._record_timing("qk_softmax_weighted_value_sum_batch_total", total_started_at)
         self.batch_item_totals["qk_softmax_weighted_value_sum_batch_total"] += len(slot_queries)
-        return [context for context in contexts if context is not None]
+        return self._complete_batch_outputs("qk_softmax_weighted_value_sum_batch", contexts)
