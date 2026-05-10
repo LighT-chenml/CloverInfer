@@ -4,6 +4,7 @@ import sys
 import ray
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+TESTS_ROOT = os.path.dirname(os.path.abspath(__file__))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
@@ -11,6 +12,41 @@ from src.core.config import ClusterConfig, ModelConfig
 from src.core.scheduler import GlobalScheduler
 
 FLOAT_TOL = 1e-4
+RAY_PYTHONPATH_OVERRIDE = os.environ.get("CLOVER_VERIFY_PYTHONPATH", os.environ.get("CLOVER_RAY_PYTHONPATH"))
+RAY_WORKING_DIR = os.environ.get("CLOVER_VERIFY_WORKING_DIR", os.environ.get("CLOVER_RAY_WORKING_DIR", "")).strip()
+RAY_PY_MODULES = os.environ.get("CLOVER_VERIFY_PY_MODULES", os.environ.get("CLOVER_RAY_PY_MODULES", "")).strip()
+RAY_EXCLUDES = os.environ.get("CLOVER_VERIFY_EXCLUDES", os.environ.get("CLOVER_RAY_EXCLUDES", "")).strip()
+
+
+def _resolve_runtime_path(value: str) -> str:
+    if os.path.isabs(value):
+        return value
+    return os.path.abspath(os.path.join(REPO_ROOT, value))
+
+
+def build_runtime_env() -> dict:
+    runtime_env = {}
+
+    if RAY_WORKING_DIR:
+        runtime_env["working_dir"] = _resolve_runtime_path(RAY_WORKING_DIR)
+
+    if RAY_PY_MODULES:
+        runtime_env["py_modules"] = [
+            _resolve_runtime_path(item.strip())
+            for item in RAY_PY_MODULES.split(os.pathsep)
+            if item.strip()
+        ]
+
+    if RAY_EXCLUDES:
+        runtime_env["excludes"] = [item.strip() for item in RAY_EXCLUDES.split(os.pathsep) if item.strip()]
+
+    pythonpath = RAY_PYTHONPATH_OVERRIDE
+    if pythonpath is None and not runtime_env:
+        pythonpath = REPO_ROOT
+    if pythonpath:
+        runtime_env["env_vars"] = {"PYTHONPATH": pythonpath}
+
+    return runtime_env
 
 
 def resolve_pim_dpu_placement_policy(attention_backend: str, requested_policy: str) -> str:
@@ -174,7 +210,7 @@ def main():
 
     ray.init(
         address=args.address,
-        runtime_env={"env_vars": {"PYTHONPATH": REPO_ROOT}},
+        runtime_env=build_runtime_env(),
     )
 
     resident_store_backend = args.pim_resident_store_backend

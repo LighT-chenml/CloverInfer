@@ -49,6 +49,62 @@ def _load_host_reduction_module():
     return _HOST_REDUCTION_MODULE
 
 
+def _iter_candidate_kvslot_dirs(repo_root: str) -> List[str]:
+    roots: List[str] = []
+    for candidate in (
+        repo_root,
+        os.environ.get("CLOVER_REPO_ROOT"),
+        os.environ.get("PROJECT_DIR"),
+        os.getcwd(),
+        os.path.expanduser("~/CloverInfer"),
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")),
+    ):
+        if not candidate:
+            continue
+        resolved = os.path.abspath(str(candidate))
+        if resolved not in roots:
+            roots.append(resolved)
+
+    kvslot_dirs: List[str] = []
+    for root in roots:
+        if os.path.basename(root) == "src":
+            candidate_dir = os.path.join(root, "pim", "upmem_kvslot")
+        else:
+            candidate_dir = os.path.join(root, "src", "pim", "upmem_kvslot")
+        if candidate_dir not in kvslot_dirs:
+            kvslot_dirs.append(candidate_dir)
+    return kvslot_dirs
+
+
+def _resolve_kvslot_helper_paths(repo_root: str) -> tuple[str, str]:
+    helper_override = os.environ.get("CLOVER_KVSLOT_HELPER")
+    kvslot_dir_override = os.environ.get("CLOVER_KVSLOT_DIR")
+    searched_paths: List[str] = []
+
+    if helper_override:
+        helper_path = os.path.abspath(helper_override)
+        if os.path.exists(helper_path):
+            kvslot_dir = kvslot_dir_override
+            if not kvslot_dir:
+                kvslot_dir = os.path.abspath(os.path.join(os.path.dirname(helper_path), ".."))
+            return os.path.abspath(kvslot_dir), helper_path
+        searched_paths.append(helper_path)
+
+    for kvslot_dir in _iter_candidate_kvslot_dirs(repo_root):
+        helper_path = os.path.join(kvslot_dir, "build", "host_kvslot")
+        searched_paths.append(helper_path)
+        if os.path.exists(helper_path):
+            return kvslot_dir, helper_path
+
+    searched_desc = ", ".join(searched_paths)
+    raise FileNotFoundError(
+        "UPMEM kvslot helper binary is missing. "
+        f"Searched: {searched_desc}. "
+        "Build it with `make -C <repo>/src/pim/upmem_kvslot all` "
+        "after installing the UPMEM toolchain, or set CLOVER_KVSLOT_HELPER."
+    )
+
+
 @dataclass
 class _HostKVSlot:
     k_cache: torch.Tensor
@@ -1390,14 +1446,7 @@ class UpmemKVSlotStore(ResidentKVStore):
         self.host_partial_reduce_enabled = bool(host_partial_reduce_enabled)
         if self.kv_dtype not in {"fp32", "fp16"}:
             raise ValueError(f"Unsupported resident kv dtype: {self.kv_dtype}")
-        kvslot_dir = os.path.join(repo_root, "src", "pim", "upmem_kvslot")
-        helper_binary_path = os.path.join(kvslot_dir, "build", "host_kvslot")
-        if not os.path.exists(helper_binary_path):
-            raise FileNotFoundError(
-                "UPMEM kvslot helper binary is missing: "
-                f"{helper_binary_path}. Build it with `make -C {kvslot_dir} all` "
-                "after installing the UPMEM toolchain."
-            )
+        kvslot_dir, helper_binary_path = _resolve_kvslot_helper_paths(repo_root)
         self.helper = _KVSlotHelperClient(
             binary_path=helper_binary_path,
             num_dpus=num_dpus,

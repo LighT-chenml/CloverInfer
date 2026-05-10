@@ -16,11 +16,47 @@ for path in (REPO_ROOT, TESTS_ROOT):
     if path not in sys.path:
         sys.path.insert(0, path)
 
+RAY_PYTHONPATH_OVERRIDE = os.environ.get("CLOVER_BENCHMARK_PYTHONPATH", os.environ.get("CLOVER_RAY_PYTHONPATH"))
+RAY_WORKING_DIR = os.environ.get("CLOVER_BENCHMARK_WORKING_DIR", os.environ.get("CLOVER_RAY_WORKING_DIR", "")).strip()
+RAY_PY_MODULES = os.environ.get("CLOVER_BENCHMARK_PY_MODULES", os.environ.get("CLOVER_RAY_PY_MODULES", "")).strip()
+RAY_EXCLUDES = os.environ.get("CLOVER_BENCHMARK_EXCLUDES", os.environ.get("CLOVER_RAY_EXCLUDES", "")).strip()
+
 from benchmark_utils import DATASET_FORMAT_CHOICES, load_benchmark_samples, load_tokenizer_for_benchmark
 from src.core.config import ClusterConfig, ModelConfig
 from src.core.model_adapter import CausalModelAdapter
 from src.core.nodes import DecodeDenseNode, PrefillNode
 from src.core.scheduler import GlobalScheduler
+
+
+def _resolve_runtime_path(value: str) -> str:
+    if os.path.isabs(value):
+        return value
+    return os.path.abspath(os.path.join(REPO_ROOT, value))
+
+
+def build_runtime_env() -> Dict[str, object]:
+    runtime_env: Dict[str, object] = {}
+
+    if RAY_WORKING_DIR:
+        runtime_env["working_dir"] = _resolve_runtime_path(RAY_WORKING_DIR)
+
+    if RAY_PY_MODULES:
+        runtime_env["py_modules"] = [
+            _resolve_runtime_path(item.strip())
+            for item in RAY_PY_MODULES.split(os.pathsep)
+            if item.strip()
+        ]
+
+    if RAY_EXCLUDES:
+        runtime_env["excludes"] = [item.strip() for item in RAY_EXCLUDES.split(os.pathsep) if item.strip()]
+
+    pythonpath = RAY_PYTHONPATH_OVERRIDE
+    if pythonpath is None and not runtime_env:
+        pythonpath = REPO_ROOT
+    if pythonpath:
+        runtime_env["env_vars"] = {"PYTHONPATH": pythonpath}
+
+    return runtime_env
 
 
 def _normalize_baseline_alias(value: str) -> str:
@@ -415,6 +451,15 @@ def make_cluster_config(args, attention_backend: str) -> ClusterConfig:
         clover_predictive_scheduling_alpha=args.clover_predictive_scheduling_alpha,
         clover_predictive_scheduling_min_samples=args.clover_predictive_scheduling_min_samples,
         clover_predictive_scheduling_context_bucket_tokens=args.clover_predictive_scheduling_context_bucket_tokens,
+        clover_capacity_aware_batching_enabled=(
+            args.clover_capacity_aware_batching_enabled if attention_backend == "cloverinfer" else False
+        ),
+        clover_capacity_aware_time_gap_threshold=args.clover_capacity_aware_time_gap_threshold,
+        clover_capacity_aware_lookahead_window=args.clover_capacity_aware_lookahead_window,
+        clover_capacity_aware_pim_a=args.clover_capacity_aware_pim_a,
+        clover_capacity_aware_pim_b=args.clover_capacity_aware_pim_b,
+        clover_capacity_aware_host_c=args.clover_capacity_aware_host_c,
+        clover_capacity_aware_max_tokens_per_dpu=args.clover_capacity_aware_max_tokens_per_dpu,
         clover_rankset_overlap_enabled=(
             args.clover_rankset_overlap_enabled if attention_backend == "cloverinfer" else False
         ),
@@ -658,6 +703,14 @@ def main():
     parser.add_argument("--clover-predictive-scheduling-alpha", type=float, default=0.2)
     parser.add_argument("--clover-predictive-scheduling-min-samples", type=int, default=4)
     parser.add_argument("--clover-predictive-scheduling-context-bucket-tokens", type=int, default=256)
+    parser.add_argument("--clover-capacity-aware-batching-enabled", action="store_true")
+    parser.add_argument("--no-clover-capacity-aware-batching-enabled", action="store_true")
+    parser.add_argument("--clover-capacity-aware-time-gap-threshold", type=float, default=0.0)
+    parser.add_argument("--clover-capacity-aware-lookahead-window", type=int, default=1)
+    parser.add_argument("--clover-capacity-aware-pim-a", type=float, default=1.0)
+    parser.add_argument("--clover-capacity-aware-pim-b", type=float, default=0.0)
+    parser.add_argument("--clover-capacity-aware-host-c", type=float, default=1.0)
+    parser.add_argument("--clover-capacity-aware-max-tokens-per-dpu", type=int, default=0)
     parser.add_argument("--clover-rankset-overlap-enabled", action="store_true")
     parser.add_argument("--no-clover-rankset-overlap-enabled", action="store_true")
     parser.add_argument("--clover-rankset-overlap-max-ranksets-per-batch", type=int, default=0)
@@ -716,6 +769,11 @@ def main():
         raise ValueError(
             "cannot set both --clover-predictive-scheduling-enabled and "
             "--no-clover-predictive-scheduling-enabled"
+        )
+    if args.clover_capacity_aware_batching_enabled and args.no_clover_capacity_aware_batching_enabled:
+        raise ValueError(
+            "cannot set both --clover-capacity-aware-batching-enabled and "
+            "--no-clover-capacity-aware-batching-enabled"
         )
     if args.clover_rankset_overlap_enabled and args.no_clover_rankset_overlap_enabled:
         raise ValueError(
@@ -779,6 +837,9 @@ def main():
     args.clover_predictive_scheduling_enabled = bool(args.clover_predictive_scheduling_enabled)
     if args.no_clover_predictive_scheduling_enabled:
         args.clover_predictive_scheduling_enabled = False
+    args.clover_capacity_aware_batching_enabled = bool(args.clover_capacity_aware_batching_enabled)
+    if args.no_clover_capacity_aware_batching_enabled:
+        args.clover_capacity_aware_batching_enabled = False
     args.clover_rankset_overlap_enabled = bool(args.clover_rankset_overlap_enabled)
     if args.no_clover_rankset_overlap_enabled:
         args.clover_rankset_overlap_enabled = False
@@ -817,7 +878,7 @@ def main():
     ray.init(
         address=args.address,
         ignore_reinit_error=True,
-        runtime_env={"env_vars": {"PYTHONPATH": REPO_ROOT}},
+        runtime_env=build_runtime_env(),
     )
 
     results = []
@@ -828,6 +889,13 @@ def main():
         "prompt_token_length_override": int(args.prompt_token_length),
         "concurrency": max(1, int(args.concurrency)),
         "max_new_tokens": int(args.max_new_tokens),
+        "clover_capacity_aware_batching_enabled": bool(args.clover_capacity_aware_batching_enabled),
+        "clover_capacity_aware_time_gap_threshold": float(args.clover_capacity_aware_time_gap_threshold),
+        "clover_capacity_aware_lookahead_window": int(args.clover_capacity_aware_lookahead_window),
+        "clover_capacity_aware_pim_a": float(args.clover_capacity_aware_pim_a),
+        "clover_capacity_aware_pim_b": float(args.clover_capacity_aware_pim_b),
+        "clover_capacity_aware_host_c": float(args.clover_capacity_aware_host_c),
+        "clover_capacity_aware_max_tokens_per_dpu": int(args.clover_capacity_aware_max_tokens_per_dpu),
         "clover_rankset_overlap_enabled": bool(args.clover_rankset_overlap_enabled),
         "clover_rankset_overlap_max_ranksets_per_batch": int(args.clover_rankset_overlap_max_ranksets_per_batch),
         "clover_rankset_overlap_transfer_granularity": str(args.clover_rankset_overlap_transfer_granularity),

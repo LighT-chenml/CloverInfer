@@ -11,6 +11,7 @@ from .config import ClusterConfig, ModelConfig
 from .clover_planner import plan_sharding
 from .clover_scheduler_components import (
     CapacityAwareMicroBatchScheduler,
+    allocator_aware_capacity_checker,
     default_capacity_checker,
     default_predict_host_time,
     default_predict_pim_time,
@@ -177,8 +178,23 @@ class GlobalScheduler:
         self.capacity_aware_batch_decisions = 0
         self.capacity_aware_batch_fallbacks = 0
         self.capacity_aware_last_batch: Dict[str, object] = {}
+        self._capacity_aware_allocator_stats_cache: List[Dict[str, object]] = []
+        self._capacity_aware_allocator_stats_refreshes = 0
         self._capacity_aware_scheduler: CapacityAwareMicroBatchScheduler | None = None
         if self.clover_capacity_aware_batching_enabled:
+            capacity_checker = default_capacity_checker
+            if (
+                str(cluster_config.attention_backend) == "cloverinfer"
+                and int(cluster_config.pim_num_dpus) > 0
+            ):
+                head_dim = max(1, int(getattr(model_config, "hidden_size", 0)) // max(1, int(model_config.num_heads)))
+                capacity_checker = allocator_aware_capacity_checker(
+                    lambda: list(self._capacity_aware_allocator_stats_cache),
+                    # Map token pressure into the allocator's element units with
+                    # a simple KV footprint proxy: one K row + one V row.
+                    bytes_per_token=max(1, 2 * head_dim),
+                    capacity_field="total_free_elems",
+                )
             self._capacity_aware_scheduler = CapacityAwareMicroBatchScheduler(
                 planner=plan_sharding,
                 predict_pim_time=lambda reqs, plan: default_predict_pim_time(
@@ -191,7 +207,7 @@ class GlobalScheduler:
                     total_tokens,
                     c=self.clover_capacity_aware_host_c,
                 ),
-                capacity_checker=default_capacity_checker,
+                capacity_checker=capacity_checker,
                 num_dpus=int(cluster_config.pim_num_dpus),
                 num_heads=int(model_config.num_heads),
                 time_gap_threshold=self.clover_capacity_aware_time_gap_threshold,
@@ -735,6 +751,20 @@ class GlobalScheduler:
             "_state": state,
         }
 
+    async def _refresh_capacity_aware_allocator_stats(self) -> None:
+        if not self.attention_nodes:
+            return
+        try:
+            attention_info = await self.attention_nodes[0].get_info.remote()
+        except Exception:
+            return
+        backend_debug = dict(attention_info.get("backend_debug", {}) or {})
+        resident_store_debug = dict(backend_debug.get("resident_store_debug", {}) or {})
+        allocator_stats = list(resident_store_debug.get("allocator_stats", []) or [])
+        if allocator_stats:
+            self._capacity_aware_allocator_stats_cache = [dict(item) for item in allocator_stats]
+            self._capacity_aware_allocator_stats_refreshes += 1
+
     def _record_capacity_aware_batch(self, request_views: List[Dict[str, object]], batch_meta: Dict[str, object]) -> None:
         self.capacity_aware_last_batch = {
             "enabled": bool(self.clover_capacity_aware_batching_enabled),
@@ -746,6 +776,8 @@ class GlobalScheduler:
             "capacity_ok": bool(batch_meta.get("capacity_ok", False)),
             "capacity_usage_ratio": float(batch_meta.get("capacity_usage_ratio", 0.0)),
             "selection_reason": str(batch_meta.get("selection_reason", "")),
+            "allocator_stats_cached": int(len(self._capacity_aware_allocator_stats_cache)),
+            "allocator_stats_refreshes": int(self._capacity_aware_allocator_stats_refreshes),
         }
 
     def _decode_batch_candidate_score(
@@ -910,6 +942,8 @@ class GlobalScheduler:
     async def _decode_driver_loop(self):
         try:
             while self._decode_pending_queue:
+                if self.clover_capacity_aware_batching_enabled and self._capacity_aware_scheduler is not None:
+                    await self._refresh_capacity_aware_allocator_stats()
                 target_size = self._decode_continuous_batch_target_size()
                 flush_reason = "immediate"
                 waited_s = 0.0
@@ -1506,6 +1540,8 @@ class GlobalScheduler:
                 "capacity_aware_time_gap_threshold": float(self.clover_capacity_aware_time_gap_threshold),
                 "capacity_aware_lookahead_window": int(self.clover_capacity_aware_lookahead_window),
                 "capacity_aware_max_tokens_per_dpu": int(self.clover_capacity_aware_max_tokens_per_dpu),
+                "capacity_aware_allocator_stats_cached": int(len(self._capacity_aware_allocator_stats_cache)),
+                "capacity_aware_allocator_stats_refreshes": int(self._capacity_aware_allocator_stats_refreshes),
                 "capacity_aware_last_batch": dict(self.capacity_aware_last_batch),
                 "planner_modes": sorted(
                     {

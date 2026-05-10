@@ -11,6 +11,7 @@ PredictPimTime = Callable[[Sequence[RequestLike], ShardingPlanLike], float]
 PredictHostTime = Callable[[int], float]
 CapacityChecker = Callable[[Sequence[RequestLike], ShardingPlanLike, int], Mapping[str, object]]
 Planner = Callable[[Sequence[RequestLike], int, int], ShardingPlanLike]
+AllocatorStatsProvider = Callable[[], Sequence[Mapping[str, object]]]
 
 
 @dataclass
@@ -70,6 +71,88 @@ def default_capacity_checker(
         "peak_load": int(peak),
         "usage_ratio": float(usage_ratio),
     }
+
+
+def allocator_aware_capacity_checker(
+    allocator_stats_provider: AllocatorStatsProvider,
+    *,
+    bytes_per_token: int = 1,
+    capacity_field: str = "total_free_elems",
+) -> CapacityChecker:
+    """
+    Build a capacity checker that combines planner-estimated incremental load
+    with live allocator stats from the resident KV runtime.
+
+    The provider is expected to return one dict per DPU containing at least:
+    - `dpu_id`
+    - one free-capacity field, defaulting to `total_free_elems`
+
+    The planner's `dpu_loads` remain an approximation of additional demand for
+    the candidate batch, but the admission decision is anchored to real helper
+    state instead of a static max-token threshold alone.
+    """
+
+    normalized_bytes_per_token = max(1, int(bytes_per_token))
+
+    def check_capacity(
+        batch_requests: Sequence[RequestLike],
+        sharding_plan: ShardingPlanLike,
+        max_capacity_per_dpu: int,
+    ) -> Dict[str, object]:
+        del batch_requests
+        stats = [dict(item) for item in allocator_stats_provider()]
+        dpu_loads = {
+            int(dpu_id): int(load)
+            for dpu_id, load in dict(sharding_plan.get("dpu_loads", {}) or {}).items()
+        }
+        if not dpu_loads:
+            return {
+                "ok": True,
+                "peak_load": 0,
+                "usage_ratio": 0.0,
+                "capacity_source": "allocator_stats",
+                "peak_projected_bytes": 0,
+                "min_remaining_bytes": int(max_capacity_per_dpu),
+            }
+
+        free_by_dpu: Dict[int, int] = {}
+        for item in stats:
+            dpu_id = int(item.get("dpu_id", -1))
+            if dpu_id < 0:
+                continue
+            free_bytes = int(item.get(capacity_field, item.get("largest_free_range", max_capacity_per_dpu)) or 0)
+            free_by_dpu[dpu_id] = free_bytes
+
+        projected_bytes_by_dpu: Dict[int, int] = {}
+        remaining_bytes_by_dpu: Dict[int, int] = {}
+        ok = True
+        for dpu_id, token_load in dpu_loads.items():
+            projected = int(token_load) * normalized_bytes_per_token
+            free_bytes = int(free_by_dpu.get(int(dpu_id), max_capacity_per_dpu))
+            projected_bytes_by_dpu[int(dpu_id)] = projected
+            remaining_bytes_by_dpu[int(dpu_id)] = free_bytes - projected
+            if projected > free_bytes:
+                ok = False
+
+        peak_load = max(dpu_loads.values(), default=0)
+        peak_projected_bytes = max(projected_bytes_by_dpu.values(), default=0)
+        limiting_capacity = max(
+            1,
+            min(
+                [int(max_capacity_per_dpu)] + [int(free_by_dpu.get(dpu_id, max_capacity_per_dpu)) for dpu_id in dpu_loads]
+            ),
+        )
+        usage_ratio = min(1.0, float(peak_projected_bytes) / float(limiting_capacity))
+        return {
+            "ok": bool(ok),
+            "peak_load": int(peak_load),
+            "usage_ratio": float(usage_ratio),
+            "capacity_source": "allocator_stats",
+            "peak_projected_bytes": int(peak_projected_bytes),
+            "min_remaining_bytes": min(remaining_bytes_by_dpu.values(), default=int(max_capacity_per_dpu)),
+        }
+
+    return check_capacity
 
 
 class CapacityAwareMicroBatchScheduler:

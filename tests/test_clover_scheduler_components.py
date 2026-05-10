@@ -8,6 +8,7 @@ if REPO_ROOT not in sys.path:
 from src.core.clover_planner import plan_sharding
 from src.core.clover_scheduler_components import (
     CapacityAwareMicroBatchScheduler,
+    allocator_aware_capacity_checker,
     default_capacity_checker,
     default_predict_host_time,
     default_predict_pim_time,
@@ -57,3 +58,48 @@ def test_lookahead_can_pick_non_prefix_combo():
     assert len(picked_ids) >= 1
     assert picked_ids != {"long", "short0", "short1"} or decision.micro_batch.time_gap >= 0.0
 
+
+def test_allocator_aware_capacity_checker_rejects_when_live_free_space_is_too_small():
+    checker = allocator_aware_capacity_checker(
+        lambda: [
+            {"dpu_id": 0, "total_free_elems": 5},
+            {"dpu_id": 1, "total_free_elems": 5},
+            {"dpu_id": 2, "total_free_elems": 5},
+            {"dpu_id": 3, "total_free_elems": 5},
+        ],
+        bytes_per_token=1,
+    )
+    plan = plan_sharding(
+        [
+            {"request_id": "r0", "seq_len": 16},
+            {"request_id": "r1", "seq_len": 12},
+        ],
+        D=4,
+        H=2,
+    )
+    result = checker([], plan, 64)
+    assert result["ok"] is False
+    assert result["capacity_source"] == "allocator_stats"
+
+
+def test_allocator_aware_capacity_checker_accepts_when_live_free_space_is_sufficient():
+    checker = allocator_aware_capacity_checker(
+        lambda: [
+            {"dpu_id": 0, "total_free_elems": 64},
+            {"dpu_id": 1, "total_free_elems": 64},
+            {"dpu_id": 2, "total_free_elems": 64},
+            {"dpu_id": 3, "total_free_elems": 64},
+        ],
+        bytes_per_token=1,
+    )
+    plan = plan_sharding(
+        [
+            {"request_id": "r0", "seq_len": 8},
+            {"request_id": "r1", "seq_len": 8},
+        ],
+        D=4,
+        H=2,
+    )
+    result = checker([], plan, 64)
+    assert result["ok"] is True
+    assert result["usage_ratio"] >= 0.0
