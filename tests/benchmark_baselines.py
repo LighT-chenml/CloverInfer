@@ -451,6 +451,16 @@ def make_cluster_config(args, attention_backend: str) -> ClusterConfig:
         clover_pim_slot_spill_alloc_experimental_enabled=(
             args.clover_pim_slot_spill_alloc_experimental_enabled if attention_backend == "cloverinfer" else False
         ),
+        clover_pim_slot_pressure_aware_alloc_experimental_enabled=(
+            args.clover_pim_slot_pressure_aware_alloc_experimental_enabled
+            if attention_backend == "cloverinfer"
+            else False
+        ),
+        clover_pim_emergency_slot_spill_experimental_enabled=(
+            args.clover_pim_emergency_slot_spill_experimental_enabled
+            if attention_backend == "cloverinfer"
+            else False
+        ),
         clover_pim_reserve_segment_tail_capacity_experimental_enabled=(
             args.clover_pim_reserve_segment_tail_capacity_experimental_enabled
             if attention_backend == "cloverinfer"
@@ -484,6 +494,9 @@ def make_cluster_config(args, attention_backend: str) -> ClusterConfig:
         clover_capacity_aware_pim_b=args.clover_capacity_aware_pim_b,
         clover_capacity_aware_host_c=args.clover_capacity_aware_host_c,
         clover_capacity_aware_max_tokens_per_dpu=args.clover_capacity_aware_max_tokens_per_dpu,
+        clover_capacity_aware_require_slot_headroom=(
+            args.clover_capacity_aware_require_slot_headroom if attention_backend == "cloverinfer" else False
+        ),
         clover_rankset_overlap_enabled=(
             args.clover_rankset_overlap_enabled if attention_backend == "cloverinfer" else False
         ),
@@ -726,6 +739,10 @@ def main():
     parser.add_argument("--no-clover-pim-rank-spread-alloc-experimental-enabled", action="store_true")
     parser.add_argument("--clover-pim-slot-spill-alloc-experimental-enabled", action="store_true")
     parser.add_argument("--no-clover-pim-slot-spill-alloc-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-pim-slot-pressure-aware-alloc-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-slot-pressure-aware-alloc-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-pim-emergency-slot-spill-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-emergency-slot-spill-experimental-enabled", action="store_true")
     parser.add_argument("--clover-pim-reserve-segment-tail-capacity-experimental-enabled", action="store_true")
     parser.add_argument("--no-clover-pim-reserve-segment-tail-capacity-experimental-enabled", action="store_true")
     parser.add_argument("--clover-pim-reserve-segment-tail-capacity-tokens", type=int, default=0)
@@ -748,6 +765,8 @@ def main():
     parser.add_argument("--clover-capacity-aware-pim-b", type=float, default=0.0)
     parser.add_argument("--clover-capacity-aware-host-c", type=float, default=1.0)
     parser.add_argument("--clover-capacity-aware-max-tokens-per-dpu", type=int, default=0)
+    parser.add_argument("--clover-capacity-aware-require-slot-headroom", action="store_true")
+    parser.add_argument("--no-clover-capacity-aware-require-slot-headroom", action="store_true")
     parser.add_argument("--clover-rankset-overlap-enabled", action="store_true")
     parser.add_argument("--no-clover-rankset-overlap-enabled", action="store_true")
     parser.add_argument("--clover-rankset-overlap-max-ranksets-per-batch", type=int, default=0)
@@ -817,6 +836,22 @@ def main():
         raise ValueError(
             "cannot set both --clover-pim-slot-spill-alloc-experimental-enabled and "
             "--no-clover-pim-slot-spill-alloc-experimental-enabled"
+        )
+    if (
+        args.clover_pim_slot_pressure_aware_alloc_experimental_enabled
+        and args.no_clover_pim_slot_pressure_aware_alloc_experimental_enabled
+    ):
+        raise ValueError(
+            "cannot set both --clover-pim-slot-pressure-aware-alloc-experimental-enabled and "
+            "--no-clover-pim-slot-pressure-aware-alloc-experimental-enabled"
+        )
+    if (
+        args.clover_pim_emergency_slot_spill_experimental_enabled
+        and args.no_clover_pim_emergency_slot_spill_experimental_enabled
+    ):
+        raise ValueError(
+            "cannot set both --clover-pim-emergency-slot-spill-experimental-enabled and "
+            "--no-clover-pim-emergency-slot-spill-experimental-enabled"
         )
     if (
         args.clover_pim_reserve_segment_tail_capacity_experimental_enabled
@@ -916,6 +951,16 @@ def main():
     )
     if args.no_clover_pim_slot_spill_alloc_experimental_enabled:
         args.clover_pim_slot_spill_alloc_experimental_enabled = False
+    args.clover_pim_slot_pressure_aware_alloc_experimental_enabled = bool(
+        args.clover_pim_slot_pressure_aware_alloc_experimental_enabled
+    )
+    if args.no_clover_pim_slot_pressure_aware_alloc_experimental_enabled:
+        args.clover_pim_slot_pressure_aware_alloc_experimental_enabled = False
+    args.clover_pim_emergency_slot_spill_experimental_enabled = bool(
+        args.clover_pim_emergency_slot_spill_experimental_enabled
+    )
+    if args.no_clover_pim_emergency_slot_spill_experimental_enabled:
+        args.clover_pim_emergency_slot_spill_experimental_enabled = False
     args.clover_pim_reserve_segment_tail_capacity_experimental_enabled = bool(
         args.clover_pim_reserve_segment_tail_capacity_experimental_enabled
     )
@@ -941,6 +986,11 @@ def main():
     args.clover_capacity_aware_batching_enabled = bool(args.clover_capacity_aware_batching_enabled)
     if args.no_clover_capacity_aware_batching_enabled:
         args.clover_capacity_aware_batching_enabled = False
+    args.clover_capacity_aware_require_slot_headroom = bool(
+        args.clover_capacity_aware_require_slot_headroom
+    )
+    if args.no_clover_capacity_aware_require_slot_headroom:
+        args.clover_capacity_aware_require_slot_headroom = False
     args.clover_rankset_overlap_enabled = bool(args.clover_rankset_overlap_enabled)
     if args.no_clover_rankset_overlap_enabled:
         args.clover_rankset_overlap_enabled = False
@@ -997,11 +1047,20 @@ def main():
         "clover_capacity_aware_pim_b": float(args.clover_capacity_aware_pim_b),
         "clover_capacity_aware_host_c": float(args.clover_capacity_aware_host_c),
         "clover_capacity_aware_max_tokens_per_dpu": int(args.clover_capacity_aware_max_tokens_per_dpu),
+        "clover_capacity_aware_require_slot_headroom": bool(
+            args.clover_capacity_aware_require_slot_headroom
+        ),
         "clover_pim_rank_spread_alloc_experimental_enabled": bool(
             args.clover_pim_rank_spread_alloc_experimental_enabled
         ),
         "clover_pim_slot_spill_alloc_experimental_enabled": bool(
             args.clover_pim_slot_spill_alloc_experimental_enabled
+        ),
+        "clover_pim_slot_pressure_aware_alloc_experimental_enabled": bool(
+            args.clover_pim_slot_pressure_aware_alloc_experimental_enabled
+        ),
+        "clover_pim_emergency_slot_spill_experimental_enabled": bool(
+            args.clover_pim_emergency_slot_spill_experimental_enabled
         ),
         "clover_pim_reserve_segment_tail_capacity_experimental_enabled": bool(
             args.clover_pim_reserve_segment_tail_capacity_experimental_enabled

@@ -33,6 +33,8 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         pim_context_fused_experimental_enabled: bool = False,
         pim_rank_spread_alloc_experimental_enabled: bool = False,
         pim_slot_spill_alloc_experimental_enabled: bool = False,
+        pim_slot_pressure_aware_alloc_experimental_enabled: bool = False,
+        pim_emergency_slot_spill_experimental_enabled: bool = False,
         pim_reserve_segment_tail_capacity_experimental_enabled: bool = False,
         pim_reserve_segment_tail_capacity_tokens: int = 0,
         fine_head_grouping_experimental_enabled: bool = False,
@@ -54,6 +56,12 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         self.pim_context_fused_experimental_enabled = bool(pim_context_fused_experimental_enabled)
         self.pim_rank_spread_alloc_experimental_enabled = bool(pim_rank_spread_alloc_experimental_enabled)
         self.pim_slot_spill_alloc_experimental_enabled = bool(pim_slot_spill_alloc_experimental_enabled)
+        self.pim_slot_pressure_aware_alloc_experimental_enabled = bool(
+            pim_slot_pressure_aware_alloc_experimental_enabled
+        )
+        self.pim_emergency_slot_spill_experimental_enabled = bool(
+            pim_emergency_slot_spill_experimental_enabled
+        )
         self.pim_reserve_segment_tail_capacity_experimental_enabled = bool(
             pim_reserve_segment_tail_capacity_experimental_enabled
         )
@@ -116,6 +124,8 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                 shape_rounds_enabled=self.fine_head_grouping_experimental_enabled,
                 rank_spread_alloc_enabled=self.pim_rank_spread_alloc_experimental_enabled,
                 slot_spill_alloc_enabled=self.pim_slot_spill_alloc_experimental_enabled,
+                slot_pressure_aware_alloc_enabled=self.pim_slot_pressure_aware_alloc_experimental_enabled,
+                emergency_slot_spill_enabled=self.pim_emergency_slot_spill_experimental_enabled,
                 reserve_segment_tail_capacity_enabled=reserve_tail_capacity_enabled,
                 reserve_segment_tail_capacity_tokens=self.pim_reserve_segment_tail_capacity_tokens,
             )

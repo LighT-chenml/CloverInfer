@@ -175,6 +175,9 @@ class GlobalScheduler:
         self.clover_capacity_aware_max_tokens_per_dpu = max(
             0, int(getattr(cluster_config, "clover_capacity_aware_max_tokens_per_dpu", 0))
         )
+        self.clover_capacity_aware_require_slot_headroom = bool(
+            getattr(cluster_config, "clover_capacity_aware_require_slot_headroom", False)
+        )
         self.capacity_aware_batch_decisions = 0
         self.capacity_aware_batch_fallbacks = 0
         self.capacity_aware_last_batch: Dict[str, object] = {}
@@ -194,6 +197,7 @@ class GlobalScheduler:
                     # a simple KV footprint proxy: one K row + one V row.
                     bytes_per_token=max(1, 2 * head_dim),
                     capacity_field="total_free_elems",
+                    require_slot_headroom=self.clover_capacity_aware_require_slot_headroom,
                 )
             self._capacity_aware_scheduler = CapacityAwareMicroBatchScheduler(
                 planner=plan_sharding,
@@ -776,6 +780,7 @@ class GlobalScheduler:
             "capacity_ok": bool(batch_meta.get("capacity_ok", False)),
             "capacity_usage_ratio": float(batch_meta.get("capacity_usage_ratio", 0.0)),
             "selection_reason": str(batch_meta.get("selection_reason", "")),
+            "require_slot_headroom": bool(self.clover_capacity_aware_require_slot_headroom),
             "allocator_stats_cached": int(len(self._capacity_aware_allocator_stats_cache)),
             "allocator_stats_refreshes": int(self._capacity_aware_allocator_stats_refreshes),
         }
@@ -1540,6 +1545,7 @@ class GlobalScheduler:
                 "capacity_aware_time_gap_threshold": float(self.clover_capacity_aware_time_gap_threshold),
                 "capacity_aware_lookahead_window": int(self.clover_capacity_aware_lookahead_window),
                 "capacity_aware_max_tokens_per_dpu": int(self.clover_capacity_aware_max_tokens_per_dpu),
+                "capacity_aware_require_slot_headroom": bool(self.clover_capacity_aware_require_slot_headroom),
                 "capacity_aware_allocator_stats_cached": int(len(self._capacity_aware_allocator_stats_cache)),
                 "capacity_aware_allocator_stats_refreshes": int(self._capacity_aware_allocator_stats_refreshes),
                 "capacity_aware_last_batch": dict(self.capacity_aware_last_batch),
@@ -1706,6 +1712,12 @@ class GlobalScheduler:
                         ),
                         "pim_slot_spill_alloc_experimental_enabled": bool(
                             self.cluster_config.clover_pim_slot_spill_alloc_experimental_enabled
+                        ),
+                        "pim_slot_pressure_aware_alloc_experimental_enabled": bool(
+                            self.cluster_config.clover_pim_slot_pressure_aware_alloc_experimental_enabled
+                        ),
+                        "pim_emergency_slot_spill_experimental_enabled": bool(
+                            self.cluster_config.clover_pim_emergency_slot_spill_experimental_enabled
                         ),
                         "pim_reserve_segment_tail_capacity_experimental_enabled": bool(
                             self.cluster_config.clover_pim_reserve_segment_tail_capacity_experimental_enabled

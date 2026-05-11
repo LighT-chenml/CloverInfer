@@ -8,7 +8,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 import src.core.resident_kv_store as resident_kv_store
-from src.core.resident_kv_store import UpmemKVSlotStore
+from src.core.resident_kv_store import UpmemKVSlotStore, _KVSlotHelperClient
 
 
 def _merge_reference(entries, outputs):
@@ -135,6 +135,36 @@ def test_partial_reduce_uses_cpp_module_when_available():
     assert merged[0].shape == (1, 2)
 
 
+def test_grouped_av_splits_oversized_helper_groups_without_upmem():
+    class _FakeHelper:
+        MAX_GROUP_SEGMENTS = 2
+        MAX_BATCH_ITEMS = 32
+
+        def weighted_value_sum_grouped_batch(self, grouped_slot_weights):
+            assert all(0 < len(group) <= self.MAX_GROUP_SEGMENTS for group in grouped_slot_weights)
+            outputs = []
+            for group in grouped_slot_weights:
+                total = sum(float(weights.sum().item()) for _, _, weights in group)
+                outputs.append(torch.tensor([[total]], dtype=torch.float32))
+            return outputs
+
+    fake = _FakeHelper()
+    oversized_group = [
+        (slot_id, 1, torch.tensor([[float(slot_id)]], dtype=torch.float32))
+        for slot_id in range(5)
+    ]
+    normal_group = [(10, 1, torch.tensor([[10.0]], dtype=torch.float32))]
+
+    outputs = _KVSlotHelperClient.weighted_value_sum_grouped_batch(
+        fake,
+        [oversized_group, normal_group],
+    )
+
+    assert len(outputs) == 2
+    assert torch.allclose(outputs[0], torch.tensor([[10.0]], dtype=torch.float32))
+    assert torch.allclose(outputs[1], torch.tensor([[10.0]], dtype=torch.float32))
+
+
 def test_slot_capacity_choice_spills_outside_full_allowed_stripe():
     store = object.__new__(UpmemKVSlotStore)
     store.num_dpus = 4
@@ -190,6 +220,42 @@ def test_slot_capacity_choice_prefers_lower_slot_pressure_inside_allowed_stripe(
     )
 
     assert chosen == 1
+
+
+def test_slot_capacity_choice_fails_cleanly_when_allowed_stripe_is_full():
+    store = object.__new__(UpmemKVSlotStore)
+    store.num_dpus = 4
+    store.POOL_CAPACITY_ELEMS = 1024
+    store.dpu_live_elems_by_dpu = [0, 0, 0, 0]
+    store.dpu_live_slot_counts_by_dpu = [64, 64, 0, 0]
+    store._next_slot_seq_by_dpu = [64, 64, 0, 0]
+    store._free_slot_ids_by_dpu = [[], [], [], []]
+    store._helper_topology_cache = {}
+    store.slot_spill_alloc_enabled = False
+    store.slot_spill_allocations = 0
+    store.emergency_slot_spill_enabled = False
+    store.emergency_slot_spill_allocations = 0
+
+    class _Helper:
+        MAX_SLOTS_PER_DPU = 64
+
+    store.helper = _Helper()
+
+    try:
+        UpmemKVSlotStore._choose_physical_dpu_with_slot_capacity(
+            store,
+            preferred_dpu=0,
+            elem_count=1,
+            allowed_dpus=[0, 1],
+        )
+    except RuntimeError as exc:
+        assert "No DPU KV slot capacity remains" in str(exc)
+    else:
+        raise AssertionError("expected full allowed stripe to fail before slot assignment")
+
+    assert store._next_slot_seq_by_dpu == [64, 64, 0, 0]
+    assert store._free_slot_ids_by_dpu == [[], [], [], []]
+    assert store.slot_spill_allocations == 0
 
 
 def test_choose_physical_dpu_skips_full_preferred_dpu_before_host_fallback():
@@ -253,6 +319,63 @@ def test_choose_physical_dpu_can_globally_spill_when_enabled():
     assert chosen in {2, 3}
     assert store.slot_spill_allocations == 1
     assert store.slot_capacity_reroutes == 1
+
+
+def test_slot_capacity_choice_uses_emergency_spill_for_full_allowed_stripe():
+    store = object.__new__(UpmemKVSlotStore)
+    store.num_dpus = 4
+    store.POOL_CAPACITY_ELEMS = 1024
+    store.dpu_live_elems_by_dpu = [0, 0, 0, 0]
+    store.dpu_live_slot_counts_by_dpu = [64, 64, 0, 0]
+    store._next_slot_seq_by_dpu = [64, 64, 0, 0]
+    store._free_slot_ids_by_dpu = [[], [], [], []]
+    store._helper_topology_cache = {}
+    store.slot_spill_alloc_enabled = False
+    store.slot_spill_allocations = 0
+    store.emergency_slot_spill_enabled = True
+    store.emergency_slot_spill_allocations = 0
+    store.slot_capacity_reroutes = 0
+
+    class _Helper:
+        MAX_SLOTS_PER_DPU = 64
+
+    store.helper = _Helper()
+
+    chosen = UpmemKVSlotStore._choose_physical_dpu_with_slot_capacity(
+        store,
+        preferred_dpu=0,
+        elem_count=1,
+        allowed_dpus=[0, 1],
+    )
+
+    assert chosen in {2, 3}
+    assert store.slot_spill_allocations == 0
+    assert store.emergency_slot_spill_allocations == 1
+    assert store.slot_capacity_reroutes == 1
+
+
+def test_assign_slot_id_rejects_full_dpu_without_polluting_free_list():
+    store = object.__new__(UpmemKVSlotStore)
+    store.num_dpus = 2
+    store._slot_id_map = {}
+    store._next_slot_seq_by_dpu = [64, 0]
+    store._free_slot_ids_by_dpu = [[128], []]
+
+    class _Helper:
+        MAX_SLOTS_PER_DPU = 64
+
+    store.helper = _Helper()
+
+    try:
+        UpmemKVSlotStore._assign_slot_id(store, ("k", "v"), preferred_dpu=0)
+    except RuntimeError as exc:
+        assert "No DPU KV slot capacity remains" in str(exc)
+    else:
+        raise AssertionError("expected exhausted DPU to reject new slot assignment")
+
+    assert ("k", "v") not in store._slot_id_map
+    assert store._free_slot_ids_by_dpu[0] == []
+    assert store._next_slot_seq_by_dpu == [64, 0]
 
 
 def test_segmented_base_capacity_reserves_decode_growth_on_tail_blocks():

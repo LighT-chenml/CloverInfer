@@ -132,6 +132,10 @@ def parse_args():
     parser.add_argument("--no-clover-pim-rank-spread-alloc-experimental-enabled", action="store_true")
     parser.add_argument("--clover-pim-slot-spill-alloc-experimental-enabled", action="store_true")
     parser.add_argument("--no-clover-pim-slot-spill-alloc-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-pim-slot-pressure-aware-alloc-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-slot-pressure-aware-alloc-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-pim-emergency-slot-spill-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-emergency-slot-spill-experimental-enabled", action="store_true")
     parser.add_argument("--clover-pim-reserve-segment-tail-capacity-experimental-enabled", action="store_true")
     parser.add_argument("--no-clover-pim-reserve-segment-tail-capacity-experimental-enabled", action="store_true")
     parser.add_argument("--clover-pim-reserve-segment-tail-capacity-tokens", type=int, default=0)
@@ -154,6 +158,8 @@ def parse_args():
     parser.add_argument("--clover-capacity-aware-pim-b", type=float, default=0.0)
     parser.add_argument("--clover-capacity-aware-host-c", type=float, default=1.0)
     parser.add_argument("--clover-capacity-aware-max-tokens-per-dpu", type=int, default=0)
+    parser.add_argument("--clover-capacity-aware-require-slot-headroom", action="store_true")
+    parser.add_argument("--no-clover-capacity-aware-require-slot-headroom", action="store_true")
     parser.add_argument("--decode-step-sync-window-s", type=float, default=0.0)
     parser.add_argument("--decode-step-sync-max-size", type=int, default=8)
     parser.add_argument("--attention-decode-wave-persist-enabled", action="store_true")
@@ -205,6 +211,22 @@ def main():
         raise ValueError(
             "cannot set both --clover-pim-slot-spill-alloc-experimental-enabled and "
             "--no-clover-pim-slot-spill-alloc-experimental-enabled"
+        )
+    if (
+        args.clover_pim_slot_pressure_aware_alloc_experimental_enabled
+        and args.no_clover_pim_slot_pressure_aware_alloc_experimental_enabled
+    ):
+        raise ValueError(
+            "cannot set both --clover-pim-slot-pressure-aware-alloc-experimental-enabled and "
+            "--no-clover-pim-slot-pressure-aware-alloc-experimental-enabled"
+        )
+    if (
+        args.clover_pim_emergency_slot_spill_experimental_enabled
+        and args.no_clover_pim_emergency_slot_spill_experimental_enabled
+    ):
+        raise ValueError(
+            "cannot set both --clover-pim-emergency-slot-spill-experimental-enabled and "
+            "--no-clover-pim-emergency-slot-spill-experimental-enabled"
         )
     if (
         args.clover_pim_reserve_segment_tail_capacity_experimental_enabled
@@ -282,6 +304,16 @@ def main():
     )
     if args.no_clover_pim_slot_spill_alloc_experimental_enabled:
         clover_pim_slot_spill_alloc_experimental_enabled = False
+    clover_pim_slot_pressure_aware_alloc_experimental_enabled = bool(
+        args.clover_pim_slot_pressure_aware_alloc_experimental_enabled
+    )
+    if args.no_clover_pim_slot_pressure_aware_alloc_experimental_enabled:
+        clover_pim_slot_pressure_aware_alloc_experimental_enabled = False
+    clover_pim_emergency_slot_spill_experimental_enabled = bool(
+        args.clover_pim_emergency_slot_spill_experimental_enabled
+    )
+    if args.no_clover_pim_emergency_slot_spill_experimental_enabled:
+        clover_pim_emergency_slot_spill_experimental_enabled = False
     clover_pim_reserve_segment_tail_capacity_experimental_enabled = bool(
         args.clover_pim_reserve_segment_tail_capacity_experimental_enabled
     )
@@ -309,6 +341,11 @@ def main():
     clover_capacity_aware_batching_enabled = bool(args.clover_capacity_aware_batching_enabled)
     if args.no_clover_capacity_aware_batching_enabled:
         clover_capacity_aware_batching_enabled = False
+    clover_capacity_aware_require_slot_headroom = bool(
+        args.clover_capacity_aware_require_slot_headroom
+    )
+    if args.no_clover_capacity_aware_require_slot_headroom:
+        clover_capacity_aware_require_slot_headroom = False
 
     ray.init(
         address=args.address,
@@ -384,6 +421,12 @@ def main():
         clover_pim_attention_enabled=(args.attention_backend == "cloverinfer"),
         clover_pim_rank_spread_alloc_experimental_enabled=clover_pim_rank_spread_alloc_experimental_enabled,
         clover_pim_slot_spill_alloc_experimental_enabled=clover_pim_slot_spill_alloc_experimental_enabled,
+        clover_pim_slot_pressure_aware_alloc_experimental_enabled=(
+            clover_pim_slot_pressure_aware_alloc_experimental_enabled
+        ),
+        clover_pim_emergency_slot_spill_experimental_enabled=(
+            clover_pim_emergency_slot_spill_experimental_enabled
+        ),
         clover_pim_reserve_segment_tail_capacity_experimental_enabled=(
             clover_pim_reserve_segment_tail_capacity_experimental_enabled
         ),
@@ -403,6 +446,7 @@ def main():
         clover_capacity_aware_pim_b=args.clover_capacity_aware_pim_b,
         clover_capacity_aware_host_c=args.clover_capacity_aware_host_c,
         clover_capacity_aware_max_tokens_per_dpu=args.clover_capacity_aware_max_tokens_per_dpu,
+        clover_capacity_aware_require_slot_headroom=clover_capacity_aware_require_slot_headroom,
     )
     model = ModelConfig(
         model_name=args.model_name,
@@ -458,6 +502,12 @@ def main():
             assert bool(store_debug.get("slot_spill_alloc_enabled", False)) == (
                 clover_pim_slot_spill_alloc_experimental_enabled
             ), debug
+            assert bool(store_debug.get("slot_pressure_aware_alloc_enabled", False)) == (
+                clover_pim_slot_pressure_aware_alloc_experimental_enabled
+            ), debug
+            assert bool(store_debug.get("emergency_slot_spill_enabled", False)) == (
+                clover_pim_emergency_slot_spill_experimental_enabled
+            ), debug
             assert bool(store_debug.get("reserve_segment_tail_capacity_enabled", False)) == (
                 clover_pim_reserve_segment_tail_capacity_experimental_enabled
                 or args.clover_pim_reserve_segment_tail_capacity_tokens > 0
@@ -494,6 +544,10 @@ def main():
             assert dense_batching["predictive_enabled"] == clover_predictive_scheduling_enabled, dense_batching
             assert "predictive_last_batch" in dense_batching, dense_batching
             assert dense_batching["capacity_aware_enabled"] == clover_capacity_aware_batching_enabled, dense_batching
+            assert (
+                dense_batching["capacity_aware_require_slot_headroom"]
+                == clover_capacity_aware_require_slot_headroom
+            ), dense_batching
             assert "capacity_aware_last_batch" in dense_batching, dense_batching
         if args.attention_backend in {"pim_naive", "cloverinfer"}:
             debug = metrics["attention_backend"]["backend_debug"]

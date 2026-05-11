@@ -50,6 +50,8 @@ class ClusterConfig(BaseModel):
     clover_pim_context_fused_experimental_enabled: bool = False
     clover_pim_rank_spread_alloc_experimental_enabled: bool = False
     clover_pim_slot_spill_alloc_experimental_enabled: bool = False
+    clover_pim_slot_pressure_aware_alloc_experimental_enabled: bool = False
+    clover_pim_emergency_slot_spill_experimental_enabled: bool = False
     clover_pim_reserve_segment_tail_capacity_experimental_enabled: bool = False
     clover_pim_reserve_segment_tail_capacity_tokens: int = 0
     clover_compact_short_segments_enabled: bool = False
@@ -68,6 +70,7 @@ class ClusterConfig(BaseModel):
     clover_capacity_aware_pim_b: float = 0.0
     clover_capacity_aware_host_c: float = 1.0
     clover_capacity_aware_max_tokens_per_dpu: int = 0
+    clover_capacity_aware_require_slot_headroom: bool = False
     clover_rankset_overlap_enabled: bool = False
     clover_rankset_overlap_max_ranksets_per_batch: int = 0
     clover_rankset_overlap_transfer_granularity: str = "stripe"

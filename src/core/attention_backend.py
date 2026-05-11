@@ -726,6 +726,117 @@ class PimNaiveAttentionBackend:
             return _balanced_segments()
         return segment_plan
 
+    def _coarsen_short_segment_plan(
+        self,
+        segment_plan: Sequence[Dict[str, int]],
+    ) -> tuple[List[Dict[str, int]], str]:
+        if not self.compact_short_segments_enabled:
+            return ([dict(item) for item in segment_plan], "")
+        normalized = [
+            {
+                "dpu_id": int(item.get("dpu_id", item.get("physical_dpu", 0))),
+                "token_range_start": int(item.get("token_range_start", 0)),
+                "token_range_end": int(item.get("token_range_end", 0)),
+            }
+            for item in segment_plan
+            if int(item.get("token_range_end", 0)) > int(item.get("token_range_start", 0))
+        ]
+        if len(normalized) <= 1:
+            return (normalized, "")
+
+        min_tokens = max(1, int(self.compact_short_segment_min_tokens))
+        token_counts = [
+            int(item["token_range_end"]) - int(item["token_range_start"])
+            for item in normalized
+        ]
+        max_segment_tokens = max(token_counts, default=0)
+        if max_segment_tokens >= min_tokens:
+            return (normalized, "")
+
+        coarsened: List[Dict[str, int]] = []
+        chunk: List[Dict[str, int]] = []
+        chunk_tokens = 0
+        for item in normalized:
+            chunk.append(item)
+            chunk_tokens += int(item["token_range_end"]) - int(item["token_range_start"])
+            if chunk_tokens < min_tokens:
+                continue
+            chosen_dpu = self._select_segment_dpu(chunk)
+            coarsened.append(
+                {
+                    "dpu_id": int(chosen_dpu),
+                    "token_range_start": int(chunk[0]["token_range_start"]),
+                    "token_range_end": int(chunk[-1]["token_range_end"]),
+                }
+            )
+            chunk = []
+            chunk_tokens = 0
+
+        if chunk:
+            if coarsened:
+                coarsened[-1]["token_range_end"] = int(chunk[-1]["token_range_end"])
+            else:
+                chosen_dpu = self._select_segment_dpu(chunk)
+                coarsened.append(
+                    {
+                        "dpu_id": int(chosen_dpu),
+                        "token_range_start": int(chunk[0]["token_range_start"]),
+                        "token_range_end": int(chunk[-1]["token_range_end"]),
+                    }
+                )
+
+        if len(coarsened) >= len(normalized):
+            return (normalized, "")
+        if len(coarsened) <= 1:
+            reason = "short_segments_compacted"
+        else:
+            reason = "short_segments_coarsened"
+        return (
+            coarsened,
+            f"{reason}:from={len(normalized)},to={len(coarsened)},"
+            f"max_segment_tokens={max_segment_tokens},min_segment_tokens={min_tokens}",
+        )
+
+    def _segment_dpu_pressure(self, physical_dpu: int) -> tuple[int, int, int]:
+        normalized_dpu = int(physical_dpu) % max(self.num_dpus, 1)
+        slot_counts = getattr(self.resident_store, "dpu_live_slot_counts_by_dpu", None)
+        elem_counts = getattr(self.resident_store, "dpu_live_elems_by_dpu", None)
+        slot_pressure = 0
+        elem_pressure = 0
+        if isinstance(slot_counts, list) and normalized_dpu < len(slot_counts):
+            slot_pressure = int(slot_counts[normalized_dpu])
+        if isinstance(elem_counts, list) and normalized_dpu < len(elem_counts):
+            elem_pressure = int(elem_counts[normalized_dpu])
+        return (slot_pressure, elem_pressure, normalized_dpu)
+
+    def _select_segment_dpu(
+        self,
+        segment_items: Sequence[Dict[str, int]],
+        *,
+        preferred_dpu: int | None = None,
+    ) -> int:
+        if not segment_items:
+            return 0
+        preferred = None if preferred_dpu is None else int(preferred_dpu) % max(self.num_dpus, 1)
+        soft_limit = int(getattr(self.resident_store, "slot_pressure_soft_limit", 0))
+        candidates: List[tuple[int, int, int, int, int]] = []
+        for ordinal, item in enumerate(segment_items):
+            dpu_id = int(item["dpu_id"]) % max(self.num_dpus, 1)
+            token_count = int(item["token_range_end"]) - int(item["token_range_start"])
+            slot_pressure, elem_pressure, normalized_dpu = self._segment_dpu_pressure(dpu_id)
+            preferred_miss = 0 if preferred is not None and normalized_dpu == preferred else 1
+            candidates.append(
+                (
+                    preferred_miss if preferred is not None else 0,
+                    max(0, slot_pressure - soft_limit),
+                    elem_pressure,
+                    -int(token_count),
+                    int(ordinal),
+                    normalized_dpu,
+                )
+            )
+        return int(min(candidates)[-1])
+
     def _planner_segment_materialization_decision(
         self,
         segment_plan: Sequence[Dict[str, int]],
@@ -1066,10 +1177,17 @@ class PimNaiveAttentionBackend:
             use_segment_plan, segment_decision = self._planner_segment_materialization_decision(segment_plan)
             if segment_plan:
                 self.planner_segment_plan_count += 1
-                self.planner_segment_last_decision = segment_decision
+                segment_plan, coarsen_decision = self._coarsen_short_segment_plan(segment_plan)
+                use_segment_plan, segment_decision = self._planner_segment_materialization_decision(segment_plan)
+                self.planner_segment_last_decision = coarsen_decision or segment_decision
                 if use_segment_plan:
                     self.planner_segment_materialized_count += 1
-                elif len({int(item.get("dpu_id", item.get("physical_dpu", -1))) for item in segment_plan}) > 1:
+                if coarsen_decision or (
+                    not use_segment_plan
+                    and len(
+                        {int(item.get("dpu_id", item.get("physical_dpu", -1))) for item in segment_plan}
+                    ) > 1
+                ):
                     self.planner_segment_compacted_count += 1
             physical_dpu = self._choose_group_physical_dpu(
                 group_idx=group_idx,

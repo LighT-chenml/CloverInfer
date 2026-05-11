@@ -178,6 +178,36 @@ def test_request_state_compacts_short_planner_token_segments_when_enabled():
     assert backend.planner_segment_last_decision.startswith("short_segments_compacted")
 
 
+def test_request_state_coarsens_mid_length_short_segments_when_enabled():
+    backend = _PlannerOnlyBackend(
+        num_dpus=16,
+        resident_store_backend="host",
+        head_grouping_policy="balanced",
+        compact_short_segments_enabled=True,
+        compact_short_segment_min_tokens=16,
+    )
+    backend.resident_store = _RecordingHostStore()
+    state = backend._build_request_state(
+        "req_mid",
+        _dummy_initial_kv(seq_len=60, num_heads=2, head_dim=8, num_layers=1),
+        decode_reserve_tokens=2,
+    )
+
+    group = state.layer_states[0].head_groups[0]
+    assert len(group.physical_dpus or []) == 3
+    assert [(segment["token_range_start"], segment["token_range_end"]) for segment in (group.token_segments or [])] == [
+        (0, 16),
+        (16, 32),
+        (32, 60),
+    ]
+
+    first_call = backend.resident_store.allocate_calls[0]
+    assert len(first_call["segment_plan"]) == 3
+    assert backend.planner_segment_materialized_count == 1
+    assert backend.planner_segment_compacted_count == 1
+    assert backend.planner_segment_last_decision.startswith("short_segments_coarsened")
+
+
 def test_request_state_keeps_large_planner_token_segments_when_compaction_enabled():
     backend = _PlannerOnlyBackend(
         num_dpus=4,

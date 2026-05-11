@@ -90,10 +90,10 @@ def allocator_aware_capacity_checker(
 
     The planner's `dpu_loads` remain an approximation of additional demand for
     the candidate batch, but the admission decision is anchored to real helper
-    state instead of a static max-token threshold alone.  Slot-table headroom is
-    reported separately and can be made strict for allocator tests, but the
-    online scheduler keeps it soft because decode appends often fit in existing
-    resident blocks even when a physical DPU's 64-slot table is full.
+    state instead of a static max-token threshold alone. Slot-table headroom is
+    reported separately and can optionally be made strict for admission control
+    when experiments need to avoid resident growth fallback at the cost of
+    smaller micro-batches.
     """
 
     normalized_bytes_per_token = max(1, int(bytes_per_token))
@@ -103,8 +103,11 @@ def allocator_aware_capacity_checker(
         sharding_plan: ShardingPlanLike,
         max_capacity_per_dpu: int,
     ) -> Dict[str, object]:
-        del batch_requests
         stats = [dict(item) for item in allocator_stats_provider()]
+        slot_demand_per_touched_group = max(
+            1,
+            sum(int(request.get("num_new_tokens", 1) or 1) for request in batch_requests),
+        )
         dpu_loads = {
             int(dpu_id): int(load)
             for dpu_id, load in dict(sharding_plan.get("dpu_loads", {}) or {}).items()
@@ -156,10 +159,10 @@ def allocator_aware_capacity_checker(
                 group_dpus = dpu_groups.get(group_id, [int(dpu_id)])
                 free_slots = sum(int(free_slots_by_dpu.get(int(group_dpu), 64)) for group_dpu in group_dpus)
                 remaining_slots_by_group[group_id] = min(
-                    int(remaining_slots_by_group.get(group_id, free_slots - 1)),
-                    free_slots - 1,
+                    int(remaining_slots_by_group.get(group_id, free_slots - slot_demand_per_touched_group)),
+                    free_slots - slot_demand_per_touched_group,
                 )
-                if require_slot_headroom and free_slots <= 0:
+                if require_slot_headroom and free_slots < slot_demand_per_touched_group:
                     ok = False
 
         peak_load = max(dpu_loads.values(), default=0)

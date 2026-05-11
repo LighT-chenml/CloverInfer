@@ -190,6 +190,40 @@ def test_allocator_aware_capacity_checker_allows_group_slot_substitution():
     assert result["slot_headroom_ok"] is True
 
 
+def test_lookahead_respects_strict_slot_headroom():
+    checker = allocator_aware_capacity_checker(
+        lambda: [
+            {"dpu_id": 0, "total_free_elems": 1024, "live_slot_count": 63},
+            {"dpu_id": 1, "total_free_elems": 1024, "live_slot_count": 64},
+        ],
+        bytes_per_token=1,
+        require_slot_headroom=True,
+    )
+    scheduler = CapacityAwareMicroBatchScheduler(
+        planner=lambda requests, D, H: {
+            "dpu_groups": {0: [0, 1]},
+            "dpu_loads": {0: len(requests), 1: len(requests)},
+        },
+        predict_pim_time=lambda reqs, plan: float(len(reqs)),
+        predict_host_time=lambda total_tokens: float(total_tokens),
+        capacity_checker=checker,
+        num_dpus=2,
+        num_heads=1,
+        time_gap_threshold=0.0,
+        lookahead_window=2,
+    )
+    queue = [
+        {"request_id": "r0", "seq_len": 8, "num_new_tokens": 1},
+        {"request_id": "r1", "seq_len": 8, "num_new_tokens": 1},
+    ]
+
+    decision = scheduler.build_micro_batch(queue, max_capacity_per_dpu=1024, max_batch_size=2)
+
+    assert decision.micro_batch.capacity_ok is True
+    assert len(decision.micro_batch.requests) == 1
+    assert len(queue) == 1
+
+
 def test_allocator_aware_capacity_usage_uses_live_allocator_capacity():
     checker = allocator_aware_capacity_checker(
         lambda: [
