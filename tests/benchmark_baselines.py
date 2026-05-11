@@ -440,6 +440,9 @@ def make_cluster_config(args, attention_backend: str) -> ClusterConfig:
         clover_cpu_shadow_enabled=args.clover_cpu_shadow_enabled,
         clover_shadow_checks_enabled=args.clover_shadow_checks_enabled,
         clover_op_profiling_enabled=args.clover_op_profiling_enabled,
+        clover_cpu_fast_path_max_context_tokens=(
+            args.clover_cpu_fast_path_max_context_tokens if attention_backend == "cloverinfer" else 0
+        ),
         clover_shadow_check_token_interval=args.clover_shadow_check_token_interval,
         clover_shadow_check_layer_interval=args.clover_shadow_check_layer_interval,
         clover_host_qk_mixed_enabled=args.clover_host_qk_mixed_enabled,
@@ -729,6 +732,7 @@ def main():
     parser.add_argument("--no-clover-shadow-checks-enabled", action="store_true")
     parser.add_argument("--clover-op-profiling-enabled", action="store_true")
     parser.add_argument("--no-clover-op-profiling-enabled", action="store_true")
+    parser.add_argument("--clover-cpu-fast-path-max-context-tokens", type=int, default=0)
     parser.add_argument("--clover-shadow-check-token-interval", type=int, default=4)
     parser.add_argument("--clover-shadow-check-layer-interval", type=int, default=4)
     parser.add_argument("--clover-host-qk-mixed-enabled", action="store_true")
@@ -811,6 +815,8 @@ def main():
         raise ValueError(
             "cannot set both --clover-op-profiling-enabled and --no-clover-op-profiling-enabled"
         )
+    if args.clover_cpu_fast_path_max_context_tokens < 0:
+        raise ValueError("--clover-cpu-fast-path-max-context-tokens must be non-negative")
     if args.clover_host_qk_mixed_enabled and args.no_clover_host_qk_mixed_enabled:
         raise ValueError("cannot set both --clover-host-qk-mixed-enabled and --no-clover-host-qk-mixed-enabled")
     if (
@@ -1047,6 +1053,7 @@ def main():
         "clover_capacity_aware_pim_b": float(args.clover_capacity_aware_pim_b),
         "clover_capacity_aware_host_c": float(args.clover_capacity_aware_host_c),
         "clover_capacity_aware_max_tokens_per_dpu": int(args.clover_capacity_aware_max_tokens_per_dpu),
+        "clover_cpu_fast_path_max_context_tokens": int(args.clover_cpu_fast_path_max_context_tokens),
         "clover_capacity_aware_require_slot_headroom": bool(
             args.clover_capacity_aware_require_slot_headroom
         ),

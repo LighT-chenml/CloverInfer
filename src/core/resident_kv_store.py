@@ -1496,6 +1496,7 @@ class UpmemKVSlotStore(ResidentKVStore):
         self.slot_spill_allocations = 0
         self.emergency_slot_spill_enabled = False
         self.emergency_slot_spill_allocations = 0
+        self.host_fallback_migrations = 0
         self.slot_capacity_reroutes = 0
         self.reserve_segment_tail_capacity_enabled = False
         self.reserve_segment_tail_capacity_tokens = 0
@@ -3111,6 +3112,74 @@ class UpmemKVSlotStore(ResidentKVStore):
         self._record_timing("materialize_group", started_at)
         return out
 
+    def migrate_group_to_host_fallback(self, k_slot: str, v_slot: str) -> Dict[str, object]:
+        """Move one DPU-backed group into host fallback for append recovery."""
+        key = self._slot_key(k_slot, v_slot)
+        slot_info = self.slot_mapping[key]
+        if slot_info["backend"] == "host_fallback":
+            return {
+                "backend": "host_fallback",
+                "storage": "host_fallback",
+                "migrated": False,
+            }
+
+        keys, values = self.materialize_group(k_slot, v_slot)
+        capacity = max(int(slot_info.get("capacity", int(keys.shape[0]))), int(keys.shape[0]), 1)
+        preferred_dpu = int(slot_info.get("physical_dpu", slot_info.get("base_physical_dpu", 0)))
+        allowed_dpus = list(slot_info.get("allowed_physical_dpus", []) or [])
+
+        if slot_info["backend"] in {"dpu_segmented", "dpu_blocked"}:
+            self._free_block_infos(slot_info.get("blocks", slot_info.get("segments", [])))
+        elif slot_info["backend"] == "dpu":
+            slot_id = self._slot_id_map.pop(key, None)
+            try:
+                self.helper.free_group(int(slot_info["slot_id"]))
+            except Exception:
+                pass
+            self.dpu_free_ops += 1
+            self.dpu_live_slots = max(0, self.dpu_live_slots - 1)
+            physical_dpu = int(slot_info.get("physical_dpu", 0)) % max(self.num_dpus, 1)
+            elem_count = int(slot_info.get("elem_count", 0))
+            self.dpu_live_slot_counts_by_dpu[physical_dpu] = max(
+                0,
+                self.dpu_live_slot_counts_by_dpu[physical_dpu] - 1,
+            )
+            self.dpu_live_elems_by_dpu[physical_dpu] = max(
+                0,
+                self.dpu_live_elems_by_dpu[physical_dpu] - elem_count,
+            )
+            if slot_id is not None:
+                self._remember_free_slot_id(physical_dpu, int(slot_id))
+            self.helper.persistent_state_active = self.dpu_live_slots > 0
+            if self.dpu_live_slots == 0:
+                self.helper.close()
+
+        self.host_fallback.allocate_group(
+            k_slot,
+            v_slot,
+            keys,
+            values,
+            capacity=capacity,
+            preferred_dpu=preferred_dpu,
+            allowed_dpus=allowed_dpus or None,
+        )
+        self.slot_mapping[key] = {
+            "backend": "host_fallback",
+            "slot_id": None,
+            "physical_dpu": preferred_dpu,
+            "elem_count": 0,
+            "migrated_from": str(slot_info.get("backend", "")),
+        }
+        self.fallback_allocations += 1
+        self.host_fallback_migrations += 1
+        return {
+            "backend": "host_fallback",
+            "storage": "host_fallback",
+            "migrated": True,
+            "seq_len": int(keys.shape[0]),
+            "capacity": int(capacity),
+        }
+
     def slot_debug(self, k_slot: str, v_slot: str) -> Dict[str, object]:
         key = self._slot_key(k_slot, v_slot)
         slot_info = self.slot_mapping[key]
@@ -3275,6 +3344,7 @@ class UpmemKVSlotStore(ResidentKVStore):
             "slot_spill_allocations": self.slot_spill_allocations,
             "emergency_slot_spill_enabled": bool(getattr(self, "emergency_slot_spill_enabled", False)),
             "emergency_slot_spill_allocations": int(getattr(self, "emergency_slot_spill_allocations", 0)),
+            "host_fallback_migrations": int(getattr(self, "host_fallback_migrations", 0)),
             "slot_capacity_reroutes": int(getattr(self, "slot_capacity_reroutes", 0)),
             "reserve_segment_tail_capacity_enabled": bool(
                 getattr(self, "reserve_segment_tail_capacity_enabled", False)

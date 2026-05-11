@@ -43,6 +43,7 @@ class ClusterConfig(BaseModel):
     clover_cpu_shadow_enabled: bool = True
     clover_shadow_checks_enabled: bool = True
     clover_op_profiling_enabled: bool = True
+    clover_cpu_fast_path_max_context_tokens: int = 0
     clover_shadow_check_token_interval: int = 4
     clover_shadow_check_layer_interval: int = 4
     clover_host_qk_mixed_enabled: bool = False

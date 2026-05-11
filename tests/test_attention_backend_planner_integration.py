@@ -104,6 +104,29 @@ class _RecordingHostStore(HostResidentKVStore):
         )
 
 
+class _RecoveringHostStore(HostResidentKVStore):
+    def __init__(self):
+        super().__init__()
+        self.failed_once = False
+        self.migrated_slots = []
+
+    def append_group(self, k_slot, v_slot, k_new, v_new):
+        key = self._slot_key(k_slot, v_slot)
+        if "group1" in str(k_slot) and key not in self.migrated_slots and not self.failed_once:
+            self.failed_once = True
+            raise RuntimeError("synthetic append failure")
+        return super().append_group(k_slot, v_slot, k_new, v_new)
+
+    def migrate_group_to_host_fallback(self, k_slot, v_slot):
+        key = self._slot_key(k_slot, v_slot)
+        self.migrated_slots.append(key)
+        return {
+            "backend": "host_fallback",
+            "storage": "host_fallback",
+            "migrated": True,
+        }
+
+
 def test_request_state_materializes_planner_token_segments_for_multi_dpu_group():
     backend = _PlannerOnlyBackend(
         num_dpus=4,
@@ -140,6 +163,33 @@ def test_request_state_materializes_planner_token_segments_for_multi_dpu_group()
         (6, 8),
         (8, 10),
     ]
+
+
+def test_resident_append_recovers_group_failure_without_seq_len_skew():
+    backend = _PlannerOnlyBackend(
+        num_dpus=4,
+        resident_store_backend="host",
+        head_grouping_policy="balanced",
+    )
+    recovering_store = _RecoveringHostStore()
+    backend.resident_store = recovering_store
+    state = backend._build_request_state(
+        "req_recover",
+        _dummy_initial_kv(seq_len=4, num_heads=8, head_dim=8, num_layers=1),
+        decode_reserve_tokens=2,
+    )
+
+    backend._append_resident_kv(
+        state,
+        0,
+        torch.randn(8, 8),
+        torch.randn(8, 8),
+    )
+
+    assert recovering_store.failed_once is True
+    assert len(recovering_store.migrated_slots) == 1
+    assert state.context_len == 5
+    assert {group.seq_len for group in state.layer_states[0].head_groups} == {5}
 
 
 def test_request_state_compacts_short_planner_token_segments_when_enabled():

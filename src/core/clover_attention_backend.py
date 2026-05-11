@@ -8,6 +8,17 @@ import torch
 from .attention_backend import PimNaiveAttentionBackend
 
 
+class _NoopTimer:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+_NOOP_TIMER = _NoopTimer()
+
+
 class CloverInferAttentionBackend(PimNaiveAttentionBackend):
     """Independent CloverInfer backend.
 
@@ -26,6 +37,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         cpu_shadow_enabled: bool = True,
         shadow_checks_enabled: bool = True,
         op_profiling_enabled: bool = True,
+        cpu_fast_path_max_context_tokens: int = 0,
         shadow_check_token_interval: int = 1,
         shadow_check_layer_interval: int = 1,
         host_qk_mixed_enabled: bool = False,
@@ -49,6 +61,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         self.cpu_shadow_enabled = bool(cpu_shadow_enabled)
         self.shadow_checks_enabled = bool(shadow_checks_enabled)
         self.op_profiling_enabled = bool(op_profiling_enabled)
+        self.cpu_fast_path_max_context_tokens = max(0, int(cpu_fast_path_max_context_tokens))
         self.shadow_check_token_interval = max(1, int(shadow_check_token_interval))
         self.shadow_check_layer_interval = max(1, int(shadow_check_layer_interval))
         self.host_qk_mixed_enabled = bool(host_qk_mixed_enabled)
@@ -77,6 +90,9 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         self.shadow_k_buffers: Dict[str, List[torch.Tensor]] = {}
         self.shadow_v_buffers: Dict[str, List[torch.Tensor]] = {}
         self.shadow_layer_lens: Dict[str, List[int]] = {}
+        self.cpu_fast_path_request_ids: set[str] = set()
+        self.cpu_fast_path_decode_calls = 0
+        self.cpu_fast_path_decode_items = 0
         self.op_timing_totals: Dict[str, float] = {
             "prepare_decode_record_s": 0.0,
             "normalize_decode_tensors_s": 0.0,
@@ -131,6 +147,9 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
             )
 
     def _timed(self, name: str):
+        if not self.op_profiling_enabled:
+            return _NOOP_TIMER
+
         class _Timer:
             def __init__(self, backend: CloverInferAttentionBackend, key: str):
                 self.backend = backend
@@ -142,8 +161,6 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                 return self
 
             def __exit__(self, exc_type, exc, tb):
-                if not self.backend.op_profiling_enabled:
-                    return False
                 elapsed = time.perf_counter() - self.started_at
                 self.backend.op_timing_totals[self.key] += float(elapsed)
                 self.backend.op_timing_counts[self.key] += 1
@@ -247,6 +264,52 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         k_buf[current_len:target_len].copy_(k_new)
         v_buf[current_len:target_len].copy_(v_new)
         self.shadow_layer_lens[request_id][layer_idx] = target_len
+
+    def _use_cpu_fast_path_for_request(self, request_id: str) -> bool:
+        return str(request_id) in self.cpu_fast_path_request_ids
+
+    def _decode_cpu_fast_path_batch(self, items: List[Dict[str, object]]) -> List[torch.Tensor]:
+        records: List[Dict[str, object]] = []
+        for item in items:
+            request_id = str(item["request_id"])
+            layer_idx = int(item["layer_idx"])
+            if request_id not in self.shadow_k_buffers:
+                raise KeyError(f"CPU fast path missing shadow KV for request {request_id}")
+            q, k_new, v_new = self._normalize_decode_tensors(
+                item["query"],
+                item["key"],
+                item["value"],
+            )
+            self._append_cpu_shadow_kv(
+                request_id,
+                layer_idx,
+                k_new.unsqueeze(0),
+                v_new.unsqueeze(0),
+            )
+            keys, values = self._cpu_shadow_active_kv(request_id, layer_idx)
+            records.append(
+                {
+                    "request_id": request_id,
+                    "layer_idx": layer_idx,
+                    "query_dtype": q.dtype,
+                    "q_fp32": q if q.dtype == torch.float32 and q.is_contiguous() else q.to(torch.float32).contiguous(),
+                    "keys": keys,
+                    "values": values,
+                    "score_scale": float(item.get("score_scale", 1.0)),
+                }
+            )
+
+        outputs: List[torch.Tensor] = []
+        for record in records:
+            scores = self._compute_host_scores(record)
+            weights = torch.softmax(scores, dim=-1)
+            context = torch.einsum("hl,lhd->hd", weights, record["values"].float()).to(record["query_dtype"])
+            if record["layer_idx"] == len(self.shadow_k_buffers[record["request_id"]]) - 1:
+                self.cpu_backend.context_lens[record["request_id"]] += 1
+            outputs.append(context.unsqueeze(0))
+        self.cpu_fast_path_decode_calls += 1
+        self.cpu_fast_path_decode_items += len(items)
+        return outputs
 
     def _update_resident_shadow_diff(
         self,
@@ -463,6 +526,27 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
             return []
         self.decode_batch_calls += 1
         self.decode_batch_items += len(items)
+        fast_items_with_indices = [
+            (idx, item)
+            for idx, item in enumerate(items)
+            if self._use_cpu_fast_path_for_request(str(item["request_id"]))
+        ]
+        if len(fast_items_with_indices) == len(items):
+            return self._decode_cpu_fast_path_batch(items)
+        if fast_items_with_indices:
+            outputs: List[torch.Tensor | None] = [None for _ in items]
+            fast_outputs = self._decode_cpu_fast_path_batch([item for _, item in fast_items_with_indices])
+            for (idx, _), output in zip(fast_items_with_indices, fast_outputs):
+                outputs[idx] = output
+            pim_items_with_indices = [
+                (idx, item)
+                for idx, item in enumerate(items)
+                if not self._use_cpu_fast_path_for_request(str(item["request_id"]))
+            ]
+            pim_outputs = self.decode_layer_batch([item for _, item in pim_items_with_indices])
+            for (idx, _), output in zip(pim_items_with_indices, pim_outputs):
+                outputs[idx] = output
+            return [output for output in outputs if output is not None]
         records = [self._prepare_decode_record(item) for item in items]
         use_qk_context_fused = (
             self.pim_attention_enabled
@@ -997,24 +1081,34 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         initial_kv: List[Dict[str, torch.Tensor]],
         decode_reserve_tokens: int = 0,
     ) -> int:
-        if self.cpu_shadow_enabled:
+        if not initial_kv:
+            raise ValueError("initial_kv must contain at least one layer")
+        initial_seq_len = int(initial_kv[0]["key"].shape[0])
+        use_cpu_fast_path = (
+            self.cpu_fast_path_max_context_tokens > 0
+            and initial_seq_len <= self.cpu_fast_path_max_context_tokens
+        )
+        if self.cpu_shadow_enabled or use_cpu_fast_path:
             seq_len = self._init_cpu_shadow_request(
                 request_id,
                 initial_kv,
                 decode_reserve_tokens,
             )
         else:
-            seq_len = int(initial_kv[0]["key"].shape[0])
+            seq_len = initial_seq_len
             self.cpu_backend.context_lens[request_id] = seq_len
-        self.request_states[request_id] = self._build_request_state(
-            request_id,
-            initial_kv,
-            decode_reserve_tokens,
-        )
+        if use_cpu_fast_path:
+            self.cpu_fast_path_request_ids.add(str(request_id))
+        else:
+            self.request_states[request_id] = self._build_request_state(
+                request_id,
+                initial_kv,
+                decode_reserve_tokens,
+            )
         return seq_len
 
     def get_context_len(self, request_id: str) -> int:
-        if self.cpu_shadow_enabled:
+        if self.cpu_shadow_enabled or self._use_cpu_fast_path_for_request(request_id):
             return self.cpu_backend.get_context_len(request_id)
         request_state = self.request_states.get(request_id)
         if request_state is None:
@@ -1022,7 +1116,8 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         return int(request_state.context_len)
 
     def free_request(self, request_id: str) -> None:
-        if self.cpu_shadow_enabled:
+        self.cpu_fast_path_request_ids.discard(str(request_id))
+        if self.cpu_shadow_enabled or request_id not in self.request_states:
             self.shadow_k_buffers.pop(request_id, None)
             self.shadow_v_buffers.pop(request_id, None)
             self.shadow_layer_lens.pop(request_id, None)
@@ -1042,6 +1137,10 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         debug["clover_cpu_shadow_enabled"] = self.cpu_shadow_enabled
         debug["clover_shadow_checks_enabled"] = self.shadow_checks_enabled
         debug["clover_op_profiling_enabled"] = self.op_profiling_enabled
+        debug["clover_cpu_fast_path_max_context_tokens"] = int(self.cpu_fast_path_max_context_tokens)
+        debug["clover_cpu_fast_path_request_count"] = int(len(self.cpu_fast_path_request_ids))
+        debug["clover_cpu_fast_path_decode_calls"] = int(self.cpu_fast_path_decode_calls)
+        debug["clover_cpu_fast_path_decode_items"] = int(self.cpu_fast_path_decode_items)
         debug["clover_shadow_check_token_interval"] = self.shadow_check_token_interval
         debug["clover_shadow_check_layer_interval"] = self.shadow_check_layer_interval
         debug["clover_host_qk_mixed_enabled"] = self.host_qk_mixed_enabled

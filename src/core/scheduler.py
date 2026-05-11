@@ -1700,6 +1700,9 @@ class GlobalScheduler:
                         "cpu_shadow_enabled": bool(self.cluster_config.clover_cpu_shadow_enabled),
                         "shadow_checks_enabled": bool(self.cluster_config.clover_shadow_checks_enabled),
                         "op_profiling_enabled": bool(self.cluster_config.clover_op_profiling_enabled),
+                        "cpu_fast_path_max_context_tokens": int(
+                            self.cluster_config.clover_cpu_fast_path_max_context_tokens
+                        ),
                         "shadow_check_token_interval": int(self.cluster_config.clover_shadow_check_token_interval),
                         "shadow_check_layer_interval": int(self.cluster_config.clover_shadow_check_layer_interval),
                         "host_qk_mixed_enabled": bool(self.cluster_config.clover_host_qk_mixed_enabled),

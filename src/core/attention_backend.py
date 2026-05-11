@@ -1602,26 +1602,8 @@ class PimNaiveAttentionBackend:
             self._maybe_expand_request_stripe(request_state)
         layer_state = request_state.layer_states[layer_idx]
         expected_seq_len = request_state.context_len + 1
-        for group in layer_state.head_groups:
-            if group.seq_len != request_state.context_len:
-                raise RuntimeError(
-                    f"resident metadata seq_len mismatch before append for request={request_state.request_id} "
-                    f"layer={layer_idx} dpu={group.dpu_id}: group_seq_len={group.seq_len} "
-                    f"context_len={request_state.context_len}"
-                )
-            group_k_new = k_new[group.head_start:group.head_end, :].unsqueeze(0).contiguous()
-            group_v_new = v_new[group.head_start:group.head_end, :].unsqueeze(0).contiguous()
-            if group_k_new.shape[1] != group.head_end - group.head_start:
-                raise RuntimeError(
-                    f"resident k append shape mismatch for request={request_state.request_id} "
-                    f"layer={layer_idx} dpu={group.dpu_id}: got={tuple(group_k_new.shape)}"
-                )
-            append_info = self.resident_store.append_group(
-                group.k_slot,
-                group.v_slot,
-                group_k_new,
-                group_v_new,
-            )
+
+        def _refresh_group_metadata(group: HeadGroupState, append_info: Dict[str, int]) -> None:
             group.seq_len = int(append_info["seq_len"])
             group.capacity = int(append_info["capacity"])
             slot_debug = self.resident_store.slot_debug(group.k_slot, group.v_slot)
@@ -1641,6 +1623,39 @@ class PimNaiveAttentionBackend:
                     }
                     for segment in slot_segments
                 ]
+
+        for group in layer_state.head_groups:
+            if group.seq_len != request_state.context_len:
+                raise RuntimeError(
+                    f"resident metadata seq_len mismatch before append for request={request_state.request_id} "
+                    f"layer={layer_idx} dpu={group.dpu_id}: group_seq_len={group.seq_len} "
+                    f"context_len={request_state.context_len}"
+                )
+            group_k_new = k_new[group.head_start:group.head_end, :].unsqueeze(0).contiguous()
+            group_v_new = v_new[group.head_start:group.head_end, :].unsqueeze(0).contiguous()
+            if group_k_new.shape[1] != group.head_end - group.head_start:
+                raise RuntimeError(
+                    f"resident k append shape mismatch for request={request_state.request_id} "
+                    f"layer={layer_idx} dpu={group.dpu_id}: got={tuple(group_k_new.shape)}"
+                )
+            try:
+                append_info = self.resident_store.append_group(
+                    group.k_slot,
+                    group.v_slot,
+                    group_k_new,
+                    group_v_new,
+                )
+            except RuntimeError:
+                if not hasattr(self.resident_store, "migrate_group_to_host_fallback"):
+                    raise
+                self.resident_store.migrate_group_to_host_fallback(group.k_slot, group.v_slot)
+                append_info = self.resident_store.append_group(
+                    group.k_slot,
+                    group.v_slot,
+                    group_k_new,
+                    group_v_new,
+                )
+            _refresh_group_metadata(group, append_info)
             if group.seq_len != expected_seq_len:
                 raise RuntimeError(
                     f"resident store seq_len mismatch after append for request={request_state.request_id} "
