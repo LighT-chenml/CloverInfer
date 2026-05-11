@@ -267,6 +267,8 @@ class PimNaiveAttentionBackend:
         qk_mixed_heads: int = 2,
         qk_mixed_window: int = 128,
         host_partial_reduce_enabled: bool = True,
+        compact_short_segments_enabled: bool = False,
+        compact_short_segment_min_tokens: int = 16,
     ):
         self.repo_root = repo_root or os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         self.num_dpus = num_dpus
@@ -309,6 +311,12 @@ class PimNaiveAttentionBackend:
         self.qk_mixed_heads = max(0, int(qk_mixed_heads))
         self.qk_mixed_window = max(1, int(qk_mixed_window))
         self.host_partial_reduce_enabled = bool(host_partial_reduce_enabled)
+        self.compact_short_segments_enabled = bool(compact_short_segments_enabled)
+        self.compact_short_segment_min_tokens = max(1, int(compact_short_segment_min_tokens))
+        self.planner_segment_plan_count = 0
+        self.planner_segment_materialized_count = 0
+        self.planner_segment_compacted_count = 0
+        self.planner_segment_last_decision = ""
         self.qk_mixed_count = 0
         self.qk_mixed_last_max_abs_diff = 0.0
         self.qk_mixed_last_head_diffs = []
@@ -718,6 +726,46 @@ class PimNaiveAttentionBackend:
             return _balanced_segments()
         return segment_plan
 
+    def _planner_segment_materialization_decision(
+        self,
+        segment_plan: Sequence[Dict[str, int]],
+    ) -> tuple[bool, str]:
+        if not segment_plan:
+            return (False, "no_segment_plan")
+
+        unique_dpus = {
+            int(item.get("dpu_id", item.get("physical_dpu", -1)))
+            for item in segment_plan
+        }
+        if len(unique_dpus) <= 1:
+            return (False, "single_dpu_segment_plan")
+
+        if not self.compact_short_segments_enabled:
+            return (True, "compact_short_segments_disabled")
+
+        token_counts = [
+            max(
+                0,
+                int(item.get("token_range_end", 0)) - int(item.get("token_range_start", 0)),
+            )
+            for item in segment_plan
+        ]
+        max_segment_tokens = max(token_counts, default=0)
+        if max_segment_tokens < int(self.compact_short_segment_min_tokens):
+            return (
+                False,
+                "short_segments_compacted:"
+                f"max_segment_tokens={max_segment_tokens},"
+                f"min_segment_tokens={int(self.compact_short_segment_min_tokens)}",
+            )
+
+        return (
+            True,
+            "segments_materialized:"
+            f"max_segment_tokens={max_segment_tokens},"
+            f"min_segment_tokens={int(self.compact_short_segment_min_tokens)}",
+        )
+
     def _map_logical_dpus_to_physical(
         self,
         logical_dpu_ids: Sequence[int],
@@ -1015,7 +1063,14 @@ class PimNaiveAttentionBackend:
                 head_end=head_end,
                 allowed_dpus=allowed_dpus,
             )
-            use_segment_plan = len({int(item.get("dpu_id", -1)) for item in segment_plan}) > 1
+            use_segment_plan, segment_decision = self._planner_segment_materialization_decision(segment_plan)
+            if segment_plan:
+                self.planner_segment_plan_count += 1
+                self.planner_segment_last_decision = segment_decision
+                if use_segment_plan:
+                    self.planner_segment_materialized_count += 1
+                elif len({int(item.get("dpu_id", item.get("physical_dpu", -1))) for item in segment_plan}) > 1:
+                    self.planner_segment_compacted_count += 1
             physical_dpu = self._choose_group_physical_dpu(
                 group_idx=group_idx,
                 num_groups=len(group_specs),
@@ -2287,6 +2342,12 @@ class PimNaiveAttentionBackend:
             "qk_mixed_heads": self.qk_mixed_heads,
             "qk_mixed_window": self.qk_mixed_window,
             "host_partial_reduce_enabled": self.host_partial_reduce_enabled,
+            "compact_short_segments_enabled": self.compact_short_segments_enabled,
+            "compact_short_segment_min_tokens": self.compact_short_segment_min_tokens,
+            "planner_segment_plan_count": self.planner_segment_plan_count,
+            "planner_segment_materialized_count": self.planner_segment_materialized_count,
+            "planner_segment_compacted_count": self.planner_segment_compacted_count,
+            "planner_segment_last_decision": self.planner_segment_last_decision,
             "qk_mixed_count": self.qk_mixed_count,
             "qk_mixed_last_max_abs_diff": self.qk_mixed_last_max_abs_diff,
             "qk_mixed_last_head_diffs": self.qk_mixed_last_head_diffs,

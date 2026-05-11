@@ -1707,6 +1707,22 @@ class GlobalScheduler:
                         "pim_slot_spill_alloc_experimental_enabled": bool(
                             self.cluster_config.clover_pim_slot_spill_alloc_experimental_enabled
                         ),
+                        "pim_reserve_segment_tail_capacity_experimental_enabled": bool(
+                            self.cluster_config.clover_pim_reserve_segment_tail_capacity_experimental_enabled
+                        ),
+                        "pim_reserve_segment_tail_capacity_tokens": int(
+                            getattr(
+                                self.cluster_config,
+                                "clover_pim_reserve_segment_tail_capacity_tokens",
+                                0,
+                            )
+                        ),
+                        "compact_short_segments_enabled": bool(
+                            self.cluster_config.clover_compact_short_segments_enabled
+                        ),
+                        "compact_short_segment_min_tokens": int(
+                            self.cluster_config.clover_compact_short_segment_min_tokens
+                        ),
                         "fine_head_grouping_experimental_enabled": bool(
                             self.cluster_config.clover_fine_head_grouping_experimental_enabled
                         ),

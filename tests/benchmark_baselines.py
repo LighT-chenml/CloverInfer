@@ -451,6 +451,20 @@ def make_cluster_config(args, attention_backend: str) -> ClusterConfig:
         clover_pim_slot_spill_alloc_experimental_enabled=(
             args.clover_pim_slot_spill_alloc_experimental_enabled if attention_backend == "cloverinfer" else False
         ),
+        clover_pim_reserve_segment_tail_capacity_experimental_enabled=(
+            args.clover_pim_reserve_segment_tail_capacity_experimental_enabled
+            if attention_backend == "cloverinfer"
+            else False
+        ),
+        clover_pim_reserve_segment_tail_capacity_tokens=(
+            args.clover_pim_reserve_segment_tail_capacity_tokens
+            if attention_backend == "cloverinfer"
+            else 0
+        ),
+        clover_compact_short_segments_enabled=(
+            args.clover_compact_short_segments_enabled if attention_backend == "cloverinfer" else False
+        ),
+        clover_compact_short_segment_min_tokens=args.clover_compact_short_segment_min_tokens,
         clover_fine_head_grouping_experimental_enabled=(
             args.clover_fine_head_grouping_experimental_enabled if attention_backend == "cloverinfer" else False
         ),
@@ -712,6 +726,12 @@ def main():
     parser.add_argument("--no-clover-pim-rank-spread-alloc-experimental-enabled", action="store_true")
     parser.add_argument("--clover-pim-slot-spill-alloc-experimental-enabled", action="store_true")
     parser.add_argument("--no-clover-pim-slot-spill-alloc-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-pim-reserve-segment-tail-capacity-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-reserve-segment-tail-capacity-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-pim-reserve-segment-tail-capacity-tokens", type=int, default=0)
+    parser.add_argument("--clover-compact-short-segments-enabled", action="store_true")
+    parser.add_argument("--no-clover-compact-short-segments-enabled", action="store_true")
+    parser.add_argument("--clover-compact-short-segment-min-tokens", type=int, default=8)
     parser.add_argument("--clover-fine-head-grouping-experimental-enabled", action="store_true")
     parser.add_argument("--no-clover-fine-head-grouping-experimental-enabled", action="store_true")
     parser.add_argument("--clover-target-heads-per-group-experimental", type=int, default=0)
@@ -799,6 +819,19 @@ def main():
             "--no-clover-pim-slot-spill-alloc-experimental-enabled"
         )
     if (
+        args.clover_pim_reserve_segment_tail_capacity_experimental_enabled
+        and args.no_clover_pim_reserve_segment_tail_capacity_experimental_enabled
+    ):
+        raise ValueError(
+            "cannot set both --clover-pim-reserve-segment-tail-capacity-experimental-enabled and "
+            "--no-clover-pim-reserve-segment-tail-capacity-experimental-enabled"
+        )
+    if args.clover_compact_short_segments_enabled and args.no_clover_compact_short_segments_enabled:
+        raise ValueError(
+            "cannot set both --clover-compact-short-segments-enabled and "
+            "--no-clover-compact-short-segments-enabled"
+        )
+    if (
         args.clover_fine_head_grouping_experimental_enabled
         and args.no_clover_fine_head_grouping_experimental_enabled
     ):
@@ -865,10 +898,8 @@ def main():
         args.clover_op_profiling_enabled = False
     elif args.clover_op_profiling_enabled:
         args.clover_op_profiling_enabled = True
-    args.clover_host_qk_mixed_enabled = False
-    if args.clover_host_qk_mixed_enabled:
-        args.clover_host_qk_mixed_enabled = True
-    elif args.no_clover_host_qk_mixed_enabled:
+    args.clover_host_qk_mixed_enabled = bool(args.clover_host_qk_mixed_enabled)
+    if args.no_clover_host_qk_mixed_enabled:
         args.clover_host_qk_mixed_enabled = False
     args.clover_pim_context_fused_experimental_enabled = bool(
         args.clover_pim_context_fused_experimental_enabled
@@ -885,6 +916,18 @@ def main():
     )
     if args.no_clover_pim_slot_spill_alloc_experimental_enabled:
         args.clover_pim_slot_spill_alloc_experimental_enabled = False
+    args.clover_pim_reserve_segment_tail_capacity_experimental_enabled = bool(
+        args.clover_pim_reserve_segment_tail_capacity_experimental_enabled
+    )
+    if args.no_clover_pim_reserve_segment_tail_capacity_experimental_enabled:
+        args.clover_pim_reserve_segment_tail_capacity_experimental_enabled = False
+    if args.clover_pim_reserve_segment_tail_capacity_tokens < 0:
+        raise ValueError("--clover-pim-reserve-segment-tail-capacity-tokens must be non-negative")
+    args.clover_compact_short_segments_enabled = bool(args.clover_compact_short_segments_enabled)
+    if args.no_clover_compact_short_segments_enabled:
+        args.clover_compact_short_segments_enabled = False
+    if args.clover_compact_short_segment_min_tokens <= 0:
+        raise ValueError("--clover-compact-short-segment-min-tokens must be positive")
     args.clover_fine_head_grouping_experimental_enabled = bool(
         args.clover_fine_head_grouping_experimental_enabled
     )
@@ -960,6 +1003,14 @@ def main():
         "clover_pim_slot_spill_alloc_experimental_enabled": bool(
             args.clover_pim_slot_spill_alloc_experimental_enabled
         ),
+        "clover_pim_reserve_segment_tail_capacity_experimental_enabled": bool(
+            args.clover_pim_reserve_segment_tail_capacity_experimental_enabled
+        ),
+        "clover_pim_reserve_segment_tail_capacity_tokens": int(
+            args.clover_pim_reserve_segment_tail_capacity_tokens
+        ),
+        "clover_compact_short_segments_enabled": bool(args.clover_compact_short_segments_enabled),
+        "clover_compact_short_segment_min_tokens": int(args.clover_compact_short_segment_min_tokens),
         "clover_fine_head_grouping_experimental_enabled": bool(
             args.clover_fine_head_grouping_experimental_enabled
         ),

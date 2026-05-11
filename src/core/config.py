@@ -50,6 +50,10 @@ class ClusterConfig(BaseModel):
     clover_pim_context_fused_experimental_enabled: bool = False
     clover_pim_rank_spread_alloc_experimental_enabled: bool = False
     clover_pim_slot_spill_alloc_experimental_enabled: bool = False
+    clover_pim_reserve_segment_tail_capacity_experimental_enabled: bool = False
+    clover_pim_reserve_segment_tail_capacity_tokens: int = 0
+    clover_compact_short_segments_enabled: bool = False
+    clover_compact_short_segment_min_tokens: int = 8
     clover_fine_head_grouping_experimental_enabled: bool = False
     clover_target_heads_per_group_experimental: int = 0
     clover_host_partial_reduce_enabled: bool = True

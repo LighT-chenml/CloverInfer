@@ -8,6 +8,7 @@ import os
 import numpy as np
 import struct
 import subprocess
+import sys
 import time
 from typing import Dict, List
 
@@ -1458,15 +1459,23 @@ class UpmemKVSlotStore(ResidentKVStore):
         self._slot_id_map: Dict[tuple[str, str], int] = {}
         self._free_slot_ids_by_dpu: list[list[int]] = [[] for _ in range(num_dpus)]
         self._next_slot_seq_by_dpu = [0 for _ in range(num_dpus)]
+        self.dpu_live_slot_counts_by_dpu = [0 for _ in range(num_dpus)]
+        self.slot_pressure_soft_limit = max(1, int(self.helper.MAX_SLOTS_PER_DPU) - max(8, int(self.helper.MAX_SLOTS_PER_DPU // 8)))
+        self.slot_pressure_aware_alloc_enabled = False
         self._helper_topology_cache: Dict[int, Dict[str, int]] = {}
         self.dpu_allocations = 0
         self.fallback_allocations = 0
         self.dpu_free_ops = 0
         self.dpu_allocate_failures = 0
+        self.dpu_allocate_failure_reasons: Dict[str, int] = {}
+        self.dpu_allocate_last_failure: Dict[str, object] = {}
         self.dpu_live_slots = 0
         self.dpu_capacity_fallbacks = 0
         self.slot_spill_alloc_enabled = False
         self.slot_spill_allocations = 0
+        self.slot_capacity_reroutes = 0
+        self.reserve_segment_tail_capacity_enabled = False
+        self.reserve_segment_tail_capacity_tokens = 0
         self.dpu_live_elems_by_dpu = [0 for _ in range(num_dpus)]
         self.op_timing_totals_s: Dict[str, float] = {
             "allocate_group": 0.0,
@@ -1520,6 +1529,8 @@ class UpmemKVSlotStore(ResidentKVStore):
         rank_spread_alloc_enabled: bool | None = None,
         slot_spill_alloc_enabled: bool | None = None,
         host_partial_reduce_enabled: bool | None = None,
+        reserve_segment_tail_capacity_enabled: bool | None = None,
+        reserve_segment_tail_capacity_tokens: int | None = None,
     ) -> None:
         if context_fused_enabled is not None:
             self.helper.set_env_flag("CLOVER_KVSLOT_CONTEXT_FUSED", bool(context_fused_enabled))
@@ -1531,6 +1542,10 @@ class UpmemKVSlotStore(ResidentKVStore):
             self.slot_spill_alloc_enabled = bool(slot_spill_alloc_enabled)
         if host_partial_reduce_enabled is not None:
             self.host_partial_reduce_enabled = bool(host_partial_reduce_enabled)
+        if reserve_segment_tail_capacity_enabled is not None:
+            self.reserve_segment_tail_capacity_enabled = bool(reserve_segment_tail_capacity_enabled)
+        if reserve_segment_tail_capacity_tokens is not None:
+            self.reserve_segment_tail_capacity_tokens = max(0, int(reserve_segment_tail_capacity_tokens))
 
     def _merge_partial_contexts(
         self,
@@ -1812,6 +1827,32 @@ class UpmemKVSlotStore(ResidentKVStore):
         free_ids = len(self._free_slot_ids_by_dpu[physical_dpu])
         return free_ids > 0 or next_seq < max_slots
 
+    def _dpu_has_allocation_capacity(self, physical_dpu: int, elem_count: int) -> bool:
+        if self.num_dpus <= 0:
+            return True
+        normalized = int(physical_dpu) % self.num_dpus
+        return (
+            self._dpu_has_slot_capacity(normalized)
+            and self.dpu_live_elems_by_dpu[normalized] + int(elem_count) <= self.POOL_CAPACITY_ELEMS
+        )
+
+    def _record_slot_capacity_reroute(self) -> None:
+        self.slot_capacity_reroutes = int(getattr(self, "slot_capacity_reroutes", 0)) + 1
+
+    def _record_dpu_allocate_failure(self, stage: str, exc: BaseException, **context: object) -> None:
+        reason = str(exc).strip() or exc.__class__.__name__
+        reason_key = reason[:240]
+        failure_reasons = getattr(self, "dpu_allocate_failure_reasons", {})
+        if not isinstance(failure_reasons, dict):
+            failure_reasons = {}
+        failure_reasons[reason_key] = int(failure_reasons.get(reason_key, 0)) + 1
+        self.dpu_allocate_failure_reasons = failure_reasons
+        self.dpu_allocate_last_failure = {
+            "stage": str(stage),
+            "reason": reason,
+            **dict(context),
+        }
+
     def _choose_physical_dpu_with_slot_capacity(
         self,
         *,
@@ -1826,8 +1867,7 @@ class UpmemKVSlotStore(ResidentKVStore):
         viable = [
             int(physical_dpu)
             for physical_dpu in candidates
-            if self._dpu_has_slot_capacity(int(physical_dpu))
-            and self.dpu_live_elems_by_dpu[int(physical_dpu)] + int(elem_count) <= self.POOL_CAPACITY_ELEMS
+            if self._dpu_has_allocation_capacity(int(physical_dpu), int(elem_count))
         ]
         if viable:
             return min(
@@ -1843,11 +1883,11 @@ class UpmemKVSlotStore(ResidentKVStore):
             global_viable = [
                 int(physical_dpu)
                 for physical_dpu in global_candidates
-                if self._dpu_has_slot_capacity(int(physical_dpu))
-                and self.dpu_live_elems_by_dpu[int(physical_dpu)] + int(elem_count) <= self.POOL_CAPACITY_ELEMS
+                if self._dpu_has_allocation_capacity(int(physical_dpu), int(elem_count))
             ]
             if global_viable:
                 self.slot_spill_allocations += 1
+                self._record_slot_capacity_reroute()
                 return min(
                     global_viable,
                     key=lambda physical_dpu: self._score_physical_dpu(
@@ -1893,6 +1933,11 @@ class UpmemKVSlotStore(ResidentKVStore):
 
     def _score_physical_dpu(self, physical_dpu: int, elem_count: int, preferred_dpu: int | None = None) -> tuple:
         live_elems = int(self.dpu_live_elems_by_dpu[physical_dpu])
+        live_slot_counts = getattr(self, "dpu_live_slot_counts_by_dpu", None)
+        if not isinstance(live_slot_counts, list) or physical_dpu >= len(live_slot_counts):
+            live_slot_counts = self._count_slots_by_dpu()
+            self.dpu_live_slot_counts_by_dpu = list(live_slot_counts)
+        live_slot_count = int(live_slot_counts[physical_dpu])
         free_ids = len(self._free_slot_ids_by_dpu[physical_dpu])
         next_seq = int(self._next_slot_seq_by_dpu[physical_dpu])
         rank_index = self._topology_rank_index(physical_dpu)
@@ -1906,6 +1951,12 @@ class UpmemKVSlotStore(ResidentKVStore):
             over_capacity,
             no_slot_capacity,
             rank_miss,
+            max(
+                0,
+                live_slot_count - int(getattr(self, "slot_pressure_soft_limit", int(self.helper.MAX_SLOTS_PER_DPU))),
+            )
+            if bool(getattr(self, "slot_pressure_aware_alloc_enabled", False))
+            else 0,
             preferred_distance,
             live_elems,
             next_seq,
@@ -1930,7 +1981,23 @@ class UpmemKVSlotStore(ResidentKVStore):
             allowed_dpus=allowed_dpus,
         )
         if policy != "load_aware":
-            return candidates[0]
+            first_candidate = int(candidates[0])
+            if self._dpu_has_allocation_capacity(first_candidate, int(elem_count)):
+                return first_candidate
+            for physical_dpu in candidates[1:]:
+                candidate = int(physical_dpu)
+                if self._dpu_has_allocation_capacity(candidate, int(elem_count)):
+                    self._record_slot_capacity_reroute()
+                    return candidate
+            if self.slot_spill_alloc_enabled:
+                global_candidates = self._candidate_dpus(preferred_dpu)
+                for physical_dpu in global_candidates:
+                    candidate = int(physical_dpu)
+                    if self._dpu_has_allocation_capacity(candidate, int(elem_count)):
+                        self.slot_spill_allocations += 1
+                        self._record_slot_capacity_reroute()
+                        return candidate
+            return first_candidate
         best_dpu = min(
             candidates,
             key=lambda physical_dpu: self._score_physical_dpu(
@@ -2097,6 +2164,33 @@ class UpmemKVSlotStore(ResidentKVStore):
             remaining_seq_len -= block_seq_len
         return layout
 
+    def _reserve_tail_block_capacities(
+        self,
+        live_lengths: list[int],
+        total_capacity: int,
+        max_reserve_tokens: int | None = None,
+    ) -> list[int]:
+        capacities = [max(0, int(length)) for length in live_lengths]
+        reserve = max(0, int(total_capacity) - sum(capacities))
+        if max_reserve_tokens is not None and int(max_reserve_tokens) > 0:
+            reserve = min(reserve, int(max_reserve_tokens))
+        if reserve <= 0:
+            return capacities
+
+        # Decode appends extend the sequence tail, so place spare capacity in
+        # the last token blocks first. This avoids allocating a new growth slot
+        # immediately after prefill when seq_len < resident capacity.
+        for idx in range(len(capacities) - 1, -1, -1):
+            room = max(0, int(self.block_tokens) - int(capacities[idx]))
+            if room <= 0:
+                continue
+            take = min(room, reserve)
+            capacities[idx] += int(take)
+            reserve -= int(take)
+            if reserve <= 0:
+                break
+        return capacities
+
     def _supports_dpu_shape(self, group_heads: int, head_dim: int) -> bool:
         return int(group_heads) <= 32 and int(head_dim) <= 128
 
@@ -2136,6 +2230,9 @@ class UpmemKVSlotStore(ResidentKVStore):
         if counters_applied:
             self.dpu_allocations = max(0, self.dpu_allocations - 1)
             self.dpu_live_slots = max(0, self.dpu_live_slots - 1)
+            self.dpu_live_slot_counts_by_dpu[normalized_dpu] = max(
+                0, self.dpu_live_slot_counts_by_dpu[normalized_dpu] - 1
+            )
             self.dpu_live_elems_by_dpu[normalized_dpu] = max(
                 0, self.dpu_live_elems_by_dpu[normalized_dpu] - int(elem_count)
             )
@@ -2154,6 +2251,9 @@ class UpmemKVSlotStore(ResidentKVStore):
                 pass
             self.dpu_free_ops += 1
             self.dpu_live_slots = max(0, self.dpu_live_slots - 1)
+            self.dpu_live_slot_counts_by_dpu[physical_dpu] = max(
+                0, self.dpu_live_slot_counts_by_dpu[physical_dpu] - 1
+            )
             elem_count = int(block.get("elem_count", 0))
             self.dpu_live_elems_by_dpu[physical_dpu] = max(
                 0, self.dpu_live_elems_by_dpu[physical_dpu] - elem_count
@@ -2336,11 +2436,23 @@ class UpmemKVSlotStore(ResidentKVStore):
                     block[str(key_name)] = int(value)
             self.dpu_allocations += 1
             self.dpu_live_slots += 1
+            self.dpu_live_slot_counts_by_dpu[block_physical_dpu] += 1
             self.dpu_live_elems_by_dpu[block_physical_dpu] += block_elem_count
             self.helper.persistent_state_active = True
             counters_applied = True
             return block
         except Exception:
+            self._record_dpu_allocate_failure(
+                "block_allocate",
+                sys.exc_info()[1] if sys.exc_info()[1] is not None else RuntimeError("block allocation failed"),
+                block_key=block_key,
+                block_idx=block_idx,
+                block_kind=block_kind,
+                slot_id=block_slot_id,
+                physical_dpu=block_physical_dpu,
+                elem_count=block_elem_count,
+                capacity=block_capacity,
+            )
             self._rollback_block_allocation(
                 block_key=block_key,
                 slot_id=block_slot_id,
@@ -2349,7 +2461,13 @@ class UpmemKVSlotStore(ResidentKVStore):
                 helper_allocated=helper_allocated,
                 counters_applied=counters_applied,
             )
-            raise
+            exc = sys.exc_info()[1]
+            raise RuntimeError(
+                "block allocation failed "
+                f"block_key={block_key} block_idx={block_idx} block_kind={block_kind} "
+                f"slot_id={block_slot_id} physical_dpu={block_physical_dpu} "
+                f"elem_count={block_elem_count} capacity={block_capacity}: {exc}"
+            ) from exc
 
     def _allocate_blocked_group(
         self,
@@ -2456,6 +2574,7 @@ class UpmemKVSlotStore(ResidentKVStore):
             "planner_segment_count": int(len(normalized_segments)),
         }
         try:
+            block_specs: list[tuple[int, int, int, int]] = []
             for logical_segment_index, segment in enumerate(normalized_segments):
                 segment_start = int(segment.token_start)
                 segment_end = int(segment.token_end)
@@ -2463,26 +2582,49 @@ class UpmemKVSlotStore(ResidentKVStore):
                 block_cursor = int(segment_start)
                 while block_cursor < segment_end:
                     block_end = min(segment_end, block_cursor + int(self.block_tokens))
-                    block_initial_k = initial_k[block_cursor:block_end].contiguous()
-                    block_initial_v = initial_v[block_cursor:block_end].contiguous()
-                    block = self._allocate_block_append_only(
-                        key=key,
-                        slot_info=slot_info,
-                        group_heads=group_heads,
-                        head_dim=head_dim,
-                        block_k=block_initial_k,
-                        block_v=block_initial_v,
-                        block_capacity_override=int(block_end - block_cursor),
-                        block_kind="base",
-                        physical_dpu_override=segment_physical_dpu,
-                        segment_meta={
-                            "logical_segment_index": int(logical_segment_index),
-                            "token_range_start": int(block_cursor),
-                            "token_range_end": int(block_end),
-                        },
+                    block_specs.append(
+                        (
+                            int(logical_segment_index),
+                            int(segment_physical_dpu),
+                            int(block_cursor),
+                            int(block_end),
+                        )
                     )
-                    allocated_blocks.append(block)
                     block_cursor = int(block_end)
+
+            block_live_lengths = [int(block_end - block_start) for _, _, block_start, block_end in block_specs]
+            if bool(getattr(self, "reserve_segment_tail_capacity_enabled", False)):
+                max_reserve_tokens = int(getattr(self, "reserve_segment_tail_capacity_tokens", 0) or 0)
+                block_capacities = self._reserve_tail_block_capacities(
+                    block_live_lengths,
+                    int(capacity),
+                    max_reserve_tokens=max_reserve_tokens if max_reserve_tokens > 0 else None,
+                )
+            else:
+                block_capacities = list(block_live_lengths)
+            for (logical_segment_index, segment_physical_dpu, block_cursor, block_end), block_capacity in zip(
+                block_specs,
+                block_capacities,
+            ):
+                block_initial_k = initial_k[block_cursor:block_end].contiguous()
+                block_initial_v = initial_v[block_cursor:block_end].contiguous()
+                block = self._allocate_block_append_only(
+                    key=key,
+                    slot_info=slot_info,
+                    group_heads=group_heads,
+                    head_dim=head_dim,
+                    block_k=block_initial_k,
+                    block_v=block_initial_v,
+                    block_capacity_override=int(block_capacity),
+                    block_kind="base",
+                    physical_dpu_override=segment_physical_dpu,
+                    segment_meta={
+                        "logical_segment_index": int(logical_segment_index),
+                        "token_range_start": int(block_cursor),
+                        "token_range_end": int(block_end),
+                    },
+                )
+                allocated_blocks.append(block)
             slot_info["seq_len"] = int(seq_len)
             slot_info["capacity"] = max(int(capacity), sum(int(block["capacity"]) for block in allocated_blocks))
             return slot_info
@@ -2543,6 +2685,19 @@ class UpmemKVSlotStore(ResidentKVStore):
                     )
             except Exception:
                 self.dpu_allocate_failures += 1
+                self._record_dpu_allocate_failure(
+                    "segmented_allocate" if segment_plan else "blocked_allocate",
+                    sys.exc_info()[1]
+                    if sys.exc_info()[1] is not None
+                    else RuntimeError("blocked allocation failed"),
+                    slot_key=key,
+                    physical_dpu=physical_dpu,
+                    elem_count=elem_count,
+                    capacity=capacity,
+                    seq_len=seq_len,
+                    group_heads=group_heads,
+                    head_dim=head_dim,
+                )
                 blocked_slot_info = None
             if blocked_slot_info is not None:
                 self.slot_mapping[key] = blocked_slot_info
@@ -2580,6 +2735,17 @@ class UpmemKVSlotStore(ResidentKVStore):
                     )
                 except Exception:
                     self.dpu_allocate_failures += 1
+                    self._record_dpu_allocate_failure(
+                        "legacy_allocate",
+                        sys.exc_info()[1]
+                        if sys.exc_info()[1] is not None
+                        else RuntimeError("legacy allocation failed"),
+                        slot_key=key,
+                        slot_id=slot_id,
+                        physical_dpu=physical_dpu,
+                        elem_count=elem_count,
+                        capacity=capacity,
+                    )
                     if self.dpu_live_slots > 0:
                         raise
                     info = None
@@ -2596,6 +2762,7 @@ class UpmemKVSlotStore(ResidentKVStore):
                     }
                     self.dpu_allocations += 1
                     self.dpu_live_slots += 1
+                    self.dpu_live_slot_counts_by_dpu[physical_dpu] += 1
                     self.dpu_live_elems_by_dpu[physical_dpu] += elem_count
                     self.helper.persistent_state_active = True
                     self._record_timing("allocate_group", started_at)
@@ -2853,6 +3020,9 @@ class UpmemKVSlotStore(ResidentKVStore):
             self.dpu_live_slots = max(0, self.dpu_live_slots - 1)
             physical_dpu = int(slot_info.get("physical_dpu", 0))
             elem_count = int(slot_info.get("elem_count", 0))
+            self.dpu_live_slot_counts_by_dpu[physical_dpu] = max(
+                0, self.dpu_live_slot_counts_by_dpu[physical_dpu] - 1
+            )
             self.dpu_live_elems_by_dpu[physical_dpu] = max(0, self.dpu_live_elems_by_dpu[physical_dpu] - elem_count)
             self.helper.persistent_state_active = self.dpu_live_slots > 0
             if self.dpu_live_slots == 0:
@@ -2918,10 +3088,22 @@ class UpmemKVSlotStore(ResidentKVStore):
             "dpu_allocations": self.dpu_allocations,
             "dpu_free_ops": self.dpu_free_ops,
             "dpu_allocate_failures": self.dpu_allocate_failures,
+            "dpu_allocate_failure_reasons": dict(getattr(self, "dpu_allocate_failure_reasons", {})),
+            "dpu_allocate_last_failure": dict(getattr(self, "dpu_allocate_last_failure", {})),
             "dpu_live_slots": self.dpu_live_slots,
             "dpu_capacity_fallbacks": self.dpu_capacity_fallbacks,
             "slot_spill_alloc_enabled": self.slot_spill_alloc_enabled,
             "slot_spill_allocations": self.slot_spill_allocations,
+            "slot_capacity_reroutes": int(getattr(self, "slot_capacity_reroutes", 0)),
+            "reserve_segment_tail_capacity_enabled": bool(
+                getattr(self, "reserve_segment_tail_capacity_enabled", False)
+            ),
+            "reserve_segment_tail_capacity_tokens": int(
+                getattr(self, "reserve_segment_tail_capacity_tokens", 0)
+            ),
+            "slot_pressure_aware_alloc_enabled": bool(self.slot_pressure_aware_alloc_enabled),
+            "slot_pressure_soft_limit": int(self.slot_pressure_soft_limit),
+            "dpu_live_slot_counts_by_dpu": list(self.dpu_live_slot_counts_by_dpu),
             "dpu_live_elems_by_dpu": list(self.dpu_live_elems_by_dpu),
             "dpu_pool_capacity_elems": self.POOL_CAPACITY_ELEMS,
             "fallback_allocations": self.fallback_allocations,

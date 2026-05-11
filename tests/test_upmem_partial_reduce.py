@@ -140,6 +140,7 @@ def test_slot_capacity_choice_spills_outside_full_allowed_stripe():
     store.num_dpus = 4
     store.POOL_CAPACITY_ELEMS = 1024
     store.dpu_live_elems_by_dpu = [0, 0, 0, 0]
+    store.dpu_live_slot_counts_by_dpu = [64, 64, 0, 0]
     store._next_slot_seq_by_dpu = [64, 64, 0, 0]
     store._free_slot_ids_by_dpu = [[], [], [], []]
     store._helper_topology_cache = {}
@@ -160,3 +161,122 @@ def test_slot_capacity_choice_spills_outside_full_allowed_stripe():
 
     assert chosen in {2, 3}
     assert store.slot_spill_allocations == 1
+
+
+def test_slot_capacity_choice_prefers_lower_slot_pressure_inside_allowed_stripe():
+    store = object.__new__(UpmemKVSlotStore)
+    store.num_dpus = 4
+    store.POOL_CAPACITY_ELEMS = 1024
+    store.dpu_live_elems_by_dpu = [0, 0, 0, 0]
+    store.dpu_live_slot_counts_by_dpu = [50, 20, 0, 0]
+    store._next_slot_seq_by_dpu = [50, 20, 0, 0]
+    store._free_slot_ids_by_dpu = [[], [], [], []]
+    store._helper_topology_cache = {}
+    store.slot_spill_alloc_enabled = False
+    store.slot_spill_allocations = 0
+    store.slot_pressure_soft_limit = 48
+    store.slot_pressure_aware_alloc_enabled = True
+
+    class _Helper:
+        MAX_SLOTS_PER_DPU = 64
+
+    store.helper = _Helper()
+
+    chosen = UpmemKVSlotStore._choose_physical_dpu_with_slot_capacity(
+        store,
+        preferred_dpu=0,
+        elem_count=1,
+        allowed_dpus=[0, 1],
+    )
+
+    assert chosen == 1
+
+
+def test_choose_physical_dpu_skips_full_preferred_dpu_before_host_fallback():
+    store = object.__new__(UpmemKVSlotStore)
+    store.num_dpus = 4
+    store.POOL_CAPACITY_ELEMS = 1024
+    store.dpu_live_elems_by_dpu = [0, 0, 0, 0]
+    store.dpu_live_slot_counts_by_dpu = [64, 4, 0, 0]
+    store._next_slot_seq_by_dpu = [64, 4, 0, 0]
+    store._free_slot_ids_by_dpu = [[], [], [], []]
+    store._helper_topology_cache = {}
+    store.slot_spill_alloc_enabled = False
+    store.slot_spill_allocations = 0
+    store.slot_capacity_reroutes = 0
+    store.placement_policy = "rank_spread"
+
+    class _Helper:
+        MAX_SLOTS_PER_DPU = 64
+
+    store.helper = _Helper()
+
+    chosen = UpmemKVSlotStore.choose_physical_dpu(
+        store,
+        elem_count=1,
+        preferred_dpu=0,
+        placement_policy="rank_spread",
+        allowed_dpus=[0, 1],
+    )
+
+    assert chosen == 1
+    assert store.slot_capacity_reroutes == 1
+
+
+def test_choose_physical_dpu_can_globally_spill_when_enabled():
+    store = object.__new__(UpmemKVSlotStore)
+    store.num_dpus = 4
+    store.POOL_CAPACITY_ELEMS = 1024
+    store.dpu_live_elems_by_dpu = [0, 0, 0, 0]
+    store.dpu_live_slot_counts_by_dpu = [64, 64, 0, 0]
+    store._next_slot_seq_by_dpu = [64, 64, 0, 0]
+    store._free_slot_ids_by_dpu = [[], [], [], []]
+    store._helper_topology_cache = {}
+    store.slot_spill_alloc_enabled = True
+    store.slot_spill_allocations = 0
+    store.slot_capacity_reroutes = 0
+    store.placement_policy = "rank_spread"
+
+    class _Helper:
+        MAX_SLOTS_PER_DPU = 64
+
+    store.helper = _Helper()
+
+    chosen = UpmemKVSlotStore.choose_physical_dpu(
+        store,
+        elem_count=1,
+        preferred_dpu=0,
+        placement_policy="rank_spread",
+        allowed_dpus=[0, 1],
+    )
+
+    assert chosen in {2, 3}
+    assert store.slot_spill_allocations == 1
+    assert store.slot_capacity_reroutes == 1
+
+
+def test_segmented_base_capacity_reserves_decode_growth_on_tail_blocks():
+    store = object.__new__(UpmemKVSlotStore)
+    store.block_tokens = 256
+
+    capacities = UpmemKVSlotStore._reserve_tail_block_capacities(
+        store,
+        [27, 26, 26, 26],
+        128,
+    )
+
+    assert capacities == [27, 26, 26, 49]
+
+
+def test_segmented_base_capacity_can_limit_tail_reserve_tokens():
+    store = object.__new__(UpmemKVSlotStore)
+    store.block_tokens = 256
+
+    capacities = UpmemKVSlotStore._reserve_tail_block_capacities(
+        store,
+        [27, 26, 26, 26],
+        128,
+        max_reserve_tokens=8,
+    )
+
+    assert capacities == [27, 26, 26, 34]

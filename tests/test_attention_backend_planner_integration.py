@@ -142,6 +142,98 @@ def test_request_state_materializes_planner_token_segments_for_multi_dpu_group()
     ]
 
 
+def test_request_state_compacts_short_planner_token_segments_when_enabled():
+    backend = _PlannerOnlyBackend(
+        num_dpus=4,
+        resident_store_backend="host",
+        head_grouping_policy="balanced",
+        compact_short_segments_enabled=True,
+        compact_short_segment_min_tokens=32,
+    )
+    backend.resident_store = _RecordingHostStore()
+    state = backend._build_request_state(
+        "req_short",
+        _dummy_initial_kv(seq_len=10, num_heads=2, head_dim=8),
+        decode_reserve_tokens=2,
+    )
+
+    layer0 = state.layer_states[0]
+    assert len(layer0.head_groups) == 1
+    group = layer0.head_groups[0]
+    assert len(group.physical_dpus or []) == 1
+    assert group.token_segments == [
+        {
+            "physical_dpu": int(group.dpu_id),
+            "token_range_start": 0,
+            "token_range_end": 10,
+        }
+    ]
+
+    first_call = backend.resident_store.allocate_calls[0]
+    assert sorted(first_call["allowed_dpus"]) == [0, 1, 2, 3]
+    assert first_call["segment_plan"] == []
+    assert backend.planner_segment_plan_count == 2
+    assert backend.planner_segment_materialized_count == 0
+    assert backend.planner_segment_compacted_count == 2
+    assert backend.planner_segment_last_decision.startswith("short_segments_compacted")
+
+
+def test_request_state_keeps_large_planner_token_segments_when_compaction_enabled():
+    backend = _PlannerOnlyBackend(
+        num_dpus=4,
+        resident_store_backend="host",
+        head_grouping_policy="balanced",
+        compact_short_segments_enabled=True,
+        compact_short_segment_min_tokens=32,
+    )
+    backend.resident_store = _RecordingHostStore()
+    state = backend._build_request_state(
+        "req_large",
+        _dummy_initial_kv(seq_len=128, num_heads=2, head_dim=8, num_layers=1),
+        decode_reserve_tokens=2,
+    )
+
+    group = state.layer_states[0].head_groups[0]
+    assert sorted(group.physical_dpus or []) == [0, 1, 2, 3]
+    assert [(segment["token_range_start"], segment["token_range_end"]) for segment in (group.token_segments or [])] == [
+        (0, 32),
+        (32, 64),
+        (64, 96),
+        (96, 128),
+    ]
+    first_call = backend.resident_store.allocate_calls[0]
+    assert [(item["token_range_start"], item["token_range_end"]) for item in first_call["segment_plan"]] == [
+        (0, 32),
+        (32, 64),
+        (64, 96),
+        (96, 128),
+    ]
+    assert backend.planner_segment_materialized_count == 1
+    assert backend.planner_segment_compacted_count == 0
+
+
+def test_request_state_does_not_compact_normal_length_segments_by_default():
+    backend = _PlannerOnlyBackend(
+        num_dpus=32,
+        resident_store_backend="host",
+        head_grouping_policy="balanced",
+        compact_short_segments_enabled=True,
+        compact_short_segment_min_tokens=16,
+    )
+    backend.resident_store = _RecordingHostStore()
+    state = backend._build_request_state(
+        "req_norm",
+        _dummy_initial_kv(seq_len=143, num_heads=12, head_dim=64),
+        decode_reserve_tokens=2,
+    )
+
+    group0 = state.layer_states[0].head_groups[0]
+    assert group0.token_segments
+    assert backend.planner_segment_materialized_count > 0
+    assert backend.planner_segment_compacted_count == 0
+    assert backend.resident_store.allocate_calls[0]["segment_plan"]
+
+
 def test_append_refreshes_group_token_segments_from_resident_store():
     backend = _PlannerOnlyBackend(
         num_dpus=4,

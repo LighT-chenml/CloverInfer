@@ -33,10 +33,16 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         pim_context_fused_experimental_enabled: bool = False,
         pim_rank_spread_alloc_experimental_enabled: bool = False,
         pim_slot_spill_alloc_experimental_enabled: bool = False,
+        pim_reserve_segment_tail_capacity_experimental_enabled: bool = False,
+        pim_reserve_segment_tail_capacity_tokens: int = 0,
         fine_head_grouping_experimental_enabled: bool = False,
         target_heads_per_group_experimental: int = 0,
+        compact_short_segments_enabled: bool = False,
+        compact_short_segment_min_tokens: int = 8,
         **kwargs,
     ):
+        kwargs["compact_short_segments_enabled"] = bool(compact_short_segments_enabled)
+        kwargs["compact_short_segment_min_tokens"] = max(1, int(compact_short_segment_min_tokens))
         super().__init__(*args, **kwargs)
         self.cpu_shadow_enabled = bool(cpu_shadow_enabled)
         self.shadow_checks_enabled = bool(shadow_checks_enabled)
@@ -48,8 +54,17 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         self.pim_context_fused_experimental_enabled = bool(pim_context_fused_experimental_enabled)
         self.pim_rank_spread_alloc_experimental_enabled = bool(pim_rank_spread_alloc_experimental_enabled)
         self.pim_slot_spill_alloc_experimental_enabled = bool(pim_slot_spill_alloc_experimental_enabled)
+        self.pim_reserve_segment_tail_capacity_experimental_enabled = bool(
+            pim_reserve_segment_tail_capacity_experimental_enabled
+        )
+        self.pim_reserve_segment_tail_capacity_tokens = max(
+            0,
+            int(pim_reserve_segment_tail_capacity_tokens),
+        )
         self.fine_head_grouping_experimental_enabled = bool(fine_head_grouping_experimental_enabled)
         self.target_heads_per_group_experimental = max(0, int(target_heads_per_group_experimental))
+        self.clover_compact_short_segments_enabled = bool(compact_short_segments_enabled)
+        self.clover_compact_short_segment_min_tokens = max(1, int(compact_short_segment_min_tokens))
         self.backend_variant = "cloverinfer"
         self.shadow_k_buffers: Dict[str, List[torch.Tensor]] = {}
         self.shadow_v_buffers: Dict[str, List[torch.Tensor]] = {}
@@ -77,6 +92,10 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         self.op_timing_counts: Dict[str, int] = {key: 0 for key in self.op_timing_totals}
         self.shadow_check_invocations = 0
         self.shadow_check_skips = 0
+        self.resident_append_fallbacks = 0
+        self.resident_append_fallback_reason = ""
+        self.resident_context_fallbacks = 0
+        self.resident_context_fallback_reason = ""
         self.resident_runtime_fallbacks = 0
         self.resident_runtime_fallback_reason = ""
         if self.pim_attention_enabled:
@@ -88,11 +107,17 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                     "use pim_resident_store_backend='upmem_kvslot'"
                 )
         if hasattr(self.resident_store, "set_experimental_flags"):
+            reserve_tail_capacity_enabled = (
+                self.pim_reserve_segment_tail_capacity_experimental_enabled
+                or self.pim_reserve_segment_tail_capacity_tokens > 0
+            )
             self.resident_store.set_experimental_flags(
                 context_fused_enabled=self.pim_context_fused_experimental_enabled,
                 shape_rounds_enabled=self.fine_head_grouping_experimental_enabled,
                 rank_spread_alloc_enabled=self.pim_rank_spread_alloc_experimental_enabled,
                 slot_spill_alloc_enabled=self.pim_slot_spill_alloc_experimental_enabled,
+                reserve_segment_tail_capacity_enabled=reserve_tail_capacity_enabled,
+                reserve_segment_tail_capacity_tokens=self.pim_reserve_segment_tail_capacity_tokens,
             )
 
     def _timed(self, name: str):
@@ -254,6 +279,8 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                 except RuntimeError as exc:
                     self.resident_compute_enabled = False
                     self.resident_av_enabled = False
+                    self.resident_append_fallbacks += 1
+                    self.resident_append_fallback_reason = str(exc)
                     self.resident_runtime_fallbacks += 1
                     self.resident_runtime_fallback_reason = str(exc)
 
@@ -706,6 +733,8 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                 weights,
                 record["values"].float(),
             ).to(record["query_dtype"])
+        self.resident_context_fallbacks += 1
+        self.resident_context_fallback_reason = str(reason)
         self.resident_runtime_fallbacks += 1
         self.resident_runtime_fallback_reason = str(reason)
 
@@ -1008,8 +1037,24 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         debug["clover_host_qk_mixed_enabled"] = self.host_qk_mixed_enabled
         debug["clover_pim_attention_enabled"] = self.pim_attention_enabled
         debug["clover_pim_context_fused_experimental_enabled"] = self.pim_context_fused_experimental_enabled
+        debug["clover_pim_reserve_segment_tail_capacity_experimental_enabled"] = (
+            self.pim_reserve_segment_tail_capacity_experimental_enabled
+        )
+        debug["clover_pim_reserve_segment_tail_capacity_tokens"] = int(
+            self.pim_reserve_segment_tail_capacity_tokens
+        )
+        debug["clover_pim_reserve_segment_tail_capacity_effective_enabled"] = (
+            self.pim_reserve_segment_tail_capacity_experimental_enabled
+            or self.pim_reserve_segment_tail_capacity_tokens > 0
+        )
+        debug["clover_compact_short_segments_enabled"] = self.clover_compact_short_segments_enabled
+        debug["clover_compact_short_segment_min_tokens"] = self.clover_compact_short_segment_min_tokens
         debug["clover_shadow_check_invocations"] = self.shadow_check_invocations
         debug["clover_shadow_check_skips"] = self.shadow_check_skips
+        debug["resident_append_fallbacks"] = int(self.resident_append_fallbacks)
+        debug["resident_append_fallback_reason"] = str(self.resident_append_fallback_reason)
+        debug["resident_context_fallbacks"] = int(self.resident_context_fallbacks)
+        debug["resident_context_fallback_reason"] = str(self.resident_context_fallback_reason)
         debug["resident_runtime_fallbacks"] = int(self.resident_runtime_fallbacks)
         debug["resident_runtime_fallback_reason"] = str(self.resident_runtime_fallback_reason)
         debug["clover_op_timing_totals_s"] = dict(self.op_timing_totals)

@@ -13,10 +13,22 @@ from src.core.scheduler import GlobalScheduler
 
 FLOAT_TOL = 1e-4
 AV_FLOAT_TOL = 5e-4
-RAY_PYTHONPATH_OVERRIDE = os.environ.get("CLOVER_VERIFY_PYTHONPATH", os.environ.get("CLOVER_RAY_PYTHONPATH"))
-RAY_WORKING_DIR = os.environ.get("CLOVER_VERIFY_WORKING_DIR", os.environ.get("CLOVER_RAY_WORKING_DIR", "")).strip()
-RAY_PY_MODULES = os.environ.get("CLOVER_VERIFY_PY_MODULES", os.environ.get("CLOVER_RAY_PY_MODULES", "")).strip()
-RAY_EXCLUDES = os.environ.get("CLOVER_VERIFY_EXCLUDES", os.environ.get("CLOVER_RAY_EXCLUDES", "")).strip()
+RAY_PYTHONPATH_OVERRIDE = os.environ.get(
+    "CLOVER_VERIFY_PYTHONPATH",
+    os.environ.get("CLOVER_BENCHMARK_PYTHONPATH", os.environ.get("CLOVER_RAY_PYTHONPATH")),
+)
+RAY_WORKING_DIR = os.environ.get(
+    "CLOVER_VERIFY_WORKING_DIR",
+    os.environ.get("CLOVER_BENCHMARK_WORKING_DIR", os.environ.get("CLOVER_RAY_WORKING_DIR", "")),
+).strip()
+RAY_PY_MODULES = os.environ.get(
+    "CLOVER_VERIFY_PY_MODULES",
+    os.environ.get("CLOVER_BENCHMARK_PY_MODULES", os.environ.get("CLOVER_RAY_PY_MODULES", "")),
+).strip()
+RAY_EXCLUDES = os.environ.get(
+    "CLOVER_VERIFY_EXCLUDES",
+    os.environ.get("CLOVER_BENCHMARK_EXCLUDES", os.environ.get("CLOVER_RAY_EXCLUDES", "")),
+).strip()
 
 
 def _resolve_runtime_path(value: str) -> str:
@@ -72,6 +84,8 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--address", default="192.168.123.4:26379")
     parser.add_argument("--model", default="/home/cml/CloverInfer/model/opt-125m")
+    parser.add_argument("--model-name", default="opt-125m")
+    parser.add_argument("--dtype", default="float16")
     parser.add_argument("--prompt", default="Hello CloverInfer")
     parser.add_argument("--max-new-tokens", type=int, default=2)
     parser.add_argument("--skip-generation", action="store_true")
@@ -101,6 +115,9 @@ def parse_args():
     parser.add_argument("--pim-qk-mixed-heads", type=int, default=2)
     parser.add_argument("--pim-qk-mixed-window", type=int, default=128)
     parser.add_argument("--pim-length", type=int, default=128)
+    parser.add_argument("--pim-block-tokens", type=int, default=256)
+    parser.add_argument("--pim-max-resident-groups-per-layer", type=int, default=0)
+    parser.add_argument("--pim-resident-kv-dtype", default="fp32", choices=["fp32", "fp16"])
     parser.add_argument("--clover-cpu-shadow-enabled", action="store_true")
     parser.add_argument("--no-clover-cpu-shadow-enabled", action="store_true")
     parser.add_argument("--clover-shadow-checks-enabled", action="store_true")
@@ -115,6 +132,12 @@ def parse_args():
     parser.add_argument("--no-clover-pim-rank-spread-alloc-experimental-enabled", action="store_true")
     parser.add_argument("--clover-pim-slot-spill-alloc-experimental-enabled", action="store_true")
     parser.add_argument("--no-clover-pim-slot-spill-alloc-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-pim-reserve-segment-tail-capacity-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-reserve-segment-tail-capacity-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-pim-reserve-segment-tail-capacity-tokens", type=int, default=0)
+    parser.add_argument("--clover-compact-short-segments-enabled", action="store_true")
+    parser.add_argument("--no-clover-compact-short-segments-enabled", action="store_true")
+    parser.add_argument("--clover-compact-short-segment-min-tokens", type=int, default=8)
     parser.add_argument("--clover-fine-head-grouping-experimental-enabled", action="store_true")
     parser.add_argument("--no-clover-fine-head-grouping-experimental-enabled", action="store_true")
     parser.add_argument("--clover-target-heads-per-group-experimental", type=int, default=0)
@@ -184,6 +207,19 @@ def main():
             "--no-clover-pim-slot-spill-alloc-experimental-enabled"
         )
     if (
+        args.clover_pim_reserve_segment_tail_capacity_experimental_enabled
+        and args.no_clover_pim_reserve_segment_tail_capacity_experimental_enabled
+    ):
+        raise ValueError(
+            "cannot set both --clover-pim-reserve-segment-tail-capacity-experimental-enabled and "
+            "--no-clover-pim-reserve-segment-tail-capacity-experimental-enabled"
+        )
+    if args.clover_compact_short_segments_enabled and args.no_clover_compact_short_segments_enabled:
+        raise ValueError(
+            "cannot set both --clover-compact-short-segments-enabled and "
+            "--no-clover-compact-short-segments-enabled"
+        )
+    if (
         args.clover_fine_head_grouping_experimental_enabled
         and args.no_clover_fine_head_grouping_experimental_enabled
     ):
@@ -246,6 +282,20 @@ def main():
     )
     if args.no_clover_pim_slot_spill_alloc_experimental_enabled:
         clover_pim_slot_spill_alloc_experimental_enabled = False
+    clover_pim_reserve_segment_tail_capacity_experimental_enabled = bool(
+        args.clover_pim_reserve_segment_tail_capacity_experimental_enabled
+    )
+    if args.no_clover_pim_reserve_segment_tail_capacity_experimental_enabled:
+        clover_pim_reserve_segment_tail_capacity_experimental_enabled = False
+    if args.clover_pim_reserve_segment_tail_capacity_tokens < 0:
+        raise ValueError("--clover-pim-reserve-segment-tail-capacity-tokens must be non-negative")
+    clover_compact_short_segments_enabled = False
+    if args.no_clover_compact_short_segments_enabled:
+        clover_compact_short_segments_enabled = False
+    elif args.clover_compact_short_segments_enabled:
+        clover_compact_short_segments_enabled = True
+    if args.clover_compact_short_segment_min_tokens <= 0:
+        raise ValueError("--clover-compact-short-segment-min-tokens must be positive")
     clover_fine_head_grouping_experimental_enabled = bool(
         args.clover_fine_head_grouping_experimental_enabled
     )
@@ -311,8 +361,11 @@ def main():
         pim_qk_mixed_heads=args.pim_qk_mixed_heads,
         pim_qk_mixed_window=args.pim_qk_mixed_window,
         pim_length=args.pim_length,
+        pim_block_tokens=args.pim_block_tokens,
+        pim_max_resident_groups_per_layer=args.pim_max_resident_groups_per_layer,
         pim_head_grouping_policy=pim_head_grouping_policy,
         pim_dpu_placement_policy=pim_dpu_placement_policy,
+        pim_resident_kv_dtype=args.pim_resident_kv_dtype,
         decode_step_sync_window_s=args.decode_step_sync_window_s,
         decode_step_sync_max_size=args.decode_step_sync_max_size,
         attention_decode_wave_persist_enabled=args.attention_decode_wave_persist_enabled,
@@ -328,8 +381,15 @@ def main():
         clover_shadow_check_token_interval=args.clover_shadow_check_token_interval,
         clover_shadow_check_layer_interval=args.clover_shadow_check_layer_interval,
         clover_host_qk_mixed_enabled=clover_host_qk_mixed_enabled,
+        clover_pim_attention_enabled=(args.attention_backend == "cloverinfer"),
         clover_pim_rank_spread_alloc_experimental_enabled=clover_pim_rank_spread_alloc_experimental_enabled,
         clover_pim_slot_spill_alloc_experimental_enabled=clover_pim_slot_spill_alloc_experimental_enabled,
+        clover_pim_reserve_segment_tail_capacity_experimental_enabled=(
+            clover_pim_reserve_segment_tail_capacity_experimental_enabled
+        ),
+        clover_pim_reserve_segment_tail_capacity_tokens=args.clover_pim_reserve_segment_tail_capacity_tokens,
+        clover_compact_short_segments_enabled=clover_compact_short_segments_enabled,
+        clover_compact_short_segment_min_tokens=args.clover_compact_short_segment_min_tokens,
         clover_fine_head_grouping_experimental_enabled=clover_fine_head_grouping_experimental_enabled,
         clover_target_heads_per_group_experimental=args.clover_target_heads_per_group_experimental,
         clover_predictive_scheduling_enabled=clover_predictive_scheduling_enabled,
@@ -344,7 +404,12 @@ def main():
         clover_capacity_aware_host_c=args.clover_capacity_aware_host_c,
         clover_capacity_aware_max_tokens_per_dpu=args.clover_capacity_aware_max_tokens_per_dpu,
     )
-    model = ModelConfig(model_path=args.model, max_new_tokens=args.max_new_tokens)
+    model = ModelConfig(
+        model_name=args.model_name,
+        model_path=args.model,
+        dtype=args.dtype,
+        max_new_tokens=args.max_new_tokens,
+    )
 
     scheduler = GlobalScheduler.remote(cluster, model)
     info = ray.get(scheduler.initialize_cluster.remote())
@@ -384,6 +449,7 @@ def main():
             assert debug["clover_shadow_check_token_interval"] == args.clover_shadow_check_token_interval, debug
             assert debug["clover_shadow_check_layer_interval"] == args.clover_shadow_check_layer_interval, debug
             assert debug["clover_host_qk_mixed_enabled"] == clover_host_qk_mixed_enabled, debug
+            assert debug["clover_pim_attention_enabled"] is True, debug
             store_debug = debug.get("resident_store_debug", {})
             helper_env = store_debug.get("helper_env", {})
             assert helper_env.get("CLOVER_KVSLOT_RANK_SPREAD_ALLOC") == (
@@ -391,6 +457,19 @@ def main():
             ), debug
             assert bool(store_debug.get("slot_spill_alloc_enabled", False)) == (
                 clover_pim_slot_spill_alloc_experimental_enabled
+            ), debug
+            assert bool(store_debug.get("reserve_segment_tail_capacity_enabled", False)) == (
+                clover_pim_reserve_segment_tail_capacity_experimental_enabled
+                or args.clover_pim_reserve_segment_tail_capacity_tokens > 0
+            ), debug
+            assert int(store_debug.get("reserve_segment_tail_capacity_tokens", 0)) == (
+                args.clover_pim_reserve_segment_tail_capacity_tokens
+            ), debug
+            assert debug["clover_compact_short_segments_enabled"] == (
+                clover_compact_short_segments_enabled
+            ), debug
+            assert debug["clover_compact_short_segment_min_tokens"] == (
+                args.clover_compact_short_segment_min_tokens
             ), debug
 
     if not args.skip_generation:
