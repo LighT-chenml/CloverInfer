@@ -187,8 +187,15 @@ def build_case_command(args, case: Dict[str, object], output_path: str) -> List[
     append_key_value(cmd, "--pim-resident-kv-dtype", args.pim_resident_kv_dtype)
     append_key_value(cmd, "--pim-qk-mixed-heads", args.pim_qk_mixed_heads)
     append_key_value(cmd, "--pim-qk-mixed-window", args.pim_qk_mixed_window)
+    append_key_value(cmd, "--clover-cpu-fast-path-max-context-tokens", args.clover_cpu_fast_path_max_context_tokens)
     append_key_value(cmd, "--clover-shadow-check-token-interval", args.clover_shadow_check_token_interval)
     append_key_value(cmd, "--clover-shadow-check-layer-interval", args.clover_shadow_check_layer_interval)
+    append_key_value(cmd, "--clover-pim-perf-guard-min-decode-items", args.clover_pim_perf_guard_min_decode_items)
+    append_key_value(
+        cmd,
+        "--clover-pim-perf-guard-slowdown-threshold",
+        args.clover_pim_perf_guard_slowdown_threshold,
+    )
     append_key_value(cmd, "--output", output_path)
 
     append_optional_flag(cmd, "--pim-qk-full-enabled", args.pim_qk_full_enabled)
@@ -211,6 +218,46 @@ def build_case_command(args, case: Dict[str, object], output_path: str) -> List[
     append_optional_flag(cmd, "--no-clover-host-qk-mixed-enabled", args.no_clover_host_qk_mixed_enabled)
     append_optional_flag(
         cmd,
+        "--clover-pim-rank-spread-alloc-experimental-enabled",
+        args.clover_pim_rank_spread_alloc_experimental_enabled,
+    )
+    append_optional_flag(
+        cmd,
+        "--no-clover-pim-rank-spread-alloc-experimental-enabled",
+        args.no_clover_pim_rank_spread_alloc_experimental_enabled,
+    )
+    append_optional_flag(
+        cmd,
+        "--clover-pim-cross-rank-stripe-experimental-enabled",
+        args.clover_pim_cross_rank_stripe_experimental_enabled,
+    )
+    append_optional_flag(
+        cmd,
+        "--no-clover-pim-cross-rank-stripe-experimental-enabled",
+        args.no_clover_pim_cross_rank_stripe_experimental_enabled,
+    )
+    append_optional_flag(
+        cmd,
+        "--clover-pim-rank-spread-multi-rank-batch-experimental-enabled",
+        args.clover_pim_rank_spread_multi_rank_batch_experimental_enabled,
+    )
+    append_optional_flag(
+        cmd,
+        "--no-clover-pim-rank-spread-multi-rank-batch-experimental-enabled",
+        args.no_clover_pim_rank_spread_multi_rank_batch_experimental_enabled,
+    )
+    append_optional_flag(
+        cmd,
+        "--clover-pim-layer-rank-rotation-experimental-enabled",
+        args.clover_pim_layer_rank_rotation_experimental_enabled,
+    )
+    append_optional_flag(
+        cmd,
+        "--no-clover-pim-layer-rank-rotation-experimental-enabled",
+        args.no_clover_pim_layer_rank_rotation_experimental_enabled,
+    )
+    append_optional_flag(
+        cmd,
         "--clover-pim-context-fused-experimental-enabled",
         args.clover_pim_context_fused_experimental_enabled,
     )
@@ -218,6 +265,18 @@ def build_case_command(args, case: Dict[str, object], output_path: str) -> List[
         cmd,
         "--no-clover-pim-context-fused-experimental-enabled",
         args.no_clover_pim_context_fused_experimental_enabled,
+    )
+    append_optional_flag(cmd, "--clover-pim-perf-guard-enabled", args.clover_pim_perf_guard_enabled)
+    append_optional_flag(cmd, "--no-clover-pim-perf-guard-enabled", args.no_clover_pim_perf_guard_enabled)
+    append_optional_flag(
+        cmd,
+        "--clover-pim-perf-guard-force-cpu-for-compressed-kv",
+        args.clover_pim_perf_guard_force_cpu_for_compressed_kv,
+    )
+    append_optional_flag(
+        cmd,
+        "--no-clover-pim-perf-guard-force-cpu-for-compressed-kv",
+        args.no_clover_pim_perf_guard_force_cpu_for_compressed_kv,
     )
     append_optional_flag(cmd, "--clover-predictive-scheduling-enabled", args.clover_predictive_scheduling_enabled)
     append_optional_flag(
@@ -356,7 +415,7 @@ def main():
         default="auto",
         choices=["auto", "identity", "rotated", "rank_spread", "load_aware"],
     )
-    parser.add_argument("--pim-resident-kv-dtype", default="fp32", choices=["fp32", "fp16"])
+    parser.add_argument("--pim-resident-kv-dtype", default="fp32", choices=["fp32", "fp16", "int8"])
     parser.add_argument("--pim-qk-full-enabled", action="store_true")
     parser.add_argument("--no-pim-qk-full-enabled", action="store_true")
     parser.add_argument("--pim-qk-full-shadow-check", action="store_true")
@@ -375,12 +434,27 @@ def main():
     parser.add_argument("--no-clover-shadow-checks-enabled", action="store_true")
     parser.add_argument("--clover-op-profiling-enabled", action="store_true")
     parser.add_argument("--no-clover-op-profiling-enabled", action="store_true")
+    parser.add_argument("--clover-cpu-fast-path-max-context-tokens", type=int, default=0)
     parser.add_argument("--clover-shadow-check-token-interval", type=int, default=4)
     parser.add_argument("--clover-shadow-check-layer-interval", type=int, default=4)
     parser.add_argument("--clover-host-qk-mixed-enabled", action="store_true")
     parser.add_argument("--no-clover-host-qk-mixed-enabled", action="store_true")
+    parser.add_argument("--clover-pim-rank-spread-alloc-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-rank-spread-alloc-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-pim-cross-rank-stripe-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-cross-rank-stripe-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-pim-rank-spread-multi-rank-batch-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-rank-spread-multi-rank-batch-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-pim-layer-rank-rotation-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-layer-rank-rotation-experimental-enabled", action="store_true")
     parser.add_argument("--clover-pim-context-fused-experimental-enabled", action="store_true")
     parser.add_argument("--no-clover-pim-context-fused-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-pim-perf-guard-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-perf-guard-enabled", action="store_true")
+    parser.add_argument("--clover-pim-perf-guard-force-cpu-for-compressed-kv", action="store_true")
+    parser.add_argument("--no-clover-pim-perf-guard-force-cpu-for-compressed-kv", action="store_true")
+    parser.add_argument("--clover-pim-perf-guard-min-decode-items", type=int, default=1)
+    parser.add_argument("--clover-pim-perf-guard-slowdown-threshold", type=float, default=1.2)
     parser.add_argument("--clover-predictive-scheduling-enabled", action="store_true")
     parser.add_argument("--no-clover-predictive-scheduling-enabled", action="store_true")
     parser.add_argument("--clover-predictive-scheduling-alpha", type=float, default=0.2)

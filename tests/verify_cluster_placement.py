@@ -117,7 +117,7 @@ def parse_args():
     parser.add_argument("--pim-length", type=int, default=128)
     parser.add_argument("--pim-block-tokens", type=int, default=256)
     parser.add_argument("--pim-max-resident-groups-per-layer", type=int, default=0)
-    parser.add_argument("--pim-resident-kv-dtype", default="fp32", choices=["fp32", "fp16"])
+    parser.add_argument("--pim-resident-kv-dtype", default="fp32", choices=["fp32", "fp16", "int8"])
     parser.add_argument("--clover-cpu-shadow-enabled", action="store_true")
     parser.add_argument("--no-clover-cpu-shadow-enabled", action="store_true")
     parser.add_argument("--clover-shadow-checks-enabled", action="store_true")
@@ -130,6 +130,12 @@ def parse_args():
     parser.add_argument("--no-clover-host-qk-mixed-enabled", action="store_true")
     parser.add_argument("--clover-pim-rank-spread-alloc-experimental-enabled", action="store_true")
     parser.add_argument("--no-clover-pim-rank-spread-alloc-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-pim-cross-rank-stripe-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-cross-rank-stripe-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-pim-rank-spread-multi-rank-batch-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-rank-spread-multi-rank-batch-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-pim-layer-rank-rotation-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-layer-rank-rotation-experimental-enabled", action="store_true")
     parser.add_argument("--clover-pim-slot-spill-alloc-experimental-enabled", action="store_true")
     parser.add_argument("--no-clover-pim-slot-spill-alloc-experimental-enabled", action="store_true")
     parser.add_argument("--clover-pim-slot-pressure-aware-alloc-experimental-enabled", action="store_true")
@@ -203,6 +209,30 @@ def main():
         raise ValueError(
             "cannot set both --clover-pim-rank-spread-alloc-experimental-enabled and "
             "--no-clover-pim-rank-spread-alloc-experimental-enabled"
+        )
+    if (
+        args.clover_pim_cross_rank_stripe_experimental_enabled
+        and args.no_clover_pim_cross_rank_stripe_experimental_enabled
+    ):
+        raise ValueError(
+            "cannot set both --clover-pim-cross-rank-stripe-experimental-enabled and "
+            "--no-clover-pim-cross-rank-stripe-experimental-enabled"
+        )
+    if (
+        args.clover_pim_rank_spread_multi_rank_batch_experimental_enabled
+        and args.no_clover_pim_rank_spread_multi_rank_batch_experimental_enabled
+    ):
+        raise ValueError(
+            "cannot set both --clover-pim-rank-spread-multi-rank-batch-experimental-enabled and "
+            "--no-clover-pim-rank-spread-multi-rank-batch-experimental-enabled"
+        )
+    if (
+        args.clover_pim_layer_rank_rotation_experimental_enabled
+        and args.no_clover_pim_layer_rank_rotation_experimental_enabled
+    ):
+        raise ValueError(
+            "cannot set both --clover-pim-layer-rank-rotation-experimental-enabled and "
+            "--no-clover-pim-layer-rank-rotation-experimental-enabled"
         )
     if (
         args.clover_pim_slot_spill_alloc_experimental_enabled
@@ -299,6 +329,21 @@ def main():
     )
     if args.no_clover_pim_rank_spread_alloc_experimental_enabled:
         clover_pim_rank_spread_alloc_experimental_enabled = False
+    clover_pim_cross_rank_stripe_experimental_enabled = bool(
+        args.clover_pim_cross_rank_stripe_experimental_enabled
+    )
+    if args.no_clover_pim_cross_rank_stripe_experimental_enabled:
+        clover_pim_cross_rank_stripe_experimental_enabled = False
+    clover_pim_rank_spread_multi_rank_batch_experimental_enabled = bool(
+        args.clover_pim_rank_spread_multi_rank_batch_experimental_enabled
+    )
+    if args.no_clover_pim_rank_spread_multi_rank_batch_experimental_enabled:
+        clover_pim_rank_spread_multi_rank_batch_experimental_enabled = False
+    clover_pim_layer_rank_rotation_experimental_enabled = bool(
+        args.clover_pim_layer_rank_rotation_experimental_enabled
+    )
+    if args.no_clover_pim_layer_rank_rotation_experimental_enabled:
+        clover_pim_layer_rank_rotation_experimental_enabled = False
     clover_pim_slot_spill_alloc_experimental_enabled = bool(
         args.clover_pim_slot_spill_alloc_experimental_enabled
     )
@@ -420,6 +465,13 @@ def main():
         clover_host_qk_mixed_enabled=clover_host_qk_mixed_enabled,
         clover_pim_attention_enabled=(args.attention_backend == "cloverinfer"),
         clover_pim_rank_spread_alloc_experimental_enabled=clover_pim_rank_spread_alloc_experimental_enabled,
+        clover_pim_cross_rank_stripe_experimental_enabled=clover_pim_cross_rank_stripe_experimental_enabled,
+        clover_pim_rank_spread_multi_rank_batch_experimental_enabled=(
+            clover_pim_rank_spread_multi_rank_batch_experimental_enabled
+        ),
+        clover_pim_layer_rank_rotation_experimental_enabled=(
+            clover_pim_layer_rank_rotation_experimental_enabled
+        ),
         clover_pim_slot_spill_alloc_experimental_enabled=clover_pim_slot_spill_alloc_experimental_enabled,
         clover_pim_slot_pressure_aware_alloc_experimental_enabled=(
             clover_pim_slot_pressure_aware_alloc_experimental_enabled
@@ -498,6 +550,18 @@ def main():
             helper_env = store_debug.get("helper_env", {})
             assert helper_env.get("CLOVER_KVSLOT_RANK_SPREAD_ALLOC") == (
                 "1" if clover_pim_rank_spread_alloc_experimental_enabled else "0"
+            ), debug
+            assert debug["clover_pim_cross_rank_stripe_experimental_enabled"] == (
+                clover_pim_cross_rank_stripe_experimental_enabled
+            ), debug
+            assert debug["clover_pim_rank_spread_multi_rank_batch_experimental_enabled"] == (
+                clover_pim_rank_spread_multi_rank_batch_experimental_enabled
+            ), debug
+            assert debug["clover_pim_layer_rank_rotation_experimental_enabled"] == (
+                clover_pim_layer_rank_rotation_experimental_enabled
+            ), debug
+            assert helper_env.get("CLOVER_KVSLOT_ALLOW_RANK_SPREAD_MULTI_RANK_BATCH") == (
+                "1" if clover_pim_rank_spread_multi_rank_batch_experimental_enabled else "0"
             ), debug
             assert bool(store_debug.get("slot_spill_alloc_enabled", False)) == (
                 clover_pim_slot_spill_alloc_experimental_enabled

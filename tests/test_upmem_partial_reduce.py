@@ -93,6 +93,37 @@ def test_partial_reduce_helper_matches_legacy_merge():
         assert torch.allclose(merged[logical_idx], reference[logical_idx], atol=1e-5, rtol=1e-5)
 
 
+def test_int8_kv_quantization_round_trips_with_scales_without_upmem():
+    store = object.__new__(UpmemKVSlotStore)
+    store.kv_dtype = "int8"
+
+    keys = torch.tensor(
+        [[[0.0, 0.25, -0.5, 1.0], [1.5, -2.0, 0.75, -1.25]]],
+        dtype=torch.float32,
+    )
+    values = keys * 0.5
+
+    encoded_k, encoded_v, k_scale, v_scale = UpmemKVSlotStore._encode_kv_pair(store, keys, values)
+    assert encoded_k.dtype == torch.int8
+    assert encoded_v.dtype == torch.int8
+    assert k_scale > 0.0
+    assert v_scale > 0.0
+
+    decoded_k = UpmemKVSlotStore._decode_tensor(store, encoded_k, scale=k_scale)
+    decoded_v = UpmemKVSlotStore._decode_tensor(store, encoded_v, scale=v_scale)
+    assert torch.allclose(decoded_k, keys, atol=max(k_scale, 1e-6), rtol=0.0)
+    assert torch.allclose(decoded_v, values, atol=max(v_scale, 1e-6), rtol=0.0)
+
+
+def test_int8_slot_elem_count_uses_packed_aligned_words_without_upmem():
+    store = object.__new__(UpmemKVSlotStore)
+    store.kv_dtype = "int8"
+
+    assert UpmemKVSlotStore._slot_elem_count(store, capacity=1, group_heads=1, head_dim=1) == 2
+    assert UpmemKVSlotStore._slot_elem_count(store, capacity=1, group_heads=1, head_dim=8) == 2
+    assert UpmemKVSlotStore._slot_elem_count(store, capacity=1, group_heads=1, head_dim=9) == 4
+
+
 def test_partial_reduce_flag_can_be_toggled_without_helper():
     store = object.__new__(UpmemKVSlotStore)
     store.host_partial_reduce_enabled = True
@@ -163,6 +194,37 @@ def test_grouped_av_splits_oversized_helper_groups_without_upmem():
     assert len(outputs) == 2
     assert torch.allclose(outputs[0], torch.tensor([[10.0]], dtype=torch.float32))
     assert torch.allclose(outputs[1], torch.tensor([[10.0]], dtype=torch.float32))
+
+
+def test_grouped_av_splits_groups_by_total_dpu_capacity_without_upmem():
+    class _FakeHelper:
+        MAX_GROUP_SEGMENTS = 8
+        MAX_DPU_CAPACITY = 4
+        MAX_BATCH_ITEMS = 32
+
+        def weighted_value_sum_grouped_batch(self, grouped_slot_weights):
+            assert all(0 < len(group) <= self.MAX_GROUP_SEGMENTS for group in grouped_slot_weights)
+            assert all(sum(segment_len for _, segment_len, _ in group) <= self.MAX_DPU_CAPACITY for group in grouped_slot_weights)
+            outputs = []
+            for group in grouped_slot_weights:
+                total = sum(float(weights.sum().item()) for _, _, weights in group)
+                outputs.append(torch.tensor([[total]], dtype=torch.float32))
+            return outputs
+
+    fake = _FakeHelper()
+    capacity_oversized_group = [
+        (0, 2, torch.tensor([[1.0, 2.0]], dtype=torch.float32)),
+        (1, 2, torch.tensor([[3.0, 4.0]], dtype=torch.float32)),
+        (2, 2, torch.tensor([[5.0, 6.0]], dtype=torch.float32)),
+    ]
+
+    outputs = _KVSlotHelperClient.weighted_value_sum_grouped_batch(
+        fake,
+        [capacity_oversized_group],
+    )
+
+    assert len(outputs) == 1
+    assert torch.allclose(outputs[0], torch.tensor([[21.0]], dtype=torch.float32))
 
 
 def test_slot_capacity_choice_spills_outside_full_allowed_stripe():

@@ -8,10 +8,17 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from src.core.attention_backend import PimNaiveAttentionBackend
+from src.core.clover_attention_backend import CloverInferAttentionBackend
 from src.core.resident_kv_store import HostResidentKVStore
 
 
 class _PlannerOnlyBackend(PimNaiveAttentionBackend):
+    def _run_dot_smoke_test(self) -> None:
+        self.smoke_test_ok = True
+        self.smoke_test_output = "skipped"
+
+
+class _PlannerOnlyCloverBackend(CloverInferAttentionBackend):
     def _run_dot_smoke_test(self) -> None:
         self.smoke_test_ok = True
         self.smoke_test_output = "skipped"
@@ -102,6 +109,26 @@ class _RecordingHostStore(HostResidentKVStore):
             allowed_dpus=allowed_dpus,
             segment_plan=segment_plan,
         )
+
+
+class _RankedRecordingHostStore(_RecordingHostStore):
+    def __init__(self, rank_groups):
+        super().__init__()
+        self.rank_groups = [[int(dpu) for dpu in group] for group in rank_groups]
+        self.rank_by_dpu = {
+            int(dpu): int(rank_idx)
+            for rank_idx, group in enumerate(self.rank_groups)
+            for dpu in group
+        }
+
+    def get_rank_groups(self):
+        return [list(group) for group in self.rank_groups]
+
+    def _ensure_topology_cache(self):
+        return None
+
+    def _topology_rank_index(self, physical_dpu):
+        return self.rank_by_dpu.get(int(physical_dpu))
 
 
 class _RecoveringHostStore(HostResidentKVStore):
@@ -314,6 +341,111 @@ def test_request_state_does_not_compact_normal_length_segments_by_default():
     assert backend.resident_store.allocate_calls[0]["segment_plan"]
 
 
+def test_rank_spread_alloc_keeps_rank_local_initial_stripe_by_default():
+    backend = _PlannerOnlyBackend(
+        num_dpus=8,
+        resident_store_backend="host",
+        head_grouping_policy="balanced",
+    )
+    backend.pim_rank_spread_alloc_experimental_enabled = True
+    backend.pim_layer_rank_rotation_experimental_enabled = True
+    backend.resident_store = _RankedRecordingHostStore(
+        [
+            [0, 1, 2, 3],
+            [4, 5, 6, 7],
+        ]
+    )
+
+    state = backend._build_request_state(
+        "req_rank_spread",
+        _dummy_initial_kv(seq_len=64, num_heads=2, head_dim=8, num_layers=1),
+        decode_reserve_tokens=2,
+    )
+
+    rank_by_dpu = {
+        int(dpu): int(rank_idx)
+        for rank_idx, group in enumerate(backend.resident_store.rank_groups)
+        for dpu in group
+    }
+    stripe_ranks = {rank_by_dpu[int(dpu)] for dpu in state.preferred_dpu_stripe}
+    assert len(stripe_ranks) == 1
+    assert backend.init_rank_last_reason != "cross_rank_stripe_experimental"
+
+
+def test_cross_rank_stripe_experiment_prefers_cross_rank_initial_stripe():
+    backend = _PlannerOnlyBackend(
+        num_dpus=8,
+        resident_store_backend="host",
+        head_grouping_policy="balanced",
+    )
+    backend.pim_rank_spread_alloc_experimental_enabled = True
+    backend.pim_cross_rank_stripe_experimental_enabled = True
+    backend.resident_store = _RankedRecordingHostStore(
+        [
+            [0, 1, 2, 3],
+            [4, 5, 6, 7],
+        ]
+    )
+
+    state = backend._build_request_state(
+        "req_rank_spread",
+        _dummy_initial_kv(seq_len=64, num_heads=2, head_dim=8, num_layers=1),
+        decode_reserve_tokens=2,
+    )
+
+    rank_by_dpu = {
+        int(dpu): int(rank_idx)
+        for rank_idx, group in enumerate(backend.resident_store.rank_groups)
+        for dpu in group
+    }
+    stripe_ranks = {rank_by_dpu[int(dpu)] for dpu in state.preferred_dpu_stripe}
+    assert len(stripe_ranks) > 1
+    assert backend.init_rank_last_reason == "cross_rank_stripe_experimental"
+
+
+def test_coarse_rank_spread_rotates_layers_across_rank_local_stripes():
+    backend = _PlannerOnlyBackend(
+        num_dpus=8,
+        resident_store_backend="host",
+        head_grouping_policy="coarse",
+        dpu_placement_policy="rank_spread",
+    )
+    backend.pim_rank_spread_alloc_experimental_enabled = True
+    backend.pim_layer_rank_rotation_experimental_enabled = True
+    backend.resident_store = _RankedRecordingHostStore(
+        [
+            [0, 1],
+            [2, 3],
+            [4, 5],
+            [6, 7],
+        ]
+    )
+
+    state = backend._build_request_state(
+        "req_layer_rank_rotation",
+        _dummy_initial_kv(seq_len=64, num_heads=4, head_dim=8, num_layers=4),
+        decode_reserve_tokens=2,
+    )
+
+    rank_by_dpu = {
+        int(dpu): int(rank_idx)
+        for rank_idx, group in enumerate(backend.resident_store.rank_groups)
+        for dpu in group
+    }
+    layer_ranks = []
+    for layer_state in state.layer_states:
+        group_ranks = {
+            rank_by_dpu[int(dpu)]
+            for group in layer_state.head_groups
+            for dpu in list(group.physical_dpus or [group.dpu_id])
+        }
+        assert len(group_ranks) == 1
+        layer_ranks.append(next(iter(group_ranks)))
+
+    assert len(set(layer_ranks)) > 1
+    assert backend.layer_rank_rotation_count > 0
+
+
 def test_append_refreshes_group_token_segments_from_resident_store():
     backend = _PlannerOnlyBackend(
         num_dpus=4,
@@ -351,3 +483,66 @@ def test_append_refreshes_group_token_segments_from_resident_store():
     ]
     resident_slot = backend.resident_store.slot_debug(group0.k_slot, group0.v_slot)
     assert [(item["token_range_start"], item["token_range_end"]) for item in resident_slot["segments"]] == [(0, 7)]
+
+
+def test_clover_perf_guard_routes_compressed_kv_to_cpu_fast_path():
+    backend = _PlannerOnlyCloverBackend(
+        num_dpus=4,
+        resident_store_backend="host",
+        resident_kv_dtype="int8",
+        pim_attention_enabled=True,
+        pim_perf_guard_enabled=True,
+        cpu_shadow_enabled=False,
+        shadow_checks_enabled=False,
+    )
+    assert backend.cpu_shadow_enabled is True
+    assert backend.pim_perf_guard_triggered is True
+    assert backend.pim_perf_guard_reason == "compressed_resident_kv_dtype:int8"
+
+    seq_len = backend.init_request(
+        "req_guard_int8",
+        _dummy_initial_kv(seq_len=8, num_heads=2, head_dim=4, num_layers=1),
+        decode_reserve_tokens=2,
+    )
+
+    assert seq_len == 8
+    assert backend._use_cpu_fast_path_for_request("req_guard_int8")
+    assert "req_guard_int8" not in backend.request_states
+    debug = backend.get_debug_info()
+    assert debug["clover_pim_perf_guard_triggered"] is True
+    assert debug["clover_pim_perf_guard_forced_request_count"] == 1
+
+
+def test_clover_perf_guard_can_trigger_from_observed_slowdown():
+    backend = _PlannerOnlyCloverBackend(
+        num_dpus=4,
+        resident_store_backend="host",
+        pim_attention_enabled=False,
+        pim_perf_guard_enabled=True,
+        pim_perf_guard_slowdown_threshold=1.1,
+        shadow_checks_enabled=False,
+    )
+    backend.pim_attention_enabled = True
+    backend.init_request(
+        "req_guard_probe",
+        _dummy_initial_kv(seq_len=8, num_heads=2, head_dim=4, num_layers=1),
+        decode_reserve_tokens=2,
+    )
+    record = {
+        "request_id": "req_guard_probe",
+        "keys": torch.randn(8, 2, 4),
+        "values": torch.randn(8, 2, 4),
+        "q_fp32": torch.randn(2, 4),
+        "score_scale": 1.0,
+    }
+
+    backend._maybe_trigger_pim_perf_guard(
+        [record],
+        cpu_probe_s=0.001,
+        pim_observed_s=0.002,
+    )
+
+    assert backend.pim_perf_guard_triggered is True
+    assert backend._use_cpu_fast_path_for_request("req_guard_probe")
+    assert backend.pim_perf_guard_decode_observations == 1
+    assert "observed_pim_attention_slowdown" in backend.pim_perf_guard_reason

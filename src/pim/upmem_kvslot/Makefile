@@ -1,10 +1,13 @@
 BUILD_DIR ?= build
 NR_TASKLETS ?= 16
 NUM_DPUS ?= 2
+KVSLOT_MAX_HEADS ?= 32
+KVSLOT_MAX_CAPACITY ?= 256
 
 DPU_CC ?= dpu-upmem-dpurte-clang
 HOST_CC ?= cc
 PKG_CONFIG ?= dpu-pkg-config
+KVSLOT_LIMIT_FLAGS := -DKVSLOT_MAX_HEADS=$(KVSLOT_MAX_HEADS) -DKVSLOT_MAX_CAPACITY=$(KVSLOT_MAX_CAPACITY)
 
 DPU_TARGET := $(BUILD_DIR)/dpu_kvslot
 HOST_TARGET := $(BUILD_DIR)/host_kvslot
@@ -17,10 +20,10 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 $(DPU_TARGET): dpu_kvslot.c common.h | $(BUILD_DIR)
-	$(DPU_CC) -O2 -DNR_TASKLETS=$(NR_TASKLETS) -I. -o $@ dpu_kvslot.c
+	$(DPU_CC) -O2 -DNR_TASKLETS=$(NR_TASKLETS) $(KVSLOT_LIMIT_FLAGS) -I. -o $@ dpu_kvslot.c
 
 $(HOST_TARGET): host_kvslot.c common.h $(DPU_TARGET) | $(BUILD_DIR)
-	$(HOST_CC) -O2 -Wall -Wextra -I. -DDPU_BINARY=\"$(abspath $(DPU_TARGET))\" -o $@ host_kvslot.c $(shell $(PKG_CONFIG) --cflags --libs dpu) -lm
+	$(HOST_CC) -O2 -Wall -Wextra $(KVSLOT_LIMIT_FLAGS) -I. -DDPU_BINARY=\"$(abspath $(DPU_TARGET))\" -o $@ host_kvslot.c $(shell $(PKG_CONFIG) --cflags --libs dpu) -lm
 
 clean:
 	rm -rf $(BUILD_DIR)

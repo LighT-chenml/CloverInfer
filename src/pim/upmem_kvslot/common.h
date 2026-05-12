@@ -4,9 +4,13 @@
 #include <stdint.h>
 
 #define KVSLOT_MAGIC 0x4B56534CU
+#ifndef KVSLOT_MAX_HEADS
 #define KVSLOT_MAX_HEADS 32
+#endif
 #define KVSLOT_MAX_HEAD_DIM 128
+#ifndef KVSLOT_MAX_CAPACITY
 #define KVSLOT_MAX_CAPACITY 256
+#endif
 #define KVSLOT_MAX_SLOTS_PER_DPU 64
 
 #define KVSLOT_CMD_ALLOCATE 1U
@@ -50,6 +54,9 @@ typedef struct {
     uint32_t group_heads;
     uint32_t head_dim;
     uint32_t dtype_code;
+    float k_scale;
+    float v_scale;
+    uint32_t reserved;
 } kvslot_slot_args_t;
 
 typedef struct {
@@ -72,7 +79,9 @@ typedef struct {
     uint32_t head_dim;
     uint32_t dtype_code;
     uint32_t elem_offset;
-    uint32_t reserved[3];
+    float k_scale;
+    float v_scale;
+    uint32_t reserved;
 } kvslot_runtime_slot_args_t;
 
 typedef struct {
@@ -104,6 +113,7 @@ typedef struct {
 
 #define KVSLOT_DTYPE_FP32 0U
 #define KVSLOT_DTYPE_FP16 1U
+#define KVSLOT_DTYPE_INT8 2U
 
 typedef struct {
     uint64_t cycles;

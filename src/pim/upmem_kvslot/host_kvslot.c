@@ -22,6 +22,8 @@ typedef struct {
     uint32_t group_heads;
     uint32_t head_dim;
     uint32_t dtype_code;
+    float k_scale;
+    float v_scale;
     uint32_t elem_offset;
     uint32_t elem_count;
 } host_slot_t;
@@ -283,6 +285,15 @@ static int shape_rounds_experiment_enabled(void)
 static int rank_spread_alloc_experiment_enabled(void)
 {
     const char *value = getenv("CLOVER_KVSLOT_RANK_SPREAD_ALLOC");
+    if (value == NULL || value[0] == '\0' || strcmp(value, "0") == 0) {
+        return 0;
+    }
+    return 1;
+}
+
+static int rank_spread_multi_rank_batch_experiment_enabled(void)
+{
+    const char *value = getenv("CLOVER_KVSLOT_ALLOW_RANK_SPREAD_MULTI_RANK_BATCH");
     if (value == NULL || value[0] == '\0' || strcmp(value, "0") == 0) {
         return 0;
     }
@@ -804,20 +815,65 @@ static int ensure_slot(host_slot_t *slot, uint32_t capacity, uint32_t group_head
     slot->group_heads = group_heads;
     slot->head_dim = head_dim;
     slot->dtype_code = KVSLOT_DTYPE_FP32;
+    slot->k_scale = 1.0f;
+    slot->v_scale = 1.0f;
     return 0;
+}
+
+static uint32_t kvslot_align_words_for_mram_xfer(uint32_t words)
+{
+    return (words + 1U) & ~1U;
 }
 
 static size_t kvslot_dtype_elem_size(uint32_t dtype_code)
 {
-    return dtype_code == KVSLOT_DTYPE_FP16 ? sizeof(uint16_t) : sizeof(int32_t);
+    if (dtype_code == KVSLOT_DTYPE_INT8) {
+        return sizeof(int8_t);
+    }
+    if (dtype_code == KVSLOT_DTYPE_FP16) {
+        return sizeof(uint16_t);
+    }
+    return sizeof(int32_t);
 }
 
 static uint32_t kvslot_packed_elem_count(uint32_t logical_elems, uint32_t dtype_code)
 {
-    if (dtype_code == KVSLOT_DTYPE_FP16) {
-        return (logical_elems + 1U) / 2U;
+    uint32_t packed_words;
+    if (dtype_code == KVSLOT_DTYPE_INT8) {
+        packed_words = (logical_elems + 3U) / 4U;
+        return kvslot_align_words_for_mram_xfer(packed_words);
     }
-    return logical_elems;
+    if (dtype_code == KVSLOT_DTYPE_FP16) {
+        packed_words = (logical_elems + 1U) / 2U;
+        return kvslot_align_words_for_mram_xfer(packed_words);
+    }
+    return kvslot_align_words_for_mram_xfer(logical_elems);
+}
+
+static uint32_t kvslot_logical_elem_offset_to_packed_words(uint32_t logical_offset, uint32_t dtype_code)
+{
+    if (dtype_code == KVSLOT_DTYPE_INT8) {
+        return logical_offset / 4U;
+    }
+    if (dtype_code == KVSLOT_DTYPE_FP16) {
+        return logical_offset / 2U;
+    }
+    return logical_offset;
+}
+
+static int kvslot_dtype_supported(uint32_t dtype_code)
+{
+    return dtype_code == KVSLOT_DTYPE_FP32
+        || dtype_code == KVSLOT_DTYPE_FP16
+        || dtype_code == KVSLOT_DTYPE_INT8;
+}
+
+static float kvslot_sanitize_scale(float scale)
+{
+    if (!isfinite(scale) || scale <= 0.0f) {
+        return 1.0f;
+    }
+    return scale;
 }
 
 static void remove_free_range(free_range_t *ranges, uint32_t *count, uint32_t idx)
@@ -1007,7 +1063,16 @@ static int runner_init(kvslot_runner_t *runner, uint32_t requested_dpus)
     runner->num_free_ranges = NULL;
     rank_spread_enabled = rank_spread_alloc_experiment_enabled();
     if (rank_spread_enabled) {
-        DPU_ASSERT(dpu_alloc_ranks(requested_dpus, NULL, &runner->dpu_set));
+        /*
+         * dpu_alloc_ranks() takes a rank count, not a DPU count.  For the
+         * rank-spread experiment we allocate all ranks and then expose exactly
+         * requested_dpus logical DPUs by interleaving one physical DPU from
+         * each rank at a time in collect_runner_physical_dpus_rank_spread().
+         * This intentionally over-reserves the PIM node, but the Ray placement
+         * layer already treats attention_pim as an exclusive resource and this
+         * keeps 32-DPU experiments from silently collapsing onto one rank.
+         */
+        DPU_ASSERT(dpu_alloc_ranks(DPU_ALLOCATE_ALL, NULL, &runner->dpu_set));
         runner->nr_dpus = requested_dpus;
     } else {
         DPU_ASSERT(dpu_alloc(requested_dpus, NULL, &runner->dpu_set));
@@ -1137,6 +1202,10 @@ static int handle_allocate(kvslot_runner_t *runner, uint32_t slot_id)
     if (ensure_slot(slot, args.capacity, args.group_heads, args.head_dim) != 0) {
         return 1;
     }
+    if (!kvslot_dtype_supported(args.dtype_code)) {
+        fprintf(stderr, "Unsupported kvslot dtype_code=%u\n", args.dtype_code);
+        return 1;
+    }
 
     size_t logical_elems = (size_t)args.seq_len * args.group_heads * args.head_dim;
     size_t elem_size = kvslot_dtype_elem_size(args.dtype_code);
@@ -1167,6 +1236,10 @@ static int handle_allocate(kvslot_runner_t *runner, uint32_t slot_id)
         }
     }
     slot->dtype_code = args.dtype_code;
+    slot->k_scale = kvslot_sanitize_scale(args.k_scale);
+    slot->v_scale = kvslot_sanitize_scale(args.v_scale);
+    args.k_scale = slot->k_scale;
+    args.v_scale = slot->v_scale;
     DPU_ASSERT(dpu_broadcast_to(target_dpu, "slot_args", 0, &args, sizeof(args), DPU_XFER_DEFAULT));
     if (reserve_elem_range(runner, physical_dpu_id, slot_total_elems, &slot->elem_offset) != 0) {
         fprintf(stderr, "DPU %u out of reusable kvslot capacity\n", physical_dpu_id);
@@ -1193,6 +1266,9 @@ static int handle_allocate(kvslot_runner_t *runner, uint32_t slot_id)
         .group_heads = slot->group_heads,
         .head_dim = slot->head_dim,
         .dtype_code = slot->dtype_code,
+        .k_scale = slot->k_scale,
+        .v_scale = slot->v_scale,
+        .reserved = 0,
     };
     if (write_exact(stdout, &out, sizeof(out)) != 0 || flush_exact(stdout) != 0) {
         fprintf(stderr, "Failed to write allocate response\n");
@@ -1264,6 +1340,9 @@ static int handle_append(kvslot_runner_t *runner, uint32_t slot_id)
         .group_heads = slot->group_heads,
         .head_dim = slot->head_dim,
         .dtype_code = slot->dtype_code,
+        .k_scale = slot->k_scale,
+        .v_scale = slot->v_scale,
+        .reserved = 0,
     };
     if (write_exact(stdout, &out, sizeof(out)) != 0 || flush_exact(stdout) != 0) {
         fprintf(stderr, "Failed to write append response\n");
@@ -1294,6 +1373,9 @@ static int handle_readback(kvslot_runner_t *runner, uint32_t slot_id)
         .group_heads = slot->group_heads,
         .head_dim = slot->head_dim,
         .dtype_code = slot->dtype_code,
+        .k_scale = slot->k_scale,
+        .v_scale = slot->v_scale,
+        .reserved = 0,
     };
     size_t elems = (size_t)slot->seq_len * slot->group_heads * slot->head_dim;
     size_t elem_size = kvslot_dtype_elem_size(slot->dtype_code);
@@ -2016,9 +2098,9 @@ static int prepare_qk_slot_item_header(
     item->runtime_args.head_dim = item->slot->head_dim;
     item->runtime_args.dtype_code = item->slot->dtype_code;
     item->runtime_args.elem_offset = item->slot->elem_offset;
-    item->runtime_args.reserved[0] = 0;
-    item->runtime_args.reserved[1] = 0;
-    item->runtime_args.reserved[2] = 0;
+    item->runtime_args.k_scale = item->slot->k_scale;
+    item->runtime_args.v_scale = item->slot->v_scale;
+    item->runtime_args.reserved = 0;
 
     item->slot_args.num_heads = num_heads;
     item->slot_args.window = window;
@@ -2081,7 +2163,11 @@ static int prepare_grouped_qk_slot_item_header(
                 fprintf(stderr, "Grouped qk item spans multiple physical DPUs\n");
                 return 1;
             }
-            if (slot->group_heads != first_slot->group_heads || slot->head_dim != first_slot->head_dim || slot->dtype_code != first_slot->dtype_code) {
+            if (slot->group_heads != first_slot->group_heads
+                || slot->head_dim != first_slot->head_dim
+                || slot->dtype_code != first_slot->dtype_code
+                || slot->k_scale != first_slot->k_scale
+                || slot->v_scale != first_slot->v_scale) {
                 fprintf(stderr, "Grouped qk item shape mismatch across segments\n");
                 return 1;
             }
@@ -2091,6 +2177,10 @@ static int prepare_grouped_qk_slot_item_header(
             fprintf(stderr, "Grouped qk segment length exceeds slot seq len\n");
             return 1;
         }
+        if (segment_lengths[seg_idx] > KVSLOT_MAX_CAPACITY || total_window + segment_lengths[seg_idx] > KVSLOT_MAX_CAPACITY) {
+            fprintf(stderr, "Grouped qk total window exceeds DPU capacity %u\n", KVSLOT_MAX_CAPACITY);
+            return 1;
+        }
         item->segment_slots[seg_idx] = slot;
         item->segment_slot_ids[seg_idx] = slot_id;
         item->segment_lengths[seg_idx] = segment_lengths[seg_idx];
@@ -2098,10 +2188,13 @@ static int prepare_grouped_qk_slot_item_header(
         item->segment_runtime_args[seg_idx].group_heads = slot->group_heads;
         item->segment_runtime_args[seg_idx].head_dim = slot->head_dim;
         item->segment_runtime_args[seg_idx].dtype_code = slot->dtype_code;
-        item->segment_runtime_args[seg_idx].elem_offset = slot->elem_offset + ((slot->seq_len - segment_lengths[seg_idx]) * slot->group_heads * slot->head_dim);
-        item->segment_runtime_args[seg_idx].reserved[0] = 0;
-        item->segment_runtime_args[seg_idx].reserved[1] = 0;
-        item->segment_runtime_args[seg_idx].reserved[2] = 0;
+        item->segment_runtime_args[seg_idx].elem_offset = slot->elem_offset
+            + kvslot_logical_elem_offset_to_packed_words(
+                (slot->seq_len - segment_lengths[seg_idx]) * slot->group_heads * slot->head_dim,
+                slot->dtype_code);
+        item->segment_runtime_args[seg_idx].k_scale = slot->k_scale;
+        item->segment_runtime_args[seg_idx].v_scale = slot->v_scale;
+        item->segment_runtime_args[seg_idx].reserved = 0;
         total_window += segment_lengths[seg_idx];
     }
 
@@ -2137,9 +2230,9 @@ static int prepare_grouped_qk_slot_item_header(
     item->runtime_args.head_dim = first_slot->head_dim;
     item->runtime_args.dtype_code = first_slot->dtype_code;
     item->runtime_args.elem_offset = 0;
-    item->runtime_args.reserved[0] = 0;
-    item->runtime_args.reserved[1] = 0;
-    item->runtime_args.reserved[2] = 0;
+    item->runtime_args.k_scale = first_slot->k_scale;
+    item->runtime_args.v_scale = first_slot->v_scale;
+    item->runtime_args.reserved = 0;
 
     item->slot_args.num_heads = num_heads;
     item->slot_args.window = total_window;
@@ -2414,7 +2507,9 @@ static int can_use_batched_qk_round(
         }
     }
     free(rank_used);
-    if (rank_spread_alloc_experiment_enabled() && active_rank_count > 1) {
+    if (rank_spread_alloc_experiment_enabled()
+        && active_rank_count > 1
+        && !rank_spread_multi_rank_batch_experiment_enabled()) {
         /*
          * Clover rank-spread alloc backs logical DPUs with one selected DPU per
          * physical rank. A batched round over DPU_SET_RANKS would iterate every
@@ -2953,15 +3048,18 @@ static int prepare_av_item_header(kvslot_runner_t *runner, uint32_t slot_id, av_
     item->runtime_args.head_dim = slot->head_dim;
     item->runtime_args.dtype_code = slot->dtype_code;
     item->runtime_args.elem_offset = slot->elem_offset;
-    item->runtime_args.reserved[0] = 0;
-    item->runtime_args.reserved[1] = 0;
-    item->runtime_args.reserved[2] = 0;
+    item->runtime_args.k_scale = slot->k_scale;
+    item->runtime_args.v_scale = slot->v_scale;
+    item->runtime_args.reserved = 0;
 
     item->out.capacity = slot->capacity;
     item->out.seq_len = slot->seq_len;
     item->out.group_heads = slot->group_heads;
     item->out.head_dim = slot->head_dim;
     item->out.dtype_code = slot->dtype_code;
+    item->out.k_scale = slot->k_scale;
+    item->out.v_scale = slot->v_scale;
+    item->out.reserved = 0;
     item->context_prefetched = 0;
     item->ready = 1;
     return 0;
@@ -3013,12 +3111,19 @@ static int prepare_grouped_av_item_header(
             item->out.group_heads = slot->group_heads;
             item->out.head_dim = slot->head_dim;
             item->out.dtype_code = slot->dtype_code;
+            item->out.k_scale = slot->k_scale;
+            item->out.v_scale = slot->v_scale;
+            item->out.reserved = 0;
         } else {
             if (physical_dpu_id != first_physical_dpu_id) {
                 fprintf(stderr, "Grouped av item spans multiple physical DPUs\n");
                 return 1;
             }
-            if (slot->group_heads != first_slot->group_heads || slot->head_dim != first_slot->head_dim || slot->dtype_code != first_slot->dtype_code) {
+            if (slot->group_heads != first_slot->group_heads
+                || slot->head_dim != first_slot->head_dim
+                || slot->dtype_code != first_slot->dtype_code
+                || slot->k_scale != first_slot->k_scale
+                || slot->v_scale != first_slot->v_scale) {
                 fprintf(stderr, "Grouped av item shape mismatch across segments\n");
                 return 1;
             }
@@ -3028,6 +3133,10 @@ static int prepare_grouped_av_item_header(
             fprintf(stderr, "Grouped av segment length exceeds slot seq len\n");
             return 1;
         }
+        if (segment_lengths[seg_idx] > KVSLOT_MAX_CAPACITY || total_seq_len + segment_lengths[seg_idx] > KVSLOT_MAX_CAPACITY) {
+            fprintf(stderr, "Grouped av total seq len exceeds DPU capacity %u\n", KVSLOT_MAX_CAPACITY);
+            return 1;
+        }
         item->segment_slots[seg_idx] = slot;
         item->segment_slot_ids[seg_idx] = slot_id;
         item->segment_lengths[seg_idx] = segment_lengths[seg_idx];
@@ -3035,10 +3144,13 @@ static int prepare_grouped_av_item_header(
         item->segment_runtime_args[seg_idx].group_heads = slot->group_heads;
         item->segment_runtime_args[seg_idx].head_dim = slot->head_dim;
         item->segment_runtime_args[seg_idx].dtype_code = slot->dtype_code;
-        item->segment_runtime_args[seg_idx].elem_offset = slot->elem_offset + ((slot->seq_len - segment_lengths[seg_idx]) * slot->group_heads * slot->head_dim);
-        item->segment_runtime_args[seg_idx].reserved[0] = 0;
-        item->segment_runtime_args[seg_idx].reserved[1] = 0;
-        item->segment_runtime_args[seg_idx].reserved[2] = 0;
+        item->segment_runtime_args[seg_idx].elem_offset = slot->elem_offset
+            + kvslot_logical_elem_offset_to_packed_words(
+                (slot->seq_len - segment_lengths[seg_idx]) * slot->group_heads * slot->head_dim,
+                slot->dtype_code);
+        item->segment_runtime_args[seg_idx].k_scale = slot->k_scale;
+        item->segment_runtime_args[seg_idx].v_scale = slot->v_scale;
+        item->segment_runtime_args[seg_idx].reserved = 0;
         total_seq_len += segment_lengths[seg_idx];
         item->out.capacity += slot->capacity;
     }
@@ -3049,10 +3161,13 @@ static int prepare_grouped_av_item_header(
     item->runtime_args.head_dim = first_slot->head_dim;
     item->runtime_args.dtype_code = first_slot->dtype_code;
     item->runtime_args.elem_offset = 0;
-    item->runtime_args.reserved[0] = 0;
-    item->runtime_args.reserved[1] = 0;
-    item->runtime_args.reserved[2] = 0;
+    item->runtime_args.k_scale = first_slot->k_scale;
+    item->runtime_args.v_scale = first_slot->v_scale;
+    item->runtime_args.reserved = 0;
     item->out.seq_len = total_seq_len;
+    item->out.k_scale = first_slot->k_scale;
+    item->out.v_scale = first_slot->v_scale;
+    item->out.reserved = 0;
     item->weight_bytes = (size_t)total_seq_len * first_slot->group_heads * sizeof(float);
     item->context_bytes = (size_t)first_slot->group_heads * first_slot->head_dim * sizeof(float);
     item->padded_weight_bytes = ((item->weight_bytes + 7u) / 8u) * 8u;
@@ -3311,7 +3426,9 @@ static int can_use_batched_av_round(
         }
     }
     free(rank_used);
-    if (rank_spread_alloc_experiment_enabled() && active_rank_count > 1) {
+    if (rank_spread_alloc_experiment_enabled()
+        && active_rank_count > 1
+        && !rank_spread_multi_rank_batch_experiment_enabled()) {
         return 0;
     }
     if (active_rank_count > KVSLOT_QK_MAX_ACTIVE_DPUS) {

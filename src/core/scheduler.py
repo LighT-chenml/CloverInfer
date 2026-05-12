@@ -1713,6 +1713,15 @@ class GlobalScheduler:
                         "pim_rank_spread_alloc_experimental_enabled": bool(
                             self.cluster_config.clover_pim_rank_spread_alloc_experimental_enabled
                         ),
+                        "pim_cross_rank_stripe_experimental_enabled": bool(
+                            self.cluster_config.clover_pim_cross_rank_stripe_experimental_enabled
+                        ),
+                        "pim_rank_spread_multi_rank_batch_experimental_enabled": bool(
+                            self.cluster_config.clover_pim_rank_spread_multi_rank_batch_experimental_enabled
+                        ),
+                        "pim_layer_rank_rotation_experimental_enabled": bool(
+                            self.cluster_config.clover_pim_layer_rank_rotation_experimental_enabled
+                        ),
                         "pim_slot_spill_alloc_experimental_enabled": bool(
                             self.cluster_config.clover_pim_slot_spill_alloc_experimental_enabled
                         ),
@@ -1731,6 +1740,22 @@ class GlobalScheduler:
                                 "clover_pim_reserve_segment_tail_capacity_tokens",
                                 0,
                             )
+                        ),
+                        "pim_perf_guard_enabled": bool(
+                            getattr(self.cluster_config, "clover_pim_perf_guard_enabled", False)
+                        ),
+                        "pim_perf_guard_force_cpu_for_compressed_kv": bool(
+                            getattr(
+                                self.cluster_config,
+                                "clover_pim_perf_guard_force_cpu_for_compressed_kv",
+                                True,
+                            )
+                        ),
+                        "pim_perf_guard_min_decode_items": int(
+                            getattr(self.cluster_config, "clover_pim_perf_guard_min_decode_items", 1)
+                        ),
+                        "pim_perf_guard_slowdown_threshold": float(
+                            getattr(self.cluster_config, "clover_pim_perf_guard_slowdown_threshold", 1.2)
                         ),
                         "compact_short_segments_enabled": bool(
                             self.cluster_config.clover_compact_short_segments_enabled

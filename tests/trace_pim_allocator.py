@@ -172,7 +172,7 @@ def main():
         default="auto",
         choices=["auto", "identity", "rotated", "rank_spread", "load_aware"],
     )
-    parser.add_argument("--pim-resident-kv-dtype", default="fp32", choices=["fp32", "fp16"])
+    parser.add_argument("--pim-resident-kv-dtype", default="fp32", choices=["fp32", "fp16", "int8"])
     parser.add_argument("--pim-resident-store-backend", default="upmem_kvslot", choices=["host", "upmem_kvslot"])
     parser.add_argument("--pim-qk-full-enabled", action="store_true")
     parser.add_argument("--no-pim-qk-full-enabled", action="store_true")

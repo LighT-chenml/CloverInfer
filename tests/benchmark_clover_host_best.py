@@ -46,6 +46,9 @@ def make_scheduler(args):
     mode = str(args.mode)
     clover_pim_context_fused_experimental_enabled = False
     clover_pim_rank_spread_alloc_experimental_enabled = False
+    clover_pim_cross_rank_stripe_experimental_enabled = False
+    clover_pim_rank_spread_multi_rank_batch_experimental_enabled = False
+    clover_pim_layer_rank_rotation_experimental_enabled = False
     clover_fine_head_grouping_experimental_enabled = False
     clover_target_heads_per_group_experimental = 0
     if mode == "host_best":
@@ -77,6 +80,18 @@ def make_scheduler(args):
         clover_pim_rank_spread_alloc_experimental_enabled = bool(
             clover_pim_rank_spread_alloc_experimental_enabled
             or args.clover_pim_rank_spread_alloc_experimental_enabled
+        )
+    if hasattr(args, "clover_pim_cross_rank_stripe_experimental_enabled"):
+        clover_pim_cross_rank_stripe_experimental_enabled = bool(
+            args.clover_pim_cross_rank_stripe_experimental_enabled
+        )
+    if hasattr(args, "clover_pim_rank_spread_multi_rank_batch_experimental_enabled"):
+        clover_pim_rank_spread_multi_rank_batch_experimental_enabled = bool(
+            args.clover_pim_rank_spread_multi_rank_batch_experimental_enabled
+        )
+    if hasattr(args, "clover_pim_layer_rank_rotation_experimental_enabled"):
+        clover_pim_layer_rank_rotation_experimental_enabled = bool(
+            args.clover_pim_layer_rank_rotation_experimental_enabled
         )
     if hasattr(args, "clover_fine_head_grouping_experimental_enabled"):
         clover_fine_head_grouping_experimental_enabled = bool(
@@ -115,6 +130,13 @@ def make_scheduler(args):
         clover_pim_attention_enabled=clover_pim_attention_enabled,
         clover_pim_context_fused_experimental_enabled=clover_pim_context_fused_experimental_enabled,
         clover_pim_rank_spread_alloc_experimental_enabled=clover_pim_rank_spread_alloc_experimental_enabled,
+        clover_pim_cross_rank_stripe_experimental_enabled=clover_pim_cross_rank_stripe_experimental_enabled,
+        clover_pim_rank_spread_multi_rank_batch_experimental_enabled=(
+            clover_pim_rank_spread_multi_rank_batch_experimental_enabled
+        ),
+        clover_pim_layer_rank_rotation_experimental_enabled=(
+            clover_pim_layer_rank_rotation_experimental_enabled
+        ),
         clover_fine_head_grouping_experimental_enabled=clover_fine_head_grouping_experimental_enabled,
         clover_target_heads_per_group_experimental=clover_target_heads_per_group_experimental,
         attention_rpc_cross_key_batch_enabled=True,
@@ -432,6 +454,21 @@ def main():
         "--clover-pim-rank-spread-alloc-experimental-enabled",
         action="store_true",
         help="Enable Clover-only helper-side cross-rank logical DPU allocation.",
+    )
+    parser.add_argument(
+        "--clover-pim-cross-rank-stripe-experimental-enabled",
+        action="store_true",
+        help="Enable Clover-only request stripe interleaving across physical ranks.",
+    )
+    parser.add_argument(
+        "--clover-pim-rank-spread-multi-rank-batch-experimental-enabled",
+        action="store_true",
+        help="Allow rank-spread helper rounds to use existing batched multi-rank launches.",
+    )
+    parser.add_argument(
+        "--clover-pim-layer-rank-rotation-experimental-enabled",
+        action="store_true",
+        help="Rotate coarse resident KV layers across rank-local stripes.",
     )
     parser.add_argument(
         "--clover-fine-head-grouping-experimental-enabled",

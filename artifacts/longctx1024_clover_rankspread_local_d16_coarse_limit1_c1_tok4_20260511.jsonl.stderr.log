@@ -1,0 +1,68 @@
+2026-05-11 15:58:37,987	INFO worker.py:1821 -- Connecting to existing Ray cluster at address: 192.168.123.4:26379...
+2026-05-11 15:58:38,007	INFO worker.py:1998 -- Connected to Ray cluster. View the dashboard at [1m[32m192.168.123.4:8265 [39m[22m
+/home/cml/.local/lib/python3.10/site-packages/ray/_private/worker.py:2046: FutureWarning: Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default). To enable this behavior and turn off this error message, set RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  warnings.warn(
+[33m(raylet, ip=192.168.123.7)[0m Python patch version mismatch: The cluster was started with:
+[33m(raylet, ip=192.168.123.7)[0m     Ray: 2.53.0
+[33m(raylet, ip=192.168.123.7)[0m     Python: 3.10.19
+[33m(raylet, ip=192.168.123.7)[0m This process on node 192.168.123.7 was started with:
+[33m(raylet, ip=192.168.123.7)[0m 
+[33m(raylet, ip=192.168.123.3)[0m 
+[33m(raylet, ip=192.168.123.7)[0m 
+Traceback (most recent call last):
+  File "/home/cml/CloverInfer/tests/benchmark_baselines.py", line 1188, in <module>
+    main()
+  File "/home/cml/CloverInfer/tests/benchmark_baselines.py", line 1159, in main
+    result = run_disaggregated(args, problems, "cloverinfer")
+  File "/home/cml/CloverInfer/tests/benchmark_baselines.py", line 566, in run_disaggregated
+    records, wall_time_s = run_scheduler_requests(
+  File "/home/cml/CloverInfer/tests/benchmark_baselines.py", line 350, in run_scheduler_requests
+    completion, metrics = ray.get(future)
+  File "/home/cml/.local/lib/python3.10/site-packages/ray/_private/auto_init_hook.py", line 22, in auto_init_wrapper
+    return fn(*args, **kwargs)
+  File "/home/cml/.local/lib/python3.10/site-packages/ray/_private/client_mode_hook.py", line 104, in wrapper
+    return func(*args, **kwargs)
+  File "/home/cml/.local/lib/python3.10/site-packages/ray/_private/worker.py", line 2967, in get
+    values, debugger_breakpoint = worker.get_objects(
+  File "/home/cml/.local/lib/python3.10/site-packages/ray/_private/worker.py", line 1015, in get_objects
+    raise value.as_instanceof_cause()
+ray.exceptions.RayTaskError(RuntimeError): [36mray::GlobalScheduler.submit_request()[39m (pid=100875, ip=192.168.123.7, actor_id=fceebed64240fc7d59f335446c000000, repr=<src.core.scheduler.GlobalScheduler object at 0x7fde13524760>)
+  File "/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py", line 451, in result
+    return self.__get_result()
+  File "/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py", line 403, in __get_result
+    raise self._exception
+  File "/home/cml/CloverInfer/src/core/scheduler.py", line 1850, in submit_request
+  File "/home/cml/CloverInfer/src/core/scheduler.py", line 994, in _decode_driver_loop
+    result = dict(cohort)
+  File "/home/cml/CloverInfer/src/core/scheduler.py", line 1309, in _run_decode_wave
+    sample_results = await dense.sample_next_token_batch.remote(hidden_states)
+ray.exceptions.RayTaskError(RuntimeError): [36mray::AttentionNode.decode_layer_batch()[39m (pid=100941, ip=192.168.123.7, actor_id=46a0b7c569764e3a826943df6c000000, repr=<src.core.nodes.AttentionNode object at 0x7f987216f8e0>)
+  File "/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py", line 451, in result
+    return self.__get_result()
+  File "/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py", line 403, in __get_result
+    raise self._exception
+  File "/home/cml/CloverInfer/src/core/nodes.py", line 531, in decode_layer_batch
+    return await self._execute_rankset_task_graph_batch(payloads)
+  File "/home/cml/CloverInfer/src/core/nodes.py", line 214, in _execute_rankset_task_graph_batch
+    return self._fallback_rankset_execution(
+  File "/home/cml/CloverInfer/src/core/nodes.py", line 177, in _fallback_rankset_execution
+    contexts = self.backend.decode_layer_batch(payloads)
+  File "/tmp/ray/session_2026-05-10_12-49-05_956607_92170/runtime_resources/py_modules_files/_ray_pkg_0b96adfdb2f07701/src/core/clover_attention_backend.py", line 595, in decode_layer_batch
+    return self._finalize_decode_records(records)
+  File "/tmp/ray/session_2026-05-10_12-49-05_956607_92170/runtime_resources/py_modules_files/_ray_pkg_0b96adfdb2f07701/src/core/clover_attention_backend.py", line 903, in _finalize_decode_records
+    group_contexts = self.resident_store.softmax_weighted_value_sum_batch(flat_slot_scores)
+  File "/tmp/ray/session_2026-05-10_12-49-05_956607_92170/runtime_resources/py_modules_files/_ray_pkg_0b96adfdb2f07701/src/core/resident_kv_store.py", line 3758, in softmax_weighted_value_sum_batch
+    segmented_contexts = self.weighted_value_sum_batch(segmented_weights)
+  File "/tmp/ray/session_2026-05-10_12-49-05_956607_92170/runtime_resources/py_modules_files/_ray_pkg_0b96adfdb2f07701/src/core/resident_kv_store.py", line 3660, in weighted_value_sum_batch
+    dpu_contexts = self.helper.weighted_value_sum_batch([item["payload"] for item in ordered_entries])
+  File "/tmp/ray/session_2026-05-10_12-49-05_956607_92170/runtime_resources/py_modules_files/_ray_pkg_0b96adfdb2f07701/src/core/resident_kv_store.py", line 724, in weighted_value_sum_batch
+    self._write_parts(payload_parts)
+  File "/tmp/ray/session_2026-05-10_12-49-05_956607_92170/runtime_resources/py_modules_files/_ray_pkg_0b96adfdb2f07701/src/core/resident_kv_store.py", line 320, in _write_parts
+    proc = self._ensure_proc()
+  File "/tmp/ray/session_2026-05-10_12-49-05_956607_92170/runtime_resources/py_modules_files/_ray_pkg_0b96adfdb2f07701/src/core/resident_kv_store.py", line 273, in _ensure_proc
+    raise RuntimeError(
+RuntimeError: kvslot helper exited while persistent DPU state was active:
+[33m(raylet, ip=192.168.123.7)[0m Python patch version mismatch: The cluster was started with:[32m [repeated 2x across cluster] (Ray deduplicates logs by default. Set RAY_DEDUP_LOGS=0 to disable log deduplication, or see https://docs.ray.io/en/master/ray-observability/user-guides/configure-logging.html#log-deduplication for more options.)[0m
+[33m(raylet, ip=192.168.123.7)[0m     Ray: 2.53.0[32m [repeated 5x across cluster][0m
+[33m(raylet, ip=192.168.123.7)[0m     Python: 3.10.20[32m [repeated 5x across cluster][0m
+[33m(raylet, ip=192.168.123.7)[0m This process on node 192.168.123.7 was started with:[32m [repeated 2x across cluster][0m

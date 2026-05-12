@@ -44,11 +44,18 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         pim_attention_enabled: bool = False,
         pim_context_fused_experimental_enabled: bool = False,
         pim_rank_spread_alloc_experimental_enabled: bool = False,
+        pim_cross_rank_stripe_experimental_enabled: bool = False,
+        pim_rank_spread_multi_rank_batch_experimental_enabled: bool = False,
+        pim_layer_rank_rotation_experimental_enabled: bool = False,
         pim_slot_spill_alloc_experimental_enabled: bool = False,
         pim_slot_pressure_aware_alloc_experimental_enabled: bool = False,
         pim_emergency_slot_spill_experimental_enabled: bool = False,
         pim_reserve_segment_tail_capacity_experimental_enabled: bool = False,
         pim_reserve_segment_tail_capacity_tokens: int = 0,
+        pim_perf_guard_enabled: bool = False,
+        pim_perf_guard_force_cpu_for_compressed_kv: bool = True,
+        pim_perf_guard_min_decode_items: int = 1,
+        pim_perf_guard_slowdown_threshold: float = 1.2,
         fine_head_grouping_experimental_enabled: bool = False,
         target_heads_per_group_experimental: int = 0,
         compact_short_segments_enabled: bool = False,
@@ -68,6 +75,15 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         self.pim_attention_enabled = bool(pim_attention_enabled)
         self.pim_context_fused_experimental_enabled = bool(pim_context_fused_experimental_enabled)
         self.pim_rank_spread_alloc_experimental_enabled = bool(pim_rank_spread_alloc_experimental_enabled)
+        self.pim_cross_rank_stripe_experimental_enabled = bool(
+            pim_cross_rank_stripe_experimental_enabled
+        )
+        self.pim_rank_spread_multi_rank_batch_experimental_enabled = bool(
+            pim_rank_spread_multi_rank_batch_experimental_enabled
+        )
+        self.pim_layer_rank_rotation_experimental_enabled = bool(
+            pim_layer_rank_rotation_experimental_enabled
+        )
         self.pim_slot_spill_alloc_experimental_enabled = bool(pim_slot_spill_alloc_experimental_enabled)
         self.pim_slot_pressure_aware_alloc_experimental_enabled = bool(
             pim_slot_pressure_aware_alloc_experimental_enabled
@@ -82,6 +98,12 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
             0,
             int(pim_reserve_segment_tail_capacity_tokens),
         )
+        self.pim_perf_guard_enabled = bool(pim_perf_guard_enabled)
+        self.pim_perf_guard_force_cpu_for_compressed_kv = bool(
+            pim_perf_guard_force_cpu_for_compressed_kv
+        )
+        self.pim_perf_guard_min_decode_items = max(1, int(pim_perf_guard_min_decode_items))
+        self.pim_perf_guard_slowdown_threshold = max(1.0, float(pim_perf_guard_slowdown_threshold))
         self.fine_head_grouping_experimental_enabled = bool(fine_head_grouping_experimental_enabled)
         self.target_heads_per_group_experimental = max(0, int(target_heads_per_group_experimental))
         self.clover_compact_short_segments_enabled = bool(compact_short_segments_enabled)
@@ -122,10 +144,28 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         self.resident_context_fallback_reason = ""
         self.resident_runtime_fallbacks = 0
         self.resident_runtime_fallback_reason = ""
+        self.pim_perf_guard_triggered = False
+        self.pim_perf_guard_reason = ""
+        self.pim_perf_guard_decode_observations = 0
+        self.pim_perf_guard_cpu_probe_s = 0.0
+        self.pim_perf_guard_pim_observed_s = 0.0
+        self.pim_perf_guard_forced_request_count = 0
+        if self.pim_perf_guard_enabled:
+            self.cpu_shadow_enabled = True
+        if (
+            self.pim_attention_enabled
+            and self.pim_perf_guard_enabled
+            and self.pim_perf_guard_force_cpu_for_compressed_kv
+            and str(self.resident_kv_dtype) in {"fp16", "int8"}
+        ):
+            self.pim_perf_guard_triggered = True
+            self.pim_perf_guard_reason = (
+                f"compressed_resident_kv_dtype:{self.resident_kv_dtype}"
+            )
         if self.pim_attention_enabled:
             self.qk_full_enabled = True
             self.softmax_av_fused_enabled = True
-            if not self.resident_av_enabled:
+            if not self.resident_av_enabled and not self.pim_perf_guard_triggered:
                 raise ValueError(
                     "CloverInfer PIM attention requires a resident store with PIM AV support; "
                     "use pim_resident_store_backend='upmem_kvslot'"
@@ -139,6 +179,9 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                 context_fused_enabled=self.pim_context_fused_experimental_enabled,
                 shape_rounds_enabled=self.fine_head_grouping_experimental_enabled,
                 rank_spread_alloc_enabled=self.pim_rank_spread_alloc_experimental_enabled,
+                rank_spread_multi_rank_batch_enabled=(
+                    self.pim_rank_spread_multi_rank_batch_experimental_enabled
+                ),
                 slot_spill_alloc_enabled=self.pim_slot_spill_alloc_experimental_enabled,
                 slot_pressure_aware_alloc_enabled=self.pim_slot_pressure_aware_alloc_experimental_enabled,
                 emergency_slot_spill_enabled=self.pim_emergency_slot_spill_experimental_enabled,
@@ -267,6 +310,77 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
 
     def _use_cpu_fast_path_for_request(self, request_id: str) -> bool:
         return str(request_id) in self.cpu_fast_path_request_ids
+
+    def _activate_pim_perf_guard_for_requests(
+        self,
+        request_ids: List[str],
+        reason: str,
+    ) -> None:
+        if not self.pim_perf_guard_enabled:
+            return
+        self.pim_perf_guard_triggered = True
+        self.pim_perf_guard_reason = str(reason)
+        newly_forced = 0
+        for request_id in request_ids:
+            normalized = str(request_id)
+            if normalized in self.cpu_fast_path_request_ids:
+                continue
+            if normalized not in self.shadow_k_buffers:
+                continue
+            self.cpu_fast_path_request_ids.add(normalized)
+            newly_forced += 1
+        self.pim_perf_guard_forced_request_count += newly_forced
+
+    def _ensure_pim_perf_guard_fast_path_for_items(self, items: List[Dict[str, object]]) -> None:
+        if not (self.pim_perf_guard_enabled and self.pim_perf_guard_triggered):
+            return
+        self._activate_pim_perf_guard_for_requests(
+            [str(item["request_id"]) for item in items],
+            self.pim_perf_guard_reason or "pim_perf_guard_already_triggered",
+        )
+
+    def _probe_cpu_attention_s(self, records: List[Dict[str, object]]) -> float:
+        started_at = time.perf_counter()
+        for record in records:
+            if record.get("keys") is None or record.get("values") is None:
+                continue
+            scores = self._compute_host_scores(record)
+            weights = torch.softmax(scores, dim=-1)
+            _ = torch.einsum("hl,lhd->hd", weights, record["values"].float())
+        return max(0.0, float(time.perf_counter() - started_at))
+
+    def _maybe_trigger_pim_perf_guard(
+        self,
+        records: List[Dict[str, object]],
+        *,
+        cpu_probe_s: float,
+        pim_observed_s: float,
+    ) -> None:
+        if not self.pim_perf_guard_enabled or self.pim_perf_guard_triggered:
+            return
+        if not self.pim_attention_enabled:
+            return
+        if not records or cpu_probe_s <= 0.0 or pim_observed_s <= 0.0:
+            return
+        self.pim_perf_guard_decode_observations += len(records)
+        self.pim_perf_guard_cpu_probe_s += float(cpu_probe_s)
+        self.pim_perf_guard_pim_observed_s += float(pim_observed_s)
+        if self.pim_perf_guard_decode_observations < self.pim_perf_guard_min_decode_items:
+            return
+        slowdown = self.pim_perf_guard_pim_observed_s / max(self.pim_perf_guard_cpu_probe_s, 1e-12)
+        if slowdown < self.pim_perf_guard_slowdown_threshold:
+            return
+        request_ids = [str(record["request_id"]) for record in records]
+        self._activate_pim_perf_guard_for_requests(
+            request_ids,
+            (
+                "observed_pim_attention_slowdown:"
+                f"pim_s={self.pim_perf_guard_pim_observed_s:.6f},"
+                f"cpu_probe_s={self.pim_perf_guard_cpu_probe_s:.6f},"
+                f"slowdown={slowdown:.3f},"
+                f"threshold={self.pim_perf_guard_slowdown_threshold:.3f}"
+            ),
+        )
 
     def _decode_cpu_fast_path_batch(self, items: List[Dict[str, object]]) -> List[torch.Tensor]:
         records: List[Dict[str, object]] = []
@@ -526,6 +640,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
             return []
         self.decode_batch_calls += 1
         self.decode_batch_items += len(items)
+        self._ensure_pim_perf_guard_fast_path_for_items(items)
         fast_items_with_indices = [
             (idx, item)
             for idx, item in enumerate(items)
@@ -561,8 +676,17 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
             self.qk_mixed_last_max_abs_diff = 0.0
             self.qk_mixed_last_diag = {}
             self.qk_mixed_last_diag_path = ""
+            cpu_probe_s = self._probe_cpu_attention_s(records) if self.pim_perf_guard_enabled else 0.0
+            pim_started_at = time.perf_counter()
             self._apply_qk_context_fused_batch(records)
-            return self._finalize_ready_context_records(records)
+            outputs = self._finalize_ready_context_records(records)
+            pim_observed_s = max(0.0, float(time.perf_counter() - pim_started_at))
+            self._maybe_trigger_pim_perf_guard(
+                records,
+                cpu_probe_s=cpu_probe_s,
+                pim_observed_s=pim_observed_s,
+            )
+            return outputs
         if not self.resident_compute_enabled:
             self.qk_mixed_last_head_diffs = []
             self.qk_mixed_last_max_abs_diff = 0.0
@@ -577,11 +701,23 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
             self.qk_mixed_last_max_abs_diff = 0.0
             self.qk_mixed_last_diag = {}
             self.qk_mixed_last_diag_path = ""
+            cpu_probe_s = self._probe_cpu_attention_s(records) if self.pim_perf_guard_enabled else 0.0
+            pim_started_at = time.perf_counter()
             self._apply_qk_full_batch(records)
         else:
+            cpu_probe_s = 0.0
+            pim_started_at = 0.0
             self.qk_full_shadow_last_max_abs_diff = 0.0
             self._apply_qk_mixed_batch(records)
-        return self._finalize_decode_records(records)
+        outputs = self._finalize_decode_records(records)
+        if self.qk_full_enabled and self.resident_compute_enabled:
+            pim_observed_s = max(0.0, float(time.perf_counter() - pim_started_at))
+            self._maybe_trigger_pim_perf_guard(
+                records,
+                cpu_probe_s=cpu_probe_s,
+                pim_observed_s=pim_observed_s,
+            )
+        return outputs
 
     def _finalize_ready_context_records(self, records: List[Dict[str, object]]) -> List[torch.Tensor]:
         with self._timed("finalize_decode_records_s"):
@@ -1099,6 +1235,9 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
             self.cpu_backend.context_lens[request_id] = seq_len
         if use_cpu_fast_path:
             self.cpu_fast_path_request_ids.add(str(request_id))
+        elif self.pim_perf_guard_enabled and self.pim_perf_guard_triggered:
+            self.cpu_fast_path_request_ids.add(str(request_id))
+            self.pim_perf_guard_forced_request_count += 1
         else:
             self.request_states[request_id] = self._build_request_state(
                 request_id,
@@ -1146,6 +1285,18 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         debug["clover_host_qk_mixed_enabled"] = self.host_qk_mixed_enabled
         debug["clover_pim_attention_enabled"] = self.pim_attention_enabled
         debug["clover_pim_context_fused_experimental_enabled"] = self.pim_context_fused_experimental_enabled
+        debug["clover_pim_rank_spread_alloc_experimental_enabled"] = (
+            self.pim_rank_spread_alloc_experimental_enabled
+        )
+        debug["clover_pim_cross_rank_stripe_experimental_enabled"] = (
+            self.pim_cross_rank_stripe_experimental_enabled
+        )
+        debug["clover_pim_rank_spread_multi_rank_batch_experimental_enabled"] = (
+            self.pim_rank_spread_multi_rank_batch_experimental_enabled
+        )
+        debug["clover_pim_layer_rank_rotation_experimental_enabled"] = (
+            self.pim_layer_rank_rotation_experimental_enabled
+        )
         debug["clover_pim_reserve_segment_tail_capacity_experimental_enabled"] = (
             self.pim_reserve_segment_tail_capacity_experimental_enabled
         )
@@ -1155,6 +1306,24 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         debug["clover_pim_reserve_segment_tail_capacity_effective_enabled"] = (
             self.pim_reserve_segment_tail_capacity_experimental_enabled
             or self.pim_reserve_segment_tail_capacity_tokens > 0
+        )
+        debug["clover_pim_perf_guard_enabled"] = bool(self.pim_perf_guard_enabled)
+        debug["clover_pim_perf_guard_force_cpu_for_compressed_kv"] = bool(
+            self.pim_perf_guard_force_cpu_for_compressed_kv
+        )
+        debug["clover_pim_perf_guard_min_decode_items"] = int(self.pim_perf_guard_min_decode_items)
+        debug["clover_pim_perf_guard_slowdown_threshold"] = float(
+            self.pim_perf_guard_slowdown_threshold
+        )
+        debug["clover_pim_perf_guard_triggered"] = bool(self.pim_perf_guard_triggered)
+        debug["clover_pim_perf_guard_reason"] = str(self.pim_perf_guard_reason)
+        debug["clover_pim_perf_guard_decode_observations"] = int(
+            self.pim_perf_guard_decode_observations
+        )
+        debug["clover_pim_perf_guard_cpu_probe_s"] = float(self.pim_perf_guard_cpu_probe_s)
+        debug["clover_pim_perf_guard_pim_observed_s"] = float(self.pim_perf_guard_pim_observed_s)
+        debug["clover_pim_perf_guard_forced_request_count"] = int(
+            self.pim_perf_guard_forced_request_count
         )
         debug["clover_compact_short_segments_enabled"] = self.clover_compact_short_segments_enabled
         debug["clover_compact_short_segment_min_tokens"] = self.clover_compact_short_segment_min_tokens

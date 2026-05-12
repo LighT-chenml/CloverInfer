@@ -1,0 +1,20 @@
+2026-05-11 16:05:05,839	INFO worker.py:1821 -- Connecting to existing Ray cluster at address: 192.168.123.4:26379...
+2026-05-11 16:05:05,859	INFO worker.py:1998 -- Connected to Ray cluster. View the dashboard at [1m[32m192.168.123.4:8265 [39m[22m
+2026-05-11 16:05:05,960	INFO packaging.py:691 -- Creating a file package for local module '/home/cml/CloverInfer/src'.
+2026-05-11 16:05:06,001	WARNING packaging.py:516 -- File /home/cml/CloverInfer/src/network/build/temp.linux-x86_64-3.10/csrc/clover_transport.o is very large (16.22MiB). Consider adding this file to the 'excludes' list to skip uploading it: `ray.init(..., runtime_env={'excludes': ['/home/cml/CloverInfer/src/network/build/temp.linux-x86_64-3.10/csrc/clover_transport.o']})`
+2026-05-11 16:05:06,042	WARNING packaging.py:516 -- File /home/cml/CloverInfer/src/network/build/lib.linux-x86_64-3.10/clover_net.cpython-310-x86_64-linux-gnu.so is very large (10.55MiB). Consider adding this file to the 'excludes' list to skip uploading it: `ray.init(..., runtime_env={'excludes': ['/home/cml/CloverInfer/src/network/build/lib.linux-x86_64-3.10/clover_net.cpython-310-x86_64-linux-gnu.so']})`
+2026-05-11 16:05:06,107	INFO packaging.py:463 -- Pushing file package 'gcs://_ray_pkg_a7d695e92eaa61e8.zip' (38.28MiB) to Ray cluster...
+2026-05-11 16:05:06,286	INFO packaging.py:476 -- Successfully pushed file package 'gcs://_ray_pkg_a7d695e92eaa61e8.zip'.
+/home/cml/.local/lib/python3.10/site-packages/ray/_private/worker.py:2046: FutureWarning: Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default). To enable this behavior and turn off this error message, set RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  warnings.warn(
+[33m(raylet, ip=192.168.123.7)[0m Python patch version mismatch: The cluster was started with:
+[33m(raylet, ip=192.168.123.7)[0m     Ray: 2.53.0
+[33m(raylet, ip=192.168.123.7)[0m     Python: 3.10.19
+[33m(raylet, ip=192.168.123.7)[0m This process on node 192.168.123.7 was started with:
+[33m(raylet, ip=192.168.123.7)[0m 
+[33m(raylet, ip=192.168.123.3)[0m 
+[33m(raylet, ip=192.168.123.7)[0m 
+[33m(raylet, ip=192.168.123.7)[0m Python patch version mismatch: The cluster was started with:[32m [repeated 2x across cluster] (Ray deduplicates logs by default. Set RAY_DEDUP_LOGS=0 to disable log deduplication, or see https://docs.ray.io/en/master/ray-observability/user-guides/configure-logging.html#log-deduplication for more options.)[0m
+[33m(raylet, ip=192.168.123.7)[0m     Ray: 2.53.0[32m [repeated 5x across cluster][0m
+[33m(raylet, ip=192.168.123.7)[0m     Python: 3.10.20[32m [repeated 5x across cluster][0m
+[33m(raylet, ip=192.168.123.7)[0m This process on node 192.168.123.7 was started with:[32m [repeated 2x across cluster][0m

@@ -285,7 +285,7 @@ class PimNaiveAttentionBackend:
             raise ValueError(f"Unsupported head_grouping_policy: {self.head_grouping_policy}")
         if self.dpu_placement_policy not in {"identity", "rotated", "rank_spread", "load_aware"}:
             raise ValueError(f"Unsupported dpu_placement_policy: {self.dpu_placement_policy}")
-        if self.resident_kv_dtype not in {"fp32", "fp16"}:
+        if self.resident_kv_dtype not in {"fp32", "fp16", "int8"}:
             raise ValueError(f"Unsupported resident_kv_dtype: {self.resident_kv_dtype}")
         self.cpu_backend = CpuAttentionBackend()
         self.smoke_test_ok = False
@@ -313,6 +313,8 @@ class PimNaiveAttentionBackend:
         self.host_partial_reduce_enabled = bool(host_partial_reduce_enabled)
         self.compact_short_segments_enabled = bool(compact_short_segments_enabled)
         self.compact_short_segment_min_tokens = max(1, int(compact_short_segment_min_tokens))
+        self.pim_cross_rank_stripe_experimental_enabled = False
+        self.layer_rank_rotation_count = 0
         self.planner_segment_plan_count = 0
         self.planner_segment_materialized_count = 0
         self.planner_segment_compacted_count = 0
@@ -558,6 +560,49 @@ class PimNaiveAttentionBackend:
     def _request_hash(self, request_id: str) -> int:
         return sum(ord(ch) for ch in str(request_id))
 
+    def _layer_rank_rotation_enabled(self) -> bool:
+        return (
+            bool(getattr(self, "pim_layer_rank_rotation_experimental_enabled", False))
+            and self.head_grouping_policy == "coarse"
+            and self.dpu_placement_policy == "rank_spread"
+            and bool(getattr(self, "pim_rank_spread_alloc_experimental_enabled", False))
+            and not bool(getattr(self, "pim_cross_rank_stripe_experimental_enabled", False))
+        )
+
+    def _preferred_dpu_stripe_for_layer(
+        self,
+        request_id: str,
+        layer_idx: int,
+        base_stripe: List[int],
+    ) -> List[int]:
+        base = self._normalize_physical_dpu_list(base_stripe)
+        if not base or not self._layer_rank_rotation_enabled():
+            return base
+
+        rank_groups = self._rank_groups_with_indices()
+        if not rank_groups:
+            return base
+
+        base_rank_index = self._stripe_rank_index(base)
+        base_ordinal = None
+        for ordinal, (rank_index, _group) in enumerate(rank_groups):
+            if base_rank_index is not None and int(rank_index) == int(base_rank_index):
+                base_ordinal = int(ordinal)
+                break
+        if base_ordinal is None:
+            base_ordinal = self._request_hash(request_id) % max(1, len(rank_groups))
+
+        target_ordinal = (int(base_ordinal) + int(layer_idx)) % max(1, len(rank_groups))
+        target_rank_index = int(rank_groups[target_ordinal][0])
+        layer_stripe = self._rank_local_stripe_for_request(
+            request_id,
+            max(1, len(base)),
+            target_rank_index=target_rank_index,
+        )
+        if layer_stripe != base:
+            self.layer_rank_rotation_count += 1
+        return layer_stripe
+
     def _planner_metadata(self, sharding_plan: Dict[str, object] | None) -> Dict[str, object]:
         return dict((sharding_plan or {}).get("metadata", {}) or {})
 
@@ -654,18 +699,69 @@ class PimNaiveAttentionBackend:
         *,
         request_id: str,
         seq_len: int,
+        capacity: int,
         head_start: int,
         head_end: int,
+        head_dim: int,
         allowed_dpus: List[int],
     ) -> List[Dict[str, int]]:
-        def _balanced_segments() -> List[Dict[str, int]]:
+        def _target_segment_dpus() -> List[int]:
             if not allowed_dpus:
+                return []
+            if os.environ.get("CLOVER_PIM_NARROW_SEGMENT_DPU_SUBSET", "0").strip().lower() not in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }:
+                return list(allowed_dpus)
+            pool_capacity_elems = int(getattr(self.resident_store, "POOL_CAPACITY_ELEMS", 0) or 0)
+            if pool_capacity_elems <= 0:
+                return list(allowed_dpus)
+
+            group_heads = max(1, int(head_end) - int(head_start))
+            logical_capacity = max(int(seq_len), int(capacity))
+            slot_elem_count_fn = getattr(self.resident_store, "_slot_elem_count", None)
+            if callable(slot_elem_count_fn):
+                group_capacity_elems = int(slot_elem_count_fn(logical_capacity, group_heads, int(head_dim)))
+            else:
+                group_capacity_elems = int(logical_capacity) * int(group_heads) * int(head_dim)
+            min_target_count = max(1, math.ceil(float(group_capacity_elems) / float(pool_capacity_elems)))
+            min_target_count = min(len(allowed_dpus), int(min_target_count))
+
+            dpu_live_elems = getattr(self.resident_store, "dpu_live_elems_by_dpu", None)
+            candidate_scores = []
+            for ordinal, physical_dpu in enumerate(allowed_dpus):
+                slot_pressure, elem_pressure, normalized_dpu = self._segment_dpu_pressure(int(physical_dpu))
+                live_elems = (
+                    int(dpu_live_elems[normalized_dpu])
+                    if isinstance(dpu_live_elems, list) and normalized_dpu < len(dpu_live_elems)
+                    else int(elem_pressure)
+                )
+                headroom = max(0, int(pool_capacity_elems) - int(live_elems))
+                candidate_scores.append((live_elems, slot_pressure, int(ordinal), normalized_dpu, headroom))
+            selected = []
+            selected_headroom = 0
+            for _live_elems, _slot_pressure, _ordinal, normalized_dpu, headroom in sorted(candidate_scores):
+                selected.append(int(normalized_dpu))
+                selected_headroom += int(headroom)
+                if len(selected) >= min_target_count and selected_headroom >= int(group_capacity_elems):
+                    break
+            if len(selected) >= len(allowed_dpus):
+                return list(allowed_dpus)
+            allowed_order = {int(physical_dpu) % max(self.num_dpus, 1): idx for idx, physical_dpu in enumerate(allowed_dpus)}
+            selected = sorted(selected, key=lambda physical_dpu: allowed_order.get(int(physical_dpu), int(physical_dpu)))
+            return selected
+
+        def _balanced_segments() -> List[Dict[str, int]]:
+            target_dpus = _target_segment_dpus()
+            if not target_dpus:
                 return []
             cursor = 0
             remaining_tokens = int(seq_len)
-            remaining_dpus = len(allowed_dpus)
+            remaining_dpus = len(target_dpus)
             segments = []
-            for physical_dpu in allowed_dpus:
+            for physical_dpu in target_dpus:
                 if remaining_tokens <= 0:
                     break
                 chunk = int(math.ceil(float(remaining_tokens) / float(max(1, remaining_dpus))))
@@ -1170,8 +1266,10 @@ class PimNaiveAttentionBackend:
                 sharding_plan,
                 request_id=request_id,
                 seq_len=seq_len,
+                capacity=capacity,
                 head_start=head_start,
                 head_end=head_end,
+                head_dim=head_dim,
                 allowed_dpus=allowed_dpus,
             )
             use_segment_plan, segment_decision = self._planner_segment_materialization_decision(segment_plan)
@@ -1309,6 +1407,14 @@ class PimNaiveAttentionBackend:
         if planner_mode == "single_dpu_multi_head_group":
             stripe_width = max(stripe_width, planner_group_count)
         stripe_width = min(self.num_dpus, max(1, stripe_width))
+
+        if getattr(self, "pim_cross_rank_stripe_experimental_enabled", False):
+            self.init_rank_hash_fallback_count += 1
+            self.init_rank_last_reason = "cross_rank_stripe_experimental"
+            return self._rank_spread_stripe_for_request(
+                request_id,
+                stripe_width,
+            )
 
         target_rank_index, target_reason = self._choose_active_rank_for_request(
             request_id,
@@ -1471,6 +1577,74 @@ class PimNaiveAttentionBackend:
         base_dpu = request_hash % self.num_dpus
         return [(base_dpu + offset) % self.num_dpus for offset in range(stripe_width)]
 
+    def _rank_spread_stripe_for_request(
+        self,
+        request_id: str,
+        stripe_width: int,
+        *,
+        preferred_anchor_dpu: int | None = None,
+        required_dpus: List[int] | None = None,
+    ) -> List[int]:
+        stripe_width = min(self.num_dpus, max(1, int(stripe_width)))
+        request_hash = self._request_hash(request_id)
+        rank_groups = self._rank_groups_with_indices()
+        if not rank_groups:
+            base_dpu = request_hash % self.num_dpus
+            return [(base_dpu + offset) % self.num_dpus for offset in range(stripe_width)]
+
+        if required_dpus:
+            required = []
+            seen_required = set()
+            for physical_dpu in required_dpus:
+                normalized = int(physical_dpu) % self.num_dpus
+                if normalized in seen_required:
+                    continue
+                seen_required.add(normalized)
+                required.append(normalized)
+            if len(required) >= stripe_width:
+                return required[:stripe_width]
+        else:
+            required = []
+            seen_required = set()
+
+        rank_count = len(rank_groups)
+        start_rank = request_hash % max(1, rank_count)
+        max_rank_width = max((len(group) for _, group in rank_groups), default=0)
+        if preferred_anchor_dpu is not None:
+            anchor = int(preferred_anchor_dpu) % self.num_dpus
+            for rank_idx, (_, group) in enumerate(rank_groups):
+                if anchor in {int(physical_dpu) for physical_dpu in group}:
+                    start_rank = int(rank_idx)
+                    break
+
+        stripe = list(required)
+        seen = set(seen_required)
+        # Interleave ranks first, then move to the next DPU within each rank.
+        # This matches the helper's rank-spread logical DPU order and prevents
+        # long-context requests from collapsing back to a single physical rank.
+        for offset_in_rank in range(max_rank_width):
+            for rank_offset in range(rank_count):
+                _, group = rank_groups[(start_rank + rank_offset) % rank_count]
+                if offset_in_rank >= len(group):
+                    continue
+                physical_dpu = int(group[offset_in_rank]) % self.num_dpus
+                if physical_dpu in seen:
+                    continue
+                seen.add(physical_dpu)
+                stripe.append(physical_dpu)
+                if len(stripe) >= stripe_width:
+                    return stripe
+
+        base_dpu = request_hash % self.num_dpus
+        for offset in range(self.num_dpus):
+            physical_dpu = (base_dpu + offset) % self.num_dpus
+            if physical_dpu in seen:
+                continue
+            stripe.append(physical_dpu)
+            if len(stripe) >= stripe_width:
+                break
+        return stripe
+
     def _maybe_expand_request_stripe(self, request_state: RequestState) -> None:
         if self.num_dpus <= 0 or not request_state.layer_states:
             return
@@ -1499,13 +1673,21 @@ class PimNaiveAttentionBackend:
         target_width = min(self.num_dpus, max(current_width, target_width))
         if target_width <= current_width:
             return
-        new_stripe = self._rank_local_stripe_for_request(
-            request_state.request_id,
-            target_width,
-            target_rank_index=self._stripe_rank_index(request_state.preferred_dpu_stripe),
-            preferred_anchor_dpu=int(request_state.preferred_dpu_stripe[0]),
-            required_dpus=[int(physical_dpu) for physical_dpu in request_state.preferred_dpu_stripe],
-        )
+        if getattr(self, "pim_cross_rank_stripe_experimental_enabled", False):
+            new_stripe = self._rank_spread_stripe_for_request(
+                request_state.request_id,
+                target_width,
+                preferred_anchor_dpu=int(request_state.preferred_dpu_stripe[0]),
+                required_dpus=[int(physical_dpu) for physical_dpu in request_state.preferred_dpu_stripe],
+            )
+        else:
+            new_stripe = self._rank_local_stripe_for_request(
+                request_state.request_id,
+                target_width,
+                target_rank_index=self._stripe_rank_index(request_state.preferred_dpu_stripe),
+                preferred_anchor_dpu=int(request_state.preferred_dpu_stripe[0]),
+                required_dpus=[int(physical_dpu) for physical_dpu in request_state.preferred_dpu_stripe],
+            )
         if len(new_stripe) <= current_width:
             return
         request_state.preferred_dpu_stripe = list(new_stripe)
@@ -1561,6 +1743,11 @@ class PimNaiveAttentionBackend:
                 )
 
             seq_len, num_heads, head_dim = (int(dim) for dim in layer_key.shape)
+            layer_preferred_dpu_stripe = self._preferred_dpu_stripe_for_layer(
+                request_id,
+                layer_idx,
+                preferred_dpu_stripe,
+            )
             layer_states.append(
                 LayerState(
                     layer_idx=layer_idx,
@@ -1572,7 +1759,7 @@ class PimNaiveAttentionBackend:
                         layer_key,
                         layer["value"].detach().cpu().contiguous(),
                         decode_reserve_tokens,
-                        preferred_dpu_stripe=preferred_dpu_stripe,
+                        preferred_dpu_stripe=layer_preferred_dpu_stripe,
                         sharding_plan=sharding_plan,
                     ),
                 )
@@ -2475,6 +2662,14 @@ class PimNaiveAttentionBackend:
             "qk_mixed_heads": self.qk_mixed_heads,
             "qk_mixed_window": self.qk_mixed_window,
             "host_partial_reduce_enabled": self.host_partial_reduce_enabled,
+            "pim_cross_rank_stripe_experimental_enabled": bool(
+                getattr(self, "pim_cross_rank_stripe_experimental_enabled", False)
+            ),
+            "layer_rank_rotation_enabled": self._layer_rank_rotation_enabled(),
+            "pim_layer_rank_rotation_experimental_enabled": bool(
+                getattr(self, "pim_layer_rank_rotation_experimental_enabled", False)
+            ),
+            "layer_rank_rotation_count": int(self.layer_rank_rotation_count),
             "compact_short_segments_enabled": self.compact_short_segments_enabled,
             "compact_short_segment_min_tokens": self.compact_short_segment_min_tokens,
             "planner_segment_plan_count": self.planner_segment_plan_count,

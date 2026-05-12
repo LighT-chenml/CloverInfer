@@ -6,6 +6,7 @@ import importlib.util
 import math
 import os
 import numpy as np
+import shlex
 import struct
 import subprocess
 import sys
@@ -81,6 +82,7 @@ def _resolve_kvslot_helper_paths(repo_root: str) -> tuple[str, str]:
     helper_override = os.environ.get("CLOVER_KVSLOT_HELPER")
     kvslot_dir_override = os.environ.get("CLOVER_KVSLOT_DIR")
     searched_paths: List[str] = []
+    build_failures: List[str] = []
 
     if helper_override:
         helper_path = os.path.abspath(helper_override)
@@ -97,12 +99,52 @@ def _resolve_kvslot_helper_paths(repo_root: str) -> tuple[str, str]:
         if os.path.exists(helper_path):
             return kvslot_dir, helper_path
 
+        if os.environ.get("CLOVER_KVSLOT_AUTOBUILD", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }:
+            makefile_path = os.path.join(kvslot_dir, "Makefile")
+            if not os.path.exists(makefile_path):
+                continue
+            upmem_env_script = os.environ.get("CLOVER_UPMEM_ENV", "/usr/upmem_env.sh")
+            build_cmd = "make all"
+            if os.path.exists(upmem_env_script):
+                build_cmd = f". {shlex.quote(upmem_env_script)} >/dev/null 2>&1 && {build_cmd}"
+            completed = subprocess.run(
+                build_cmd,
+                cwd=kvslot_dir,
+                shell=True,
+                executable="/bin/bash",
+                env=os.environ.copy(),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=float(os.environ.get("CLOVER_KVSLOT_AUTOBUILD_TIMEOUT_S", "120")),
+            )
+            if completed.returncode == 0 and os.path.exists(helper_path):
+                return kvslot_dir, helper_path
+            build_output = "\n".join(
+                part.strip()
+                for part in (completed.stdout, completed.stderr)
+                if part and part.strip()
+            )
+            build_failures.append(
+                f"{kvslot_dir}: exit={completed.returncode}"
+                + (f"\n{build_output[-2000:]}" if build_output else "")
+            )
+
     searched_desc = ", ".join(searched_paths)
+    build_desc = ""
+    if build_failures:
+        build_desc = " Auto-build attempts failed:\n" + "\n".join(build_failures[-3:])
     raise FileNotFoundError(
         "UPMEM kvslot helper binary is missing. "
         f"Searched: {searched_desc}. "
         "Build it with `make -C <repo>/src/pim/upmem_kvslot all` "
         "after installing the UPMEM toolchain, or set CLOVER_KVSLOT_HELPER."
+        f"{build_desc}"
     )
 
 
@@ -236,6 +278,10 @@ class _KVSlotHelperClient:
     MAX_SLOTS_PER_DPU = 64
     MAX_BATCH_ITEMS = 32
     MAX_GROUP_SEGMENTS = 8
+    MAX_DPU_CAPACITY = max(1, int(os.environ.get("CLOVER_KVSLOT_MAX_CAPACITY", "256")))
+    MAX_HEADS = max(1, int(os.environ.get("CLOVER_KVSLOT_MAX_HEADS", "32")))
+    SLOT_ARGS_STRUCT = struct.Struct("<IIIIIffI")
+    SLOT_ARGS_SIZE = SLOT_ARGS_STRUCT.size
 
     def __init__(self, binary_path: str, num_dpus: int, cwd: str, kv_dtype: str = "fp32"):
         self.binary_path = binary_path
@@ -305,10 +351,50 @@ class _KVSlotHelperClient:
                 pass
 
     def _dtype_code(self) -> int:
+        if self.kv_dtype == "int8":
+            return 2
         return 1 if self.kv_dtype == "fp16" else 0
 
     def _elem_bytes(self) -> int:
+        if self.kv_dtype == "int8":
+            return 1
         return 2 if self.kv_dtype == "fp16" else 4
+
+    def _slot_arg_scales(
+        self,
+        initial_k: torch.Tensor,
+        initial_v: torch.Tensor,
+        *,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
+    ) -> tuple[float, float]:
+        resolved_k_scale = float(k_scale if k_scale is not None else getattr(initial_k, "_clover_quant_scale", 1.0))
+        resolved_v_scale = float(v_scale if v_scale is not None else getattr(initial_v, "_clover_quant_scale", 1.0))
+        return resolved_k_scale, resolved_v_scale
+
+    def _slot_args_pack(
+        self,
+        capacity: int,
+        seq_len: int,
+        group_heads: int,
+        head_dim: int,
+        *,
+        k_scale: float = 1.0,
+        v_scale: float = 1.0,
+    ) -> bytes:
+        return self.SLOT_ARGS_STRUCT.pack(
+            int(capacity),
+            int(seq_len),
+            int(group_heads),
+            int(head_dim),
+            int(self._dtype_code()),
+            float(k_scale),
+            float(v_scale),
+            0,
+        )
+
+    def _read_slot_args(self) -> tuple[int, int, int, int, int, float, float, int]:
+        return self.SLOT_ARGS_STRUCT.unpack(self._read_exact(self.SLOT_ARGS_SIZE))
 
     def _write(self, payload: bytes) -> None:
         proc = self._ensure_proc()
@@ -337,49 +423,82 @@ class _KVSlotHelperClient:
             raise RuntimeError(f"kvslot helper returned incomplete output: {stderr_text.strip()}")
         return data
 
-    def allocate_group(self, slot_id: int, capacity: int, initial_k: torch.Tensor, initial_v: torch.Tensor) -> Dict[str, int]:
+    def allocate_group(
+        self,
+        slot_id: int,
+        capacity: int,
+        initial_k: torch.Tensor,
+        initial_v: torch.Tensor,
+        *,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
+    ) -> Dict[str, int]:
         seq_len, group_heads, head_dim = (int(dim) for dim in initial_k.shape)
         header = struct.pack("<IIII", self.MAGIC, self.CMD_ALLOCATE, slot_id, 0)
-        args = struct.pack("<IIIII", int(capacity), seq_len, group_heads, head_dim, self._dtype_code())
+        k_scale, v_scale = self._slot_arg_scales(initial_k, initial_v, k_scale=k_scale, v_scale=v_scale)
+        args = self._slot_args_pack(
+            int(capacity),
+            seq_len,
+            group_heads,
+            head_dim,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
         payload = header + args + initial_k.numpy().tobytes(order="C") + initial_v.numpy().tobytes(order="C")
         self._write(payload)
-        out = struct.unpack("<IIIII", self._read_exact(20))
+        out = self._read_slot_args()
         return {
             "capacity": int(out[0]),
             "seq_len": int(out[1]),
             "group_heads": int(out[2]),
             "head_dim": int(out[3]),
+            "k_scale": float(out[5]),
+            "v_scale": float(out[6]),
         }
 
-    def append_group(self, slot_id: int, k_new: torch.Tensor, v_new: torch.Tensor) -> Dict[str, int]:
+    def append_group(
+        self,
+        slot_id: int,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+        *,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
+    ) -> Dict[str, int]:
         append_len, group_heads, head_dim = (int(dim) for dim in k_new.shape)
         header = struct.pack("<IIII", self.MAGIC, self.CMD_APPEND, slot_id, 0)
-        args = struct.pack("<IIIII", 0, append_len, group_heads, head_dim, self._dtype_code())
+        k_scale, v_scale = self._slot_arg_scales(k_new, v_new, k_scale=k_scale, v_scale=v_scale)
+        args = self._slot_args_pack(0, append_len, group_heads, head_dim, k_scale=k_scale, v_scale=v_scale)
         payload = header + args + k_new.numpy().tobytes(order="C") + v_new.numpy().tobytes(order="C")
         self._write(payload)
-        out = struct.unpack("<IIIII", self._read_exact(20))
+        out = self._read_slot_args()
         return {
             "capacity": int(out[0]),
             "seq_len": int(out[1]),
             "group_heads": int(out[2]),
             "head_dim": int(out[3]),
+            "k_scale": float(out[5]),
+            "v_scale": float(out[6]),
         }
 
     def materialize_group(self, slot_id: int) -> tuple[torch.Tensor, torch.Tensor, Dict[str, int]]:
         header = struct.pack("<IIII", self.MAGIC, self.CMD_READBACK, slot_id, 0)
         self._write(header)
-        out = struct.unpack("<IIIII", self._read_exact(20))
+        out = self._read_slot_args()
         capacity, seq_len, group_heads, head_dim = (int(item) for item in out[:4])
         elems = seq_len * group_heads * head_dim
         elem_bytes = self._elem_bytes()
         if elems == 0:
-            dtype = torch.int16 if elem_bytes == 2 else torch.int32
+            dtype = torch.int8 if elem_bytes == 1 else (torch.int16 if elem_bytes == 2 else torch.int32)
             k = torch.empty((0, group_heads, head_dim), dtype=dtype)
             v = torch.empty((0, group_heads, head_dim), dtype=dtype)
         else:
             k_bytes = self._read_exact(elems * elem_bytes)
             v_bytes = self._read_exact(elems * elem_bytes)
-            if elem_bytes == 2:
+            if elem_bytes == 1:
+                k = torch.from_numpy(np.frombuffer(k_bytes, dtype=np.int8).copy()).view(seq_len, group_heads, head_dim)
+                v = torch.from_numpy(np.frombuffer(v_bytes, dtype=np.int8).copy()).view(seq_len, group_heads, head_dim)
+            elif elem_bytes == 2:
                 k = torch.tensor(struct.unpack(f"<{elems}h", k_bytes), dtype=torch.int16).view(seq_len, group_heads, head_dim)
                 v = torch.tensor(struct.unpack(f"<{elems}h", v_bytes), dtype=torch.int16).view(seq_len, group_heads, head_dim)
             else:
@@ -390,12 +509,14 @@ class _KVSlotHelperClient:
             "seq_len": seq_len,
             "group_heads": group_heads,
             "head_dim": head_dim,
+            "k_scale": float(out[5]),
+            "v_scale": float(out[6]),
         }
 
     def free_group(self, slot_id: int) -> None:
         header = struct.pack("<IIII", self.MAGIC, self.CMD_FREE, slot_id, 0)
         self._write(header)
-        self._read_exact(20)
+        self._read_exact(self.SLOT_ARGS_SIZE)
 
     def get_allocator_stats(self) -> list[Dict[str, int]]:
         header = struct.pack("<IIII", self.MAGIC, self.CMD_GET_STATS, 0, 0)
@@ -687,8 +808,8 @@ class _KVSlotHelperClient:
             ]
         )
 
-        out = struct.unpack("<IIIII", self._read_exact(20))
-        _, seq_len, group_heads, head_dim, _ = (int(item) for item in out)
+        out = self._read_slot_args()
+        _, seq_len, group_heads, head_dim, _ = (int(item) for item in out[:5])
         if int(w.shape[0]) != group_heads or int(w.shape[1]) != seq_len:
             raise RuntimeError(
                 "kvslot helper returned invalid av header: "
@@ -732,8 +853,8 @@ class _KVSlotHelperClient:
 
         contexts: list[torch.Tensor] = []
         for idx, (_, expected_heads, expected_seq_len) in enumerate(expected_meta):
-            out = struct.unpack("<IIIII", self._read_exact(20))
-            _, seq_len, group_heads, head_dim, _ = (int(item) for item in out)
+            out = self._read_slot_args()
+            _, seq_len, group_heads, head_dim, _ = (int(item) for item in out[:5])
             if group_heads != expected_heads or seq_len != expected_seq_len:
                 raise RuntimeError(
                     "kvslot helper returned invalid av batch item header: "
@@ -785,8 +906,8 @@ class _KVSlotHelperClient:
 
         contexts: list[torch.Tensor] = []
         for idx, (_, expected_heads, expected_seq_len) in enumerate(expected_meta):
-            out = struct.unpack("<IIIII", self._read_exact(20))
-            _, seq_len, group_heads, head_dim, _ = (int(item) for item in out)
+            out = self._read_slot_args()
+            _, seq_len, group_heads, head_dim, _ = (int(item) for item in out[:5])
             if group_heads != expected_heads or seq_len != expected_seq_len:
                 raise RuntimeError(
                     "kvslot helper returned invalid softmax-av batch item header: "
@@ -803,16 +924,42 @@ class _KVSlotHelperClient:
     ) -> list[torch.Tensor]:
         if not grouped_slot_weights:
             return []
-        if any(len(group) > self.MAX_GROUP_SEGMENTS for group in grouped_slot_weights):
-            split_groups: list[list[tuple[int, int, torch.Tensor]]] = []
-            split_owners: list[int] = []
-            for owner_idx, group in enumerate(grouped_slot_weights):
-                if not group:
-                    raise ValueError(f"invalid grouped slot weight count: {len(group)}")
-                for offset in range(0, len(group), self.MAX_GROUP_SEGMENTS):
-                    split_groups.append(group[offset : offset + self.MAX_GROUP_SEGMENTS])
+        max_group_segments = int(getattr(self, "MAX_GROUP_SEGMENTS", _KVSlotHelperClient.MAX_GROUP_SEGMENTS))
+        max_dpu_capacity = int(getattr(self, "MAX_DPU_CAPACITY", _KVSlotHelperClient.MAX_DPU_CAPACITY))
+        split_groups: list[list[tuple[int, int, torch.Tensor]]] = []
+        split_owners: list[int] = []
+        split_required = False
+        for owner_idx, group in enumerate(grouped_slot_weights):
+            if not group:
+                raise ValueError(f"invalid grouped slot weight count: {len(group)}")
+            current_group: list[tuple[int, int, torch.Tensor]] = []
+            current_tokens = 0
+            for item in group:
+                segment_len = int(item[1])
+                if segment_len <= 0:
+                    raise ValueError(f"invalid grouped AV segment length: {segment_len}")
+                if segment_len > max_dpu_capacity:
+                    raise ValueError(
+                        "grouped AV segment length exceeds DPU capacity: "
+                        f"segment_len={segment_len} max_capacity={max_dpu_capacity}"
+                    )
+                would_exceed_segments = len(current_group) >= max_group_segments
+                would_exceed_capacity = current_tokens + segment_len > max_dpu_capacity
+                if current_group and (would_exceed_segments or would_exceed_capacity):
+                    split_groups.append(current_group)
                     split_owners.append(int(owner_idx))
+                    current_group = []
+                    current_tokens = 0
+                    split_required = True
+                current_group.append(item)
+                current_tokens += segment_len
+            if current_group:
+                split_groups.append(current_group)
+                split_owners.append(int(owner_idx))
+            if len(split_groups) > owner_idx + 1:
+                split_required = True
 
+        if split_required:
             split_outputs = self.weighted_value_sum_grouped_batch(split_groups)
             merged_outputs: list[torch.Tensor | None] = [None for _ in grouped_slot_weights]
             for owner_idx, context in zip(split_owners, split_outputs):
@@ -885,8 +1032,8 @@ class _KVSlotHelperClient:
 
         contexts: list[torch.Tensor] = []
         for idx, (expected_heads, expected_seq_len) in enumerate(expected_meta):
-            out = struct.unpack("<IIIII", self._read_exact(20))
-            _, seq_len, group_heads, head_dim, _ = (int(item) for item in out)
+            out = self._read_slot_args()
+            _, seq_len, group_heads, head_dim, _ = (int(item) for item in out[:5])
             if group_heads != expected_heads or seq_len != expected_seq_len:
                 raise RuntimeError(
                     "kvslot helper returned invalid grouped av batch item header: "
@@ -951,8 +1098,8 @@ class _KVSlotHelperClient:
 
         contexts: list[torch.Tensor] = []
         for idx, (expected_heads, expected_head_dim) in enumerate(expected_meta):
-            out = struct.unpack("<IIIII", self._read_exact(20))
-            _, _, group_heads, head_dim, _ = (int(item) for item in out)
+            out = self._read_slot_args()
+            _, _, group_heads, head_dim, _ = (int(item) for item in out[:5])
             if group_heads != expected_heads or head_dim != expected_head_dim:
                 raise RuntimeError(
                     "kvslot helper returned invalid qk-softmax-av batch item header: "
@@ -1017,8 +1164,8 @@ class _KVSlotHelperClient:
 
         outputs: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         for idx, (expected_heads, expected_head_dim) in enumerate(expected_meta):
-            out = struct.unpack("<IIIII", self._read_exact(20))
-            _, _, group_heads, head_dim, _ = (int(item) for item in out)
+            out = self._read_slot_args()
+            _, _, group_heads, head_dim, _ = (int(item) for item in out[:5])
             if group_heads != expected_heads or head_dim != expected_head_dim:
                 raise RuntimeError(
                     "kvslot helper returned invalid qk-softmax-av-partial batch item header: "
@@ -1444,7 +1591,8 @@ class HostResidentKVStore(ResidentKVStore):
 
 class UpmemKVSlotStore(ResidentKVStore):
     backend_name = "upmem_kvslot_store"
-    POOL_CAPACITY_ELEMS = 256 * 32 * 128
+    DEFAULT_POOL_CAPACITY_ELEMS = 256 * 32 * 128
+    POOL_CAPACITY_ELEMS = DEFAULT_POOL_CAPACITY_ELEMS
 
     def __init__(
         self,
@@ -1466,7 +1614,7 @@ class UpmemKVSlotStore(ResidentKVStore):
         self.base_block_rollover_tokens = max(32, min(self.block_tokens, 160))
         self.placement_policy = str(placement_policy)
         self.host_partial_reduce_enabled = bool(host_partial_reduce_enabled)
-        if self.kv_dtype not in {"fp32", "fp16"}:
+        if self.kv_dtype not in {"fp32", "fp16", "int8"}:
             raise ValueError(f"Unsupported resident kv dtype: {self.kv_dtype}")
         kvslot_dir, helper_binary_path = _resolve_kvslot_helper_paths(repo_root)
         self.helper = _KVSlotHelperClient(
@@ -1475,6 +1623,9 @@ class UpmemKVSlotStore(ResidentKVStore):
             cwd=kvslot_dir,
             kv_dtype=self.kv_dtype,
         )
+        self.max_dpu_capacity = max(1, int(getattr(self.helper, "MAX_DPU_CAPACITY", 256)))
+        self.max_heads = max(1, int(getattr(self.helper, "MAX_HEADS", 32)))
+        self.POOL_CAPACITY_ELEMS = int(self.max_dpu_capacity) * int(self.max_heads) * 128
         self.host_fallback = HostResidentKVStore()
         self.slot_mapping: Dict[tuple[str, str], Dict[str, object]] = {}
         self._slot_id_map: Dict[tuple[str, str], int] = {}
@@ -1551,6 +1702,7 @@ class UpmemKVSlotStore(ResidentKVStore):
         context_fused_enabled: bool | None = None,
         shape_rounds_enabled: bool | None = None,
         rank_spread_alloc_enabled: bool | None = None,
+        rank_spread_multi_rank_batch_enabled: bool | None = None,
         slot_spill_alloc_enabled: bool | None = None,
         slot_pressure_aware_alloc_enabled: bool | None = None,
         emergency_slot_spill_enabled: bool | None = None,
@@ -1564,6 +1716,11 @@ class UpmemKVSlotStore(ResidentKVStore):
             self.helper.set_env_flag("CLOVER_KVSLOT_SHAPE_ROUNDS", bool(shape_rounds_enabled))
         if rank_spread_alloc_enabled is not None:
             self.helper.set_env_flag("CLOVER_KVSLOT_RANK_SPREAD_ALLOC", bool(rank_spread_alloc_enabled))
+        if rank_spread_multi_rank_batch_enabled is not None:
+            self.helper.set_env_flag(
+                "CLOVER_KVSLOT_ALLOW_RANK_SPREAD_MULTI_RANK_BATCH",
+                bool(rank_spread_multi_rank_batch_enabled),
+            )
         if slot_spill_alloc_enabled is not None:
             self.slot_spill_alloc_enabled = bool(slot_spill_alloc_enabled)
         if slot_pressure_aware_alloc_enabled is not None:
@@ -2259,23 +2416,74 @@ class UpmemKVSlotStore(ResidentKVStore):
         if slot_id >= max_slots:
             return False
         seq_len, group_heads, head_dim = (int(dim) for dim in initial_k.shape)
-        return capacity <= 256 and group_heads <= 32 and head_dim <= 128 and seq_len <= capacity
+        return (
+            capacity <= int(self.max_dpu_capacity)
+            and group_heads <= int(self.max_heads)
+            and head_dim <= 128
+            and seq_len <= capacity
+        )
 
     def _encode_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.kv_dtype == "int8":
+            encoded, _ = self._encode_tensor_int8(tensor)
+            return encoded
         if self.kv_dtype == "fp16":
             return tensor.detach().cpu().to(torch.float16).contiguous().view(torch.int16)
         return tensor.detach().cpu().float().contiguous().view(torch.int32)
 
-    def _decode_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+    def _encode_tensor_int8(
+        self,
+        tensor: torch.Tensor,
+        *,
+        scale: float | None = None,
+    ) -> tuple[torch.Tensor, float]:
+        tensor_fp32 = tensor.detach().cpu().to(torch.float32).contiguous()
+        if scale is None:
+            max_abs = float(torch.max(torch.abs(tensor_fp32)).item()) if tensor_fp32.numel() > 0 else 0.0
+            scale = max(max_abs / 127.0, 1.0e-8)
+        else:
+            scale = max(float(scale), 1.0e-8)
+        encoded = torch.clamp(torch.round(tensor_fp32 / float(scale)), -127, 127).to(torch.int8).contiguous()
+        encoded._clover_quant_scale = float(scale)  # type: ignore[attr-defined]
+        return encoded, float(scale)
+
+    def _encode_kv_pair(
+        self,
+        k_tensor: torch.Tensor,
+        v_tensor: torch.Tensor,
+        *,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, float, float]:
+        if self.kv_dtype == "int8":
+            encoded_k, resolved_k_scale = self._encode_tensor_int8(k_tensor, scale=k_scale)
+            encoded_v, resolved_v_scale = self._encode_tensor_int8(v_tensor, scale=v_scale)
+            return encoded_k, encoded_v, resolved_k_scale, resolved_v_scale
+        encoded_k = self._encode_tensor(k_tensor)
+        encoded_v = self._encode_tensor(v_tensor)
+        return encoded_k, encoded_v, 1.0, 1.0
+
+    def _decode_tensor(
+        self,
+        tensor: torch.Tensor,
+        *,
+        scale: float | None = None,
+    ) -> torch.Tensor:
+        if self.kv_dtype == "int8":
+            return (tensor.to(torch.float32) * float(1.0 if scale is None else scale)).contiguous()
         if self.kv_dtype == "fp16":
             return tensor.view(torch.float16).to(torch.float32).contiguous()
         return tensor.view(torch.float32).contiguous()
 
     def _slot_elem_count(self, capacity: int, group_heads: int, head_dim: int) -> int:
         elem_count = int(capacity) * int(group_heads) * int(head_dim)
+        if self.kv_dtype == "int8":
+            packed_words = max(1, (elem_count + 3) // 4)
+            return (packed_words + 1) & ~1
         if self.kv_dtype == "fp16":
-            return max(1, (elem_count + 1) // 2)
-        return elem_count
+            packed_words = max(1, (elem_count + 1) // 2)
+            return (packed_words + 1) & ~1
+        return (max(1, elem_count) + 1) & ~1
 
     def _build_block_layout(self, capacity: int, seq_len: int) -> list[tuple[int, int]]:
         remaining_capacity = int(capacity)
@@ -2545,11 +2753,14 @@ class UpmemKVSlotStore(ResidentKVStore):
                     f"shape={tuple(block_k.shape)} capacity={block_capacity} slot_id={block_slot_id}"
                 )
 
+            encoded_k, encoded_v, k_scale, v_scale = self._encode_kv_pair(block_k, block_v)
             info = self.helper.allocate_group(
                 block_slot_id,
                 block_capacity,
-                self._encode_tensor(block_k),
-                self._encode_tensor(block_v),
+                encoded_k,
+                encoded_v,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
             helper_allocated = True
             block = {
@@ -2563,6 +2774,8 @@ class UpmemKVSlotStore(ResidentKVStore):
                 "capacity": int(info["capacity"]),
                 "group_heads": int(info["group_heads"]),
                 "head_dim": int(info["head_dim"]),
+                "k_scale": float(info.get("k_scale", k_scale)),
+                "v_scale": float(info.get("v_scale", v_scale)),
             }
             if segment_meta:
                 for key_name, value in dict(segment_meta).items():
@@ -2907,11 +3120,14 @@ class UpmemKVSlotStore(ResidentKVStore):
                 self.dpu_capacity_fallbacks += 1
             else:
                 try:
+                    encoded_k, encoded_v, k_scale, v_scale = self._encode_kv_pair(initial_k, initial_v)
                     info = self.helper.allocate_group(
                         slot_id,
                         capacity,
-                        self._encode_tensor(initial_k),
-                        self._encode_tensor(initial_v),
+                        encoded_k,
+                        encoded_v,
+                        k_scale=k_scale,
+                        v_scale=v_scale,
                     )
                 except Exception:
                     self.dpu_allocate_failures += 1
@@ -2939,6 +3155,8 @@ class UpmemKVSlotStore(ResidentKVStore):
                         "capacity": int(info["capacity"]),
                         "group_heads": int(info["group_heads"]),
                         "head_dim": int(info["head_dim"]),
+                        "k_scale": float(info.get("k_scale", k_scale)),
+                        "v_scale": float(info.get("v_scale", v_scale)),
                     }
                     self.dpu_allocations += 1
                     self.dpu_live_slots += 1
@@ -3036,13 +3254,25 @@ class UpmemKVSlotStore(ResidentKVStore):
                     append_offset += take_len
 
                 if tail_take_len > 0 and tail_block is not None:
+                    tail_k_scale = float(tail_block.get("k_scale", 1.0)) if self.kv_dtype == "int8" else None
+                    tail_v_scale = float(tail_block.get("v_scale", 1.0)) if self.kv_dtype == "int8" else None
+                    encoded_k, encoded_v, k_scale, v_scale = self._encode_kv_pair(
+                        k_new[:tail_take_len].contiguous(),
+                        v_new[:tail_take_len].contiguous(),
+                        k_scale=tail_k_scale,
+                        v_scale=tail_v_scale,
+                    )
                     result = self.helper.append_group(
                         int(tail_block["slot_id"]),
-                        self._encode_tensor(k_new[:tail_take_len].contiguous()),
-                        self._encode_tensor(v_new[:tail_take_len].contiguous()),
+                        encoded_k,
+                        encoded_v,
+                        k_scale=k_scale,
+                        v_scale=v_scale,
                     )
                     tail_block["seq_len"] = int(result["seq_len"])
                     tail_block["capacity"] = int(result["capacity"])
+                    tail_block["k_scale"] = float(result.get("k_scale", tail_block.get("k_scale", 1.0)))
+                    tail_block["v_scale"] = float(result.get("v_scale", tail_block.get("v_scale", 1.0)))
                     tail_start = int(tail_block.get("token_range_start", append_base_seq_len - int(tail_block["seq_len"]) + tail_take_len))
                     tail_block["token_range_start"] = int(tail_start)
                     tail_block["token_range_end"] = int(tail_start + int(tail_block["seq_len"]))
@@ -3065,13 +3295,25 @@ class UpmemKVSlotStore(ResidentKVStore):
             self._record_timing("append_group", started_at)
             return out
         if slot_info["backend"] == "dpu":
+            slot_k_scale = float(slot_info.get("k_scale", 1.0)) if self.kv_dtype == "int8" else None
+            slot_v_scale = float(slot_info.get("v_scale", 1.0)) if self.kv_dtype == "int8" else None
+            encoded_k, encoded_v, k_scale, v_scale = self._encode_kv_pair(
+                k_new,
+                v_new,
+                k_scale=slot_k_scale,
+                v_scale=slot_v_scale,
+            )
             result = self.helper.append_group(
                 int(slot_info["slot_id"]),
-                self._encode_tensor(k_new),
-                self._encode_tensor(v_new),
+                encoded_k,
+                encoded_v,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
             slot_info["seq_len"] = int(result["seq_len"])
             slot_info["capacity"] = int(result["capacity"])
+            slot_info["k_scale"] = float(result.get("k_scale", slot_info.get("k_scale", 1.0)))
+            slot_info["v_scale"] = float(result.get("v_scale", slot_info.get("v_scale", 1.0)))
             out = {
                 "seq_len": int(result["seq_len"]),
                 "capacity": int(result["capacity"]),
@@ -3094,7 +3336,12 @@ class UpmemKVSlotStore(ResidentKVStore):
                 k, v, info = self.helper.materialize_group(int(block["slot_id"]))
                 block["seq_len"] = int(info["seq_len"])
                 block["capacity"] = int(info["capacity"])
-                materialized_blocks.append((self._decode_tensor(k), self._decode_tensor(v)))
+                materialized_blocks.append(
+                    (
+                        self._decode_tensor(k, scale=float(info.get("k_scale", 1.0))),
+                        self._decode_tensor(v, scale=float(info.get("v_scale", 1.0))),
+                    )
+                )
             out = (
                 torch.cat([item[0] for item in materialized_blocks], dim=0).contiguous(),
                 torch.cat([item[1] for item in materialized_blocks], dim=0).contiguous(),
@@ -3105,7 +3352,10 @@ class UpmemKVSlotStore(ResidentKVStore):
             k, v, info = self.helper.materialize_group(int(slot_info["slot_id"]))
             slot_info["seq_len"] = int(info["seq_len"])
             slot_info["capacity"] = int(info["capacity"])
-            out = self._decode_tensor(k), self._decode_tensor(v)
+            out = (
+                self._decode_tensor(k, scale=float(info.get("k_scale", 1.0))),
+                self._decode_tensor(v, scale=float(info.get("v_scale", 1.0))),
+            )
             self._record_timing("materialize_group", started_at)
             return out
         out = self.host_fallback.materialize_group(k_slot, v_slot)
@@ -3310,7 +3560,7 @@ class UpmemKVSlotStore(ResidentKVStore):
             except Exception:
                 helper_topology = {}
                 self._helper_topology_cache = {}
-        pool_capacity_elems = 256 * 32 * 128
+        pool_capacity_elems = int(self.POOL_CAPACITY_ELEMS)
         for stats in allocator_stats:
             tail_free = max(pool_capacity_elems - int(stats["next_free_elem"]), 0)
             total_free = int(stats["free_elems_total"]) + tail_free

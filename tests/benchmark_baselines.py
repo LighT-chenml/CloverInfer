@@ -50,11 +50,24 @@ def build_runtime_env() -> Dict[str, object]:
     if RAY_EXCLUDES:
         runtime_env["excludes"] = [item.strip() for item in RAY_EXCLUDES.split(os.pathsep) if item.strip()]
 
+    env_vars: Dict[str, str] = {}
     pythonpath = RAY_PYTHONPATH_OVERRIDE
     if pythonpath is None and not runtime_env:
         pythonpath = REPO_ROOT
     if pythonpath:
-        runtime_env["env_vars"] = {"PYTHONPATH": pythonpath}
+        env_vars["PYTHONPATH"] = pythonpath
+
+    for env_name in (
+        "CLOVER_KVSLOT_MAX_CAPACITY",
+        "CLOVER_KVSLOT_MAX_HEADS",
+        "CLOVER_KVSLOT_AUTOBUILD",
+        "CLOVER_KVSLOT_AUTOBUILD_TIMEOUT_S",
+    ):
+        env_value = os.environ.get(env_name)
+        if env_value is not None:
+            env_vars[env_name] = env_value
+    if env_vars:
+        runtime_env["env_vars"] = env_vars
 
     return runtime_env
 
@@ -451,6 +464,17 @@ def make_cluster_config(args, attention_backend: str) -> ClusterConfig:
         clover_pim_rank_spread_alloc_experimental_enabled=(
             args.clover_pim_rank_spread_alloc_experimental_enabled if attention_backend == "cloverinfer" else False
         ),
+        clover_pim_cross_rank_stripe_experimental_enabled=(
+            args.clover_pim_cross_rank_stripe_experimental_enabled if attention_backend == "cloverinfer" else False
+        ),
+        clover_pim_rank_spread_multi_rank_batch_experimental_enabled=(
+            args.clover_pim_rank_spread_multi_rank_batch_experimental_enabled
+            if attention_backend == "cloverinfer"
+            else False
+        ),
+        clover_pim_layer_rank_rotation_experimental_enabled=(
+            args.clover_pim_layer_rank_rotation_experimental_enabled if attention_backend == "cloverinfer" else False
+        ),
         clover_pim_slot_spill_alloc_experimental_enabled=(
             args.clover_pim_slot_spill_alloc_experimental_enabled if attention_backend == "cloverinfer" else False
         ),
@@ -474,6 +498,16 @@ def make_cluster_config(args, attention_backend: str) -> ClusterConfig:
             if attention_backend == "cloverinfer"
             else 0
         ),
+        clover_pim_perf_guard_enabled=(
+            args.clover_pim_perf_guard_enabled if attention_backend == "cloverinfer" else False
+        ),
+        clover_pim_perf_guard_force_cpu_for_compressed_kv=(
+            args.clover_pim_perf_guard_force_cpu_for_compressed_kv
+            if attention_backend == "cloverinfer"
+            else True
+        ),
+        clover_pim_perf_guard_min_decode_items=args.clover_pim_perf_guard_min_decode_items,
+        clover_pim_perf_guard_slowdown_threshold=args.clover_pim_perf_guard_slowdown_threshold,
         clover_compact_short_segments_enabled=(
             args.clover_compact_short_segments_enabled if attention_backend == "cloverinfer" else False
         ),
@@ -713,7 +747,7 @@ def main():
         default="auto",
         choices=["auto", "identity", "rotated", "rank_spread", "load_aware"],
     )
-    parser.add_argument("--pim-resident-kv-dtype", default="fp32", choices=["fp32", "fp16"])
+    parser.add_argument("--pim-resident-kv-dtype", default="fp32", choices=["fp32", "fp16", "int8"])
     parser.add_argument("--pim-qk-full-enabled", action="store_true")
     parser.add_argument("--no-pim-qk-full-enabled", action="store_true")
     parser.add_argument("--pim-qk-full-shadow-check", action="store_true")
@@ -741,6 +775,12 @@ def main():
     parser.add_argument("--no-clover-pim-context-fused-experimental-enabled", action="store_true")
     parser.add_argument("--clover-pim-rank-spread-alloc-experimental-enabled", action="store_true")
     parser.add_argument("--no-clover-pim-rank-spread-alloc-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-pim-cross-rank-stripe-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-cross-rank-stripe-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-pim-rank-spread-multi-rank-batch-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-rank-spread-multi-rank-batch-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-pim-layer-rank-rotation-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-layer-rank-rotation-experimental-enabled", action="store_true")
     parser.add_argument("--clover-pim-slot-spill-alloc-experimental-enabled", action="store_true")
     parser.add_argument("--no-clover-pim-slot-spill-alloc-experimental-enabled", action="store_true")
     parser.add_argument("--clover-pim-slot-pressure-aware-alloc-experimental-enabled", action="store_true")
@@ -750,6 +790,12 @@ def main():
     parser.add_argument("--clover-pim-reserve-segment-tail-capacity-experimental-enabled", action="store_true")
     parser.add_argument("--no-clover-pim-reserve-segment-tail-capacity-experimental-enabled", action="store_true")
     parser.add_argument("--clover-pim-reserve-segment-tail-capacity-tokens", type=int, default=0)
+    parser.add_argument("--clover-pim-perf-guard-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-perf-guard-enabled", action="store_true")
+    parser.add_argument("--clover-pim-perf-guard-force-cpu-for-compressed-kv", action="store_true")
+    parser.add_argument("--no-clover-pim-perf-guard-force-cpu-for-compressed-kv", action="store_true")
+    parser.add_argument("--clover-pim-perf-guard-min-decode-items", type=int, default=1)
+    parser.add_argument("--clover-pim-perf-guard-slowdown-threshold", type=float, default=1.2)
     parser.add_argument("--clover-compact-short-segments-enabled", action="store_true")
     parser.add_argument("--no-clover-compact-short-segments-enabled", action="store_true")
     parser.add_argument("--clover-compact-short-segment-min-tokens", type=int, default=8)
@@ -836,6 +882,30 @@ def main():
             "--no-clover-pim-rank-spread-alloc-experimental-enabled"
         )
     if (
+        args.clover_pim_cross_rank_stripe_experimental_enabled
+        and args.no_clover_pim_cross_rank_stripe_experimental_enabled
+    ):
+        raise ValueError(
+            "cannot set both --clover-pim-cross-rank-stripe-experimental-enabled and "
+            "--no-clover-pim-cross-rank-stripe-experimental-enabled"
+        )
+    if (
+        args.clover_pim_rank_spread_multi_rank_batch_experimental_enabled
+        and args.no_clover_pim_rank_spread_multi_rank_batch_experimental_enabled
+    ):
+        raise ValueError(
+            "cannot set both --clover-pim-rank-spread-multi-rank-batch-experimental-enabled and "
+            "--no-clover-pim-rank-spread-multi-rank-batch-experimental-enabled"
+        )
+    if (
+        args.clover_pim_layer_rank_rotation_experimental_enabled
+        and args.no_clover_pim_layer_rank_rotation_experimental_enabled
+    ):
+        raise ValueError(
+            "cannot set both --clover-pim-layer-rank-rotation-experimental-enabled and "
+            "--no-clover-pim-layer-rank-rotation-experimental-enabled"
+        )
+    if (
         args.clover_pim_slot_spill_alloc_experimental_enabled
         and args.no_clover_pim_slot_spill_alloc_experimental_enabled
     ):
@@ -866,6 +936,19 @@ def main():
         raise ValueError(
             "cannot set both --clover-pim-reserve-segment-tail-capacity-experimental-enabled and "
             "--no-clover-pim-reserve-segment-tail-capacity-experimental-enabled"
+        )
+    if args.clover_pim_perf_guard_enabled and args.no_clover_pim_perf_guard_enabled:
+        raise ValueError(
+            "cannot set both --clover-pim-perf-guard-enabled and "
+            "--no-clover-pim-perf-guard-enabled"
+        )
+    if (
+        args.clover_pim_perf_guard_force_cpu_for_compressed_kv
+        and args.no_clover_pim_perf_guard_force_cpu_for_compressed_kv
+    ):
+        raise ValueError(
+            "cannot set both --clover-pim-perf-guard-force-cpu-for-compressed-kv and "
+            "--no-clover-pim-perf-guard-force-cpu-for-compressed-kv"
         )
     if args.clover_compact_short_segments_enabled and args.no_clover_compact_short_segments_enabled:
         raise ValueError(
@@ -952,6 +1035,21 @@ def main():
     )
     if args.no_clover_pim_rank_spread_alloc_experimental_enabled:
         args.clover_pim_rank_spread_alloc_experimental_enabled = False
+    args.clover_pim_cross_rank_stripe_experimental_enabled = bool(
+        args.clover_pim_cross_rank_stripe_experimental_enabled
+    )
+    if args.no_clover_pim_cross_rank_stripe_experimental_enabled:
+        args.clover_pim_cross_rank_stripe_experimental_enabled = False
+    args.clover_pim_rank_spread_multi_rank_batch_experimental_enabled = bool(
+        args.clover_pim_rank_spread_multi_rank_batch_experimental_enabled
+    )
+    if args.no_clover_pim_rank_spread_multi_rank_batch_experimental_enabled:
+        args.clover_pim_rank_spread_multi_rank_batch_experimental_enabled = False
+    args.clover_pim_layer_rank_rotation_experimental_enabled = bool(
+        args.clover_pim_layer_rank_rotation_experimental_enabled
+    )
+    if args.no_clover_pim_layer_rank_rotation_experimental_enabled:
+        args.clover_pim_layer_rank_rotation_experimental_enabled = False
     args.clover_pim_slot_spill_alloc_experimental_enabled = bool(
         args.clover_pim_slot_spill_alloc_experimental_enabled
     )
@@ -974,6 +1072,18 @@ def main():
         args.clover_pim_reserve_segment_tail_capacity_experimental_enabled = False
     if args.clover_pim_reserve_segment_tail_capacity_tokens < 0:
         raise ValueError("--clover-pim-reserve-segment-tail-capacity-tokens must be non-negative")
+    args.clover_pim_perf_guard_enabled = bool(args.clover_pim_perf_guard_enabled)
+    if args.no_clover_pim_perf_guard_enabled:
+        args.clover_pim_perf_guard_enabled = False
+    args.clover_pim_perf_guard_force_cpu_for_compressed_kv = True
+    if args.no_clover_pim_perf_guard_force_cpu_for_compressed_kv:
+        args.clover_pim_perf_guard_force_cpu_for_compressed_kv = False
+    elif args.clover_pim_perf_guard_force_cpu_for_compressed_kv:
+        args.clover_pim_perf_guard_force_cpu_for_compressed_kv = True
+    if args.clover_pim_perf_guard_min_decode_items <= 0:
+        raise ValueError("--clover-pim-perf-guard-min-decode-items must be positive")
+    if args.clover_pim_perf_guard_slowdown_threshold < 1.0:
+        raise ValueError("--clover-pim-perf-guard-slowdown-threshold must be at least 1.0")
     args.clover_compact_short_segments_enabled = bool(args.clover_compact_short_segments_enabled)
     if args.no_clover_compact_short_segments_enabled:
         args.clover_compact_short_segments_enabled = False
@@ -1060,6 +1170,15 @@ def main():
         "clover_pim_rank_spread_alloc_experimental_enabled": bool(
             args.clover_pim_rank_spread_alloc_experimental_enabled
         ),
+        "clover_pim_cross_rank_stripe_experimental_enabled": bool(
+            args.clover_pim_cross_rank_stripe_experimental_enabled
+        ),
+        "clover_pim_rank_spread_multi_rank_batch_experimental_enabled": bool(
+            args.clover_pim_rank_spread_multi_rank_batch_experimental_enabled
+        ),
+        "clover_pim_layer_rank_rotation_experimental_enabled": bool(
+            args.clover_pim_layer_rank_rotation_experimental_enabled
+        ),
         "clover_pim_slot_spill_alloc_experimental_enabled": bool(
             args.clover_pim_slot_spill_alloc_experimental_enabled
         ),
@@ -1074,6 +1193,14 @@ def main():
         ),
         "clover_pim_reserve_segment_tail_capacity_tokens": int(
             args.clover_pim_reserve_segment_tail_capacity_tokens
+        ),
+        "clover_pim_perf_guard_enabled": bool(args.clover_pim_perf_guard_enabled),
+        "clover_pim_perf_guard_force_cpu_for_compressed_kv": bool(
+            args.clover_pim_perf_guard_force_cpu_for_compressed_kv
+        ),
+        "clover_pim_perf_guard_min_decode_items": int(args.clover_pim_perf_guard_min_decode_items),
+        "clover_pim_perf_guard_slowdown_threshold": float(
+            args.clover_pim_perf_guard_slowdown_threshold
         ),
         "clover_compact_short_segments_enabled": bool(args.clover_compact_short_segments_enabled),
         "clover_compact_short_segment_min_tokens": int(args.clover_compact_short_segment_min_tokens),
