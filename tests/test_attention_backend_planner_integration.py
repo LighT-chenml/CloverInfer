@@ -403,6 +403,205 @@ def test_cross_rank_stripe_experiment_prefers_cross_rank_initial_stripe():
     assert backend.init_rank_last_reason == "cross_rank_stripe_experimental"
 
 
+def test_sparse_tail_resident_init_does_not_expand_cross_rank_stripe_to_full_prompt_width():
+    backend = _PlannerOnlyBackend(
+        num_dpus=32,
+        length=128,
+        block_tokens=256,
+        resident_store_backend="host",
+        head_grouping_policy="coarse",
+        attention_sparse_window=512,
+    )
+    backend.pim_cross_rank_stripe_experimental_enabled = True
+    backend.resident_store = _RankedRecordingHostStore(
+        [
+            list(range(0, 8)),
+            list(range(8, 16)),
+            list(range(16, 24)),
+            list(range(24, 32)),
+        ]
+    )
+
+    state = backend._build_request_state(
+        "req_sparse_tail_stripe",
+        _dummy_initial_kv(seq_len=512, num_heads=12, head_dim=64, num_layers=1),
+        decode_reserve_tokens=4,
+        logical_context_len=1536,
+    )
+
+    assert len(state.preferred_dpu_stripe) == 16
+    assert state.logical_context_len == 1536
+    assert state.context_len == 512
+
+    state.context_len = 520
+    state.logical_context_len = 1544
+    backend._maybe_expand_request_stripe(state)
+
+    assert len(state.preferred_dpu_stripe) == 16
+    assert state.stripe_expand_count == 0
+
+
+def test_sparse_tail_stripe_width_can_be_overridden_for_sweeps():
+    previous = os.environ.get("CLOVER_PIM_SPARSE_TAIL_STRIPE_WIDTH")
+    os.environ["CLOVER_PIM_SPARSE_TAIL_STRIPE_WIDTH"] = "8"
+    try:
+        backend = _PlannerOnlyBackend(
+            num_dpus=32,
+            length=128,
+            block_tokens=256,
+            resident_store_backend="host",
+            head_grouping_policy="coarse",
+            attention_sparse_window=512,
+        )
+        backend.pim_cross_rank_stripe_experimental_enabled = True
+        backend.resident_store = _RankedRecordingHostStore(
+            [
+                list(range(0, 8)),
+                list(range(8, 16)),
+                list(range(16, 24)),
+                list(range(24, 32)),
+            ]
+        )
+
+        state = backend._build_request_state(
+            "req_sparse_tail_stripe_override",
+            _dummy_initial_kv(seq_len=512, num_heads=12, head_dim=64, num_layers=1),
+            decode_reserve_tokens=4,
+            logical_context_len=1536,
+        )
+
+        assert len(state.preferred_dpu_stripe) == 8
+    finally:
+        if previous is None:
+            os.environ.pop("CLOVER_PIM_SPARSE_TAIL_STRIPE_WIDTH", None)
+        else:
+            os.environ["CLOVER_PIM_SPARSE_TAIL_STRIPE_WIDTH"] = previous
+
+
+def test_sparse_tail_stripe_width_tracks_expected_decode_batch_size():
+    previous = os.environ.get("CLOVER_PIM_SPARSE_TAIL_STRIPE_WIDTH")
+    os.environ.pop("CLOVER_PIM_SPARSE_TAIL_STRIPE_WIDTH", None)
+    try:
+        backend = _PlannerOnlyBackend(
+            num_dpus=32,
+            length=128,
+            block_tokens=256,
+            resident_store_backend="host",
+            head_grouping_policy="coarse",
+            attention_sparse_window=128,
+            expected_decode_batch_max_size=4,
+        )
+        backend.pim_cross_rank_stripe_experimental_enabled = True
+        backend.resident_store = _RankedRecordingHostStore(
+            [[rank_idx, rank_idx + 16] for rank_idx in range(16)]
+        )
+
+        state = backend._build_request_state(
+            "req_sparse_tail_auto_c4",
+            _dummy_initial_kv(seq_len=128, num_heads=12, head_dim=64, num_layers=1),
+            decode_reserve_tokens=4,
+            logical_context_len=1536,
+        )
+
+        assert len(state.preferred_dpu_stripe) == 8
+        assert backend.sparse_tail_last_stripe_policy["mode"] == "auto"
+        assert backend.sparse_tail_last_stripe_policy["target_width"] == 8
+
+        backend.expected_decode_batch_max_size = 8
+        assert backend._sparse_tail_stripe_target_width(128) == 4
+        assert backend.sparse_tail_last_stripe_policy["concurrency_cap"] == 4
+    finally:
+        if previous is None:
+            os.environ.pop("CLOVER_PIM_SPARSE_TAIL_STRIPE_WIDTH", None)
+        else:
+            os.environ["CLOVER_PIM_SPARSE_TAIL_STRIPE_WIDTH"] = previous
+
+
+def test_cross_rank_sparse_stripes_avoid_live_request_overlap():
+    previous = os.environ.get("CLOVER_PIM_SPARSE_TAIL_STRIPE_WIDTH")
+    os.environ["CLOVER_PIM_SPARSE_TAIL_STRIPE_WIDTH"] = "16"
+    try:
+        backend = _PlannerOnlyBackend(
+            num_dpus=32,
+            length=128,
+            block_tokens=256,
+            resident_store_backend="host",
+            head_grouping_policy="coarse",
+            attention_sparse_window=128,
+        )
+        backend.pim_cross_rank_stripe_experimental_enabled = True
+        backend.resident_store = _RankedRecordingHostStore(
+            [[rank_idx, rank_idx + 16] for rank_idx in range(16)]
+        )
+
+        first = backend._build_request_state(
+            "req_sparse_overlap_a",
+            _dummy_initial_kv(seq_len=128, num_heads=12, head_dim=64, num_layers=1),
+            decode_reserve_tokens=4,
+            logical_context_len=1536,
+        )
+        backend.request_states[first.request_id] = first
+        second = backend._build_request_state(
+            "req_sparse_overlap_b",
+            _dummy_initial_kv(seq_len=128, num_heads=12, head_dim=64, num_layers=1),
+            decode_reserve_tokens=4,
+            logical_context_len=1536,
+        )
+
+        assert len(first.preferred_dpu_stripe) == 16
+        assert len(second.preferred_dpu_stripe) == 16
+        assert set(first.preferred_dpu_stripe).isdisjoint(set(second.preferred_dpu_stripe))
+    finally:
+        if previous is None:
+            os.environ.pop("CLOVER_PIM_SPARSE_TAIL_STRIPE_WIDTH", None)
+        else:
+            os.environ["CLOVER_PIM_SPARSE_TAIL_STRIPE_WIDTH"] = previous
+
+
+def test_cross_rank_sparse_stripes_pack_into_aligned_rank_blocks():
+    previous = os.environ.get("CLOVER_PIM_SPARSE_TAIL_STRIPE_WIDTH")
+    os.environ["CLOVER_PIM_SPARSE_TAIL_STRIPE_WIDTH"] = "8"
+    try:
+        backend = _PlannerOnlyBackend(
+            num_dpus=32,
+            length=128,
+            block_tokens=256,
+            resident_store_backend="host",
+            head_grouping_policy="coarse",
+            attention_sparse_window=128,
+        )
+        backend.pim_cross_rank_stripe_experimental_enabled = True
+        backend.resident_store = _RankedRecordingHostStore(
+            [[rank_idx, rank_idx + 16] for rank_idx in range(16)]
+        )
+
+        states = []
+        for request_idx in range(4):
+            state = backend._build_request_state(
+                f"req_sparse_block_{request_idx}",
+                _dummy_initial_kv(seq_len=128, num_heads=12, head_dim=64, num_layers=1),
+                decode_reserve_tokens=4,
+                logical_context_len=1536,
+            )
+            backend.request_states[state.request_id] = state
+            states.append(state)
+
+        stripe_sets = [{int(dpu) for dpu in state.preferred_dpu_stripe} for state in states]
+        expected_blocks = [
+            {0, 1, 2, 3, 16, 17, 18, 19},
+            {4, 5, 6, 7, 20, 21, 22, 23},
+            {8, 9, 10, 11, 24, 25, 26, 27},
+            {12, 13, 14, 15, 28, 29, 30, 31},
+        ]
+
+        assert sorted(stripe_sets, key=lambda item: min(item)) == expected_blocks
+    finally:
+        if previous is None:
+            os.environ.pop("CLOVER_PIM_SPARSE_TAIL_STRIPE_WIDTH", None)
+        else:
+            os.environ["CLOVER_PIM_SPARSE_TAIL_STRIPE_WIDTH"] = previous
+
+
 def test_coarse_rank_spread_rotates_layers_across_rank_local_stripes():
     backend = _PlannerOnlyBackend(
         num_dpus=8,

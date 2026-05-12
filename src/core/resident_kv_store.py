@@ -4250,25 +4250,17 @@ class UpmemKVSlotStore(ResidentKVStore):
                 self.batch_item_totals["qk_softmax_weighted_value_sum_batch_blocked_logical_items"] += 1
                 self.batch_item_totals["qk_softmax_weighted_value_sum_batch_segmented_logical_items"] += 1
                 actual_window = min(int(window), int(slot_info["seq_len"]))
-                if actual_window < int(slot_info["seq_len"]):
-                    sparse_two_stage_queries.append(
-                        (
-                            idx,
-                            (
-                                k_slot,
-                                v_slot,
-                                [int(v) for v in local_head_indices],
-                                int(actual_window),
-                                queries,
-                                float(score_scale),
-                            ),
-                        )
-                    )
-                    continue
                 segmented_queries.append(
                     (
                         idx,
-                        (k_slot, v_slot, [int(v) for v in local_head_indices], window, queries, float(score_scale)),
+                        (
+                            k_slot,
+                            v_slot,
+                            [int(v) for v in local_head_indices],
+                            int(actual_window),
+                            queries,
+                            float(score_scale),
+                        ),
                     )
                 )
             elif slot_info["backend"] == "dpu":

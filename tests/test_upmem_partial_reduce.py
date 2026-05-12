@@ -166,6 +166,79 @@ def test_partial_reduce_uses_cpp_module_when_available():
     assert merged[0].shape == (1, 2)
 
 
+def test_segmented_sparse_qk_softmax_av_uses_partial_fused_path_without_two_stage():
+    class _FakeHelper:
+        def __init__(self):
+            self.payloads = []
+
+        def qk_softmax_weighted_value_sum_partial_batch(self, payloads):
+            self.payloads = list(payloads)
+            outputs = []
+            for idx, (_slot_id, local_heads, _window, queries, _score_scale) in enumerate(payloads):
+                outputs.append(
+                    (
+                        torch.full((len(local_heads), int(queries.shape[1])), float(idx + 1), dtype=torch.float32),
+                        torch.zeros(len(local_heads), dtype=torch.float32),
+                        torch.ones(len(local_heads), dtype=torch.float32),
+                    )
+                )
+            return outputs
+
+    store = object.__new__(UpmemKVSlotStore)
+    store.helper = _FakeHelper()
+    store.host_partial_reduce_enabled = False
+    store.slot_mapping = {
+        ("k", "v"): {
+            "backend": "dpu_segmented",
+            "seq_len": 10,
+            "group_heads": 2,
+            "head_dim": 4,
+            "blocks": [
+                {"slot_id": 100, "physical_dpu": 0, "seq_len": 4},
+                {"slot_id": 101, "physical_dpu": 1, "seq_len": 6},
+            ],
+        }
+    }
+    store.op_timing_totals_s = {
+        "qk_softmax_weighted_value_sum_batch_total": 0.0,
+        "qk_softmax_weighted_value_sum_batch_dpu": 0.0,
+        "qk_softmax_weighted_value_sum_batch_host_reduce": 0.0,
+    }
+    store.op_timing_counts = {key: 0 for key in store.op_timing_totals_s}
+    store.batch_item_totals = {
+        "qk_softmax_weighted_value_sum_batch_total": 0,
+        "qk_softmax_weighted_value_sum_batch_blocked_logical_items": 0,
+        "qk_softmax_weighted_value_sum_batch_segmented_logical_items": 0,
+        "qk_softmax_weighted_value_sum_batch_dpu_items": 0,
+        "qk_softmax_weighted_value_sum_batch_host_fallback_items": 0,
+        "qk_softmax_weighted_value_sum_batch_host_reduce_items": 0,
+    }
+    store._helper_submit_sort_key = lambda **kwargs: (
+        int(kwargs["logical_idx"]),
+        int(kwargs["segment_ordinal"]),
+    )
+    store.qk_slot_scores_batch = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("segmented sparse fused path should not use two-stage QK")
+    )
+    store.softmax_weighted_value_sum_batch = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("segmented sparse fused path should not use two-stage AV")
+    )
+
+    queries = torch.ones(2, 4, dtype=torch.float32)
+    outputs = UpmemKVSlotStore.qk_softmax_weighted_value_sum_batch(
+        store,
+        [("k", "v", [0, 1], 8, queries, 0.5)],
+    )
+
+    assert len(outputs) == 1
+    assert torch.allclose(outputs[0], torch.full((2, 4), 1.5, dtype=torch.float32))
+    assert [(int(payload[0]), int(payload[2])) for payload in store.helper.payloads] == [
+        (100, 2),
+        (101, 6),
+    ]
+    assert store.batch_item_totals["qk_softmax_weighted_value_sum_batch_dpu_items"] == 2
+
+
 def test_grouped_av_splits_oversized_helper_groups_without_upmem():
     class _FakeHelper:
         MAX_GROUP_SEGMENTS = 2

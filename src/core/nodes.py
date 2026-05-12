@@ -149,8 +149,16 @@ class AttentionNode:
             info["backend_debug"] = self.backend.get_debug_info()
         return info
 
-    def init_request(self, request_id: str, initial_kv, decode_reserve_tokens: int = 0):
+    def init_request(
+        self,
+        request_id: str,
+        initial_kv,
+        decode_reserve_tokens: int = 0,
+        expected_decode_batch_size: int = 1,
+    ):
         started_at = time.perf_counter()
+        if hasattr(self.backend, "expected_decode_batch_max_size"):
+            self.backend.expected_decode_batch_max_size = max(1, int(expected_decode_batch_size))
         context_len = self.backend.init_request(
             request_id,
             initial_kv,

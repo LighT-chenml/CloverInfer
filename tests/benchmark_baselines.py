@@ -62,6 +62,7 @@ def build_runtime_env() -> Dict[str, object]:
         "CLOVER_KVSLOT_MAX_HEADS",
         "CLOVER_KVSLOT_AUTOBUILD",
         "CLOVER_KVSLOT_AUTOBUILD_TIMEOUT_S",
+        "CLOVER_PIM_SPARSE_TAIL_STRIPE_WIDTH",
     ):
         env_value = os.environ.get(env_name)
         if env_value is not None:
@@ -1014,16 +1015,25 @@ def main():
         args.pim_softmax_av_shadow_check = False
     elif args.pim_softmax_av_shadow_check:
         args.pim_softmax_av_shadow_check = True
-    args.clover_cpu_shadow_enabled = True
-    if args.no_clover_cpu_shadow_enabled:
-        args.clover_cpu_shadow_enabled = False
-    elif args.clover_cpu_shadow_enabled:
-        args.clover_cpu_shadow_enabled = True
     args.clover_shadow_checks_enabled = True
     if args.no_clover_shadow_checks_enabled:
         args.clover_shadow_checks_enabled = False
     elif args.clover_shadow_checks_enabled:
         args.clover_shadow_checks_enabled = True
+    clover_cpu_shadow_explicit_enabled = bool(args.clover_cpu_shadow_enabled)
+    args.clover_cpu_shadow_auto_disabled = False
+    args.clover_cpu_shadow_enabled = True
+    if args.no_clover_cpu_shadow_enabled:
+        args.clover_cpu_shadow_enabled = False
+    elif clover_cpu_shadow_explicit_enabled:
+        args.clover_cpu_shadow_enabled = True
+    elif (
+        not args.clover_shadow_checks_enabled
+        and args.clover_cpu_fast_path_max_context_tokens <= 0
+        and not args.clover_pim_perf_guard_enabled
+    ):
+        args.clover_cpu_shadow_enabled = False
+        args.clover_cpu_shadow_auto_disabled = True
     args.clover_op_profiling_enabled = True
     if args.no_clover_op_profiling_enabled:
         args.clover_op_profiling_enabled = False
@@ -1166,6 +1176,9 @@ def main():
         "concurrency": max(1, int(args.concurrency)),
         "max_new_tokens": int(args.max_new_tokens),
         "attention_sparse_window": int(args.attention_sparse_window),
+        "clover_cpu_shadow_enabled": bool(args.clover_cpu_shadow_enabled),
+        "clover_cpu_shadow_auto_disabled": bool(args.clover_cpu_shadow_auto_disabled),
+        "clover_shadow_checks_enabled": bool(args.clover_shadow_checks_enabled),
         "clover_capacity_aware_batching_enabled": bool(args.clover_capacity_aware_batching_enabled),
         "clover_capacity_aware_time_gap_threshold": float(args.clover_capacity_aware_time_gap_threshold),
         "clover_capacity_aware_lookahead_window": int(args.clover_capacity_aware_lookahead_window),

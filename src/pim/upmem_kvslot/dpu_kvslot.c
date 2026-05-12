@@ -211,6 +211,34 @@ static float read_v_value(const kvslot_runtime_slot_args_t *slot, uint32_t logic
     return u32_bits_to_float(bits);
 }
 
+static void read_fp16_v_pair(const kvslot_runtime_slot_args_t *slot, uint32_t logical_idx, float *value0, float *value1)
+{
+    uint64_t packed64 = 0;
+    uint32_t word_idx = slot->elem_offset + (logical_idx / 2u);
+    uint32_t pair_base = word_idx & ~1u;
+    uint32_t packed;
+
+    mram_read(&v_cache[pair_base], &packed64, sizeof(packed64));
+    packed = (word_idx & 1u) == 0 ? (uint32_t)(packed64 & 0xffffffffu) : (uint32_t)(packed64 >> 32);
+    if ((logical_idx & 1u) == 0) {
+        *value0 = fp16_bits_to_float((uint16_t)(packed & 0xffffu));
+        *value1 = fp16_bits_to_float((uint16_t)(packed >> 16));
+        return;
+    }
+
+    *value0 = fp16_bits_to_float((uint16_t)(packed >> 16));
+    if (((word_idx + 1u) & ~1u) == pair_base) {
+        uint32_t next_packed = ((word_idx + 1u) & 1u) == 0
+            ? (uint32_t)(packed64 & 0xffffffffu)
+            : (uint32_t)(packed64 >> 32);
+        *value1 = fp16_bits_to_float((uint16_t)(next_packed & 0xffffu));
+    } else {
+        uint64_t next_packed64 = 0;
+        mram_read(&v_cache[pair_base + 2u], &next_packed64, sizeof(next_packed64));
+        *value1 = fp16_bits_to_float((uint16_t)(next_packed64 & 0xffffu));
+    }
+}
+
 static float read_k_value(const kvslot_runtime_slot_args_t *slot, uint32_t logical_idx)
 {
     if (slot->dtype_code == KVSLOT_DTYPE_INT8) {
@@ -235,6 +263,46 @@ static float read_k_value(const kvslot_runtime_slot_args_t *slot, uint32_t logic
     mram_read(&k_cache[pair_base], &packed, sizeof(packed));
     bits = (word_idx & 1u) == 0 ? (uint32_t)(packed & 0xffffffffu) : (uint32_t)(packed >> 32);
     return u32_bits_to_float(bits);
+}
+
+static float dot_query_with_k_row(const kvslot_runtime_slot_args_t *slot, uint32_t key_row_base, uint32_t head_dim)
+{
+    float local_sum = 0.0f;
+    uint32_t dim_idx = 0;
+    uint32_t logical_end = key_row_base + head_dim;
+
+    if (slot->dtype_code == KVSLOT_DTYPE_FP16) {
+        uint32_t word_idx = slot->elem_offset + (key_row_base / 2u);
+        if ((key_row_base & 1u) == 0 && (word_idx & 1u) == 0) {
+            for (; dim_idx + 4u <= head_dim; dim_idx += 4u, word_idx += 2u) {
+                uint64_t packed64 = 0;
+                uint32_t low_word;
+                uint32_t high_word;
+                mram_read(&k_cache[word_idx], &packed64, sizeof(packed64));
+                low_word = (uint32_t)(packed64 & 0xffffffffu);
+                high_word = (uint32_t)(packed64 >> 32);
+                local_sum += qk_slot_query_row[dim_idx] * fp16_bits_to_float((uint16_t)(low_word & 0xffffu));
+                local_sum += qk_slot_query_row[dim_idx + 1u] * fp16_bits_to_float((uint16_t)(low_word >> 16));
+                local_sum += qk_slot_query_row[dim_idx + 2u] * fp16_bits_to_float((uint16_t)(high_word & 0xffffu));
+                local_sum += qk_slot_query_row[dim_idx + 3u] * fp16_bits_to_float((uint16_t)(high_word >> 16));
+            }
+        }
+    } else if (slot->dtype_code == KVSLOT_DTYPE_FP32) {
+        uint32_t word_idx = slot->elem_offset + key_row_base;
+        if ((word_idx & 1u) == 0) {
+            for (; dim_idx + 2u <= head_dim; dim_idx += 2u, word_idx += 2u) {
+                uint64_t packed64 = 0;
+                mram_read(&k_cache[word_idx], &packed64, sizeof(packed64));
+                local_sum += qk_slot_query_row[dim_idx] * u32_bits_to_float((uint32_t)(packed64 & 0xffffffffu));
+                local_sum += qk_slot_query_row[dim_idx + 1u] * u32_bits_to_float((uint32_t)(packed64 >> 32));
+            }
+        }
+    }
+
+    for (; dim_idx < head_dim && (key_row_base + dim_idx) < logical_end; ++dim_idx) {
+        local_sum += qk_slot_query_row[dim_idx] * read_k_value(slot, key_row_base + dim_idx);
+    }
+    return local_sum;
 }
 
 static void run_qk_kernel(void)
@@ -330,7 +398,13 @@ static void run_context_from_local_softmax(uint32_t num_heads, uint32_t window, 
             for (uint32_t token_idx = 0; token_idx < window; ++token_idx) {
                 uint32_t value_idx0 = ((token_idx * group_heads) + head_idx0) * head_dim + dim_idx0;
                 float weight0 = u32_bits_to_float(qk_slot_score_local[(size_t)head_idx0 * window + token_idx]);
-                if (runtime_slot_args.dtype_code == KVSLOT_DTYPE_FP32 && (value_idx0 % 2u) == 0) {
+                if (runtime_slot_args.dtype_code == KVSLOT_DTYPE_FP16) {
+                    float value0;
+                    float value1;
+                    read_fp16_v_pair(&runtime_slot_args, value_idx0, &value0, &value1);
+                    acc0 += weight0 * value0;
+                    acc1 += weight0 * value1;
+                } else if (runtime_slot_args.dtype_code == KVSLOT_DTYPE_FP32 && (value_idx0 % 2u) == 0) {
                     uint64_t packed_v = 0;
                     uint32_t word_idx0 = runtime_slot_args.elem_offset + value_idx0;
                     mram_read(&v_cache[word_idx0], &packed_v, sizeof(packed_v));
@@ -677,11 +751,7 @@ static void run_qk_slot_kernel(void)
         for (uint32_t token_offset = tasklet_id; token_offset < window; token_offset += NR_TASKLETS) {
             uint32_t token_idx = seq_len - window + token_offset;
             uint32_t key_row_base = (((token_idx * group_heads) + local_head_idx) * slot_head_dim);
-            float local_sum = 0.0f;
-            for (uint32_t dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
-                float key_value = read_k_value(&runtime_slot_args, key_row_base + dim_idx);
-                local_sum += qk_slot_query_row[dim_idx] * key_value;
-            }
+            float local_sum = dot_query_with_k_row(&runtime_slot_args, key_row_base, head_dim);
             qk_slot_score_local[(size_t)head_row * window + token_offset] = float_to_u32_bits(local_sum);
         }
         barrier_wait(&kvslot_barrier);
@@ -838,11 +908,7 @@ static void run_grouped_qk_slot_kernel(void)
             }
             for (uint32_t token_offset = tasklet_id; token_offset < seg_window; token_offset += NR_TASKLETS) {
                 uint32_t key_row_base = ((token_offset * seg_group_heads) + local_head_idx) * seg_head_dim;
-                float local_sum = 0.0f;
-                for (uint32_t dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
-                    float key_value = read_k_value(segment_slot, key_row_base + dim_idx);
-                    local_sum += qk_slot_query_row[dim_idx] * key_value;
-                }
+                float local_sum = dot_query_with_k_row(segment_slot, key_row_base, head_dim);
                 qk_slot_score_local[(size_t)head_row * window + output_offset + token_offset] = float_to_u32_bits(local_sum);
             }
             barrier_wait(&kvslot_barrier);

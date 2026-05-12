@@ -287,6 +287,7 @@ class PimNaiveAttentionBackend:
         qk_mixed_heads: int = 2,
         qk_mixed_window: int = 128,
         host_partial_reduce_enabled: bool = True,
+        expected_decode_batch_max_size: int = 1,
         compact_short_segments_enabled: bool = False,
         compact_short_segment_min_tokens: int = 16,
         attention_sparse_window: int = 0,
@@ -333,6 +334,8 @@ class PimNaiveAttentionBackend:
         self.qk_mixed_heads = max(0, int(qk_mixed_heads))
         self.qk_mixed_window = max(1, int(qk_mixed_window))
         self.host_partial_reduce_enabled = bool(host_partial_reduce_enabled)
+        self.expected_decode_batch_max_size = max(1, int(expected_decode_batch_max_size))
+        self.sparse_tail_last_stripe_policy: Dict[str, object] = {}
         self.compact_short_segments_enabled = bool(compact_short_segments_enabled)
         self.compact_short_segment_min_tokens = max(1, int(compact_short_segment_min_tokens))
         self.pim_cross_rank_stripe_experimental_enabled = False
@@ -1140,6 +1143,14 @@ class PimNaiveAttentionBackend:
                 stripes.append(stripe)
         return stripes
 
+    def _active_request_stripes(self) -> List[List[int]]:
+        stripes: List[List[int]] = []
+        for request_state in self.request_states.values():
+            stripe = [int(physical_dpu) for physical_dpu in request_state.preferred_dpu_stripe]
+            if stripe:
+                stripes.append(stripe)
+        return stripes
+
     def _request_shape_targets(
         self,
         initial_kv: List[Dict[str, torch.Tensor]],
@@ -1437,6 +1448,7 @@ class PimNaiveAttentionBackend:
         initial_kv: List[Dict[str, torch.Tensor]],
         decode_reserve_tokens: int = 0,
         sharding_plan: Dict[str, object] | None = None,
+        logical_context_len: int | None = None,
     ) -> List[int]:
         if self.num_dpus <= 0:
             self.init_rank_last_reason = "no_dpus"
@@ -1449,6 +1461,14 @@ class PimNaiveAttentionBackend:
             decode_reserve_tokens=decode_reserve_tokens,
         )
         initial_context_len = int(initial_kv[0]["key"].shape[0]) if initial_kv else 0
+        logical_initial_context_len = int(
+            initial_context_len if logical_context_len is None else logical_context_len
+        )
+        sparse_tail_resident = (
+            int(self.attention_sparse_window) > 0
+            and logical_initial_context_len > initial_context_len
+            and initial_context_len <= int(self.attention_sparse_window)
+        )
         planner_metadata = self._planner_metadata(sharding_plan)
         planner_mode = str(planner_metadata.get("planner_mode", "") or "")
         planner_group_count = max(0, int(planner_metadata.get("effective_group_count", 0) or 0))
@@ -1469,12 +1489,21 @@ class PimNaiveAttentionBackend:
             target_medium_width = 12
         else:
             target_medium_width = 16
+        if sparse_tail_resident:
+            target_medium_width = max(
+                target_medium_width,
+                self._sparse_tail_stripe_target_width(initial_context_len),
+            )
         # If the prompt is already beyond the base resident length, delaying
         # stripe growth leaves most base groups pinned onto the narrower
         # initial subset. Front-load a moderate width increase so more same-rank
         # DPUs participate from request initialization without giving up
         # single-rank locality.
-        if max_layer_groups <= 4 and initial_context_len >= int(self.length):
+        if (
+            not sparse_tail_resident
+            and max_layer_groups <= 4
+            and initial_context_len >= int(self.length)
+        ):
             target_medium_width = max(target_medium_width, 12)
             prompt_overshoot = max(0, initial_context_len - int(self.length))
             # Once the prompt is already beyond the base resident length, a
@@ -1483,7 +1512,11 @@ class PimNaiveAttentionBackend:
             # requests where the wider stripe is still cheap.
             if prompt_overshoot >= max(8, self.block_tokens // 32):
                 target_medium_width = max(target_medium_width, 16)
-        elif max_layer_groups > 4 and initial_context_len >= int(self.length) + max(96, self.block_tokens // 2):
+        elif (
+            not sparse_tail_resident
+            and max_layer_groups > 4
+            and initial_context_len >= int(self.length) + max(96, self.block_tokens // 2)
+        ):
             target_medium_width = max(target_medium_width, 16)
         stripe_width = max(min_dpus_by_capacity, target_medium_width)
         planner_dpu_group_width = 1
@@ -1541,6 +1574,44 @@ class PimNaiveAttentionBackend:
         if max_layer_groups <= 8:
             return 12
         return 16
+
+    def _sparse_tail_stripe_target_width(self, resident_window: int) -> int:
+        override = os.environ.get("CLOVER_PIM_SPARSE_TAIL_STRIPE_WIDTH", "").strip()
+        if override:
+            try:
+                width = min(self.num_dpus, max(1, int(override)))
+                self.sparse_tail_last_stripe_policy = {
+                    "mode": "override",
+                    "resident_window": int(resident_window),
+                    "target_width": int(width),
+                    "override": str(override),
+                }
+                return width
+            except ValueError:
+                pass
+
+        resident_window = max(0, int(resident_window))
+        if resident_window >= 512:
+            base_width = 16
+        elif resident_window >= 256:
+            base_width = 8
+        elif resident_window >= 128:
+            base_width = 8
+        else:
+            base_width = 1
+
+        expected_batch = max(1, int(getattr(self, "expected_decode_batch_max_size", 1)))
+        concurrency_cap = max(1, int(self.num_dpus) // expected_batch)
+        width = min(self.num_dpus, max(1, min(int(base_width), int(concurrency_cap))))
+        self.sparse_tail_last_stripe_policy = {
+            "mode": "auto",
+            "resident_window": int(resident_window),
+            "base_width": int(base_width),
+            "expected_decode_batch_max_size": int(expected_batch),
+            "concurrency_cap": int(concurrency_cap),
+            "target_width": int(width),
+        }
+        return width
 
     def _max_layer_group_count_for_request(self, request_state: RequestState) -> int:
         if not request_state.layer_states:
@@ -1707,53 +1778,110 @@ class PimNaiveAttentionBackend:
                     start_rank = int(rank_idx)
                     break
 
-        stripe = list(required)
-        seen = set(seen_required)
-        remaining_width = max(0, stripe_width - len(stripe))
-        whole_rank_width = max(1, max_rank_width)
-        use_rank_packed_order = remaining_width > whole_rank_width
-        if use_rank_packed_order:
-            # Prefer whole-rank chunks when the stripe spans several ranks.
-            # UPMEM batched transfers iterate every DPU in an active rank, so
-            # one selected DPU per rank creates many dummy transfers. Packing
-            # consecutive DPUs inside a rank keeps the same cross-rank capacity
-            # expansion while making batched rounds materially denser.
-            for rank_offset in range(rank_count):
-                _, group = rank_groups[(start_rank + rank_offset) % rank_count]
-                for physical_dpu in group:
-                    normalized = int(physical_dpu) % self.num_dpus
-                    if normalized in seen:
-                        continue
-                    seen.add(normalized)
-                    stripe.append(normalized)
-                    if len(stripe) >= stripe_width:
-                        return stripe
-        else:
-            # Narrow cross-rank stripes still benefit from rank interleaving:
-            # it prevents long-context requests from collapsing back to one
-            # physical rank when only a few DPUs are needed.
-            for offset_in_rank in range(max_rank_width):
-                for rank_offset in range(rank_count):
-                    _, group = rank_groups[(start_rank + rank_offset) % rank_count]
-                    if offset_in_rank >= len(group):
-                        continue
-                    physical_dpu = int(group[offset_in_rank]) % self.num_dpus
-                    if physical_dpu in seen:
-                        continue
-                    seen.add(physical_dpu)
-                    stripe.append(physical_dpu)
-                    if len(stripe) >= stripe_width:
-                        return stripe
+        def _rank_block_span() -> int:
+            remaining_width = max(0, stripe_width - len(required))
+            whole_rank_width = max(1, max_rank_width)
+            if remaining_width <= whole_rank_width:
+                return 1
+            return max(1, math.ceil(float(remaining_width) / float(whole_rank_width)))
 
-        base_dpu = request_hash % self.num_dpus
-        for offset in range(self.num_dpus):
-            physical_dpu = (base_dpu + offset) % self.num_dpus
-            if physical_dpu in seen:
-                continue
-            stripe.append(physical_dpu)
-            if len(stripe) >= stripe_width:
-                break
-        return stripe
+        def _aligned_start_ranks(rank_span: int) -> List[int]:
+            rank_span = max(1, int(rank_span))
+            if rank_span <= 1 or rank_span >= rank_count:
+                return [0] if rank_span >= rank_count else list(range(rank_count))
+            starts = list(range(0, rank_count, rank_span))
+            return starts or [0]
+
+        def _build_candidate(candidate_start_rank: int) -> List[int]:
+            stripe = list(required)
+            seen = set(seen_required)
+            remaining_width = max(0, stripe_width - len(stripe))
+            whole_rank_width = max(1, max_rank_width)
+            use_rank_packed_order = remaining_width > whole_rank_width
+            if use_rank_packed_order:
+                # Prefer whole-rank chunks when the stripe spans several ranks.
+                # UPMEM batched transfers iterate every DPU in an active rank, so
+                # one selected DPU per rank creates many dummy transfers. Packing
+                # consecutive DPUs inside a rank keeps the same cross-rank capacity
+                # expansion while making batched rounds materially denser.
+                for rank_offset in range(rank_count):
+                    _, group = rank_groups[(candidate_start_rank + rank_offset) % rank_count]
+                    for physical_dpu in group:
+                        normalized = int(physical_dpu) % self.num_dpus
+                        if normalized in seen:
+                            continue
+                        seen.add(normalized)
+                        stripe.append(normalized)
+                        if len(stripe) >= stripe_width:
+                            return stripe
+            else:
+                # Narrow cross-rank stripes still benefit from rank interleaving:
+                # it prevents long-context requests from collapsing back to one
+                # physical rank when only a few DPUs are needed.
+                for offset_in_rank in range(max_rank_width):
+                    for rank_offset in range(rank_count):
+                        _, group = rank_groups[(candidate_start_rank + rank_offset) % rank_count]
+                        if offset_in_rank >= len(group):
+                            continue
+                        physical_dpu = int(group[offset_in_rank]) % self.num_dpus
+                        if physical_dpu in seen:
+                            continue
+                        seen.add(physical_dpu)
+                        stripe.append(physical_dpu)
+                        if len(stripe) >= stripe_width:
+                            return stripe
+
+            base_dpu = request_hash % self.num_dpus
+            for offset in range(self.num_dpus):
+                physical_dpu = (base_dpu + offset) % self.num_dpus
+                if physical_dpu in seen:
+                    continue
+                stripe.append(physical_dpu)
+                if len(stripe) >= stripe_width:
+                    break
+            return stripe
+
+        if not required and preferred_anchor_dpu is None:
+            rank_span = _rank_block_span()
+            aligned_starts = set(_aligned_start_ranks(rank_span))
+            active_stripes = self._active_request_stripes()
+            if active_stripes:
+                dpu_live_elems = getattr(self.resident_store, "dpu_live_elems_by_dpu", None)
+                candidate_scores = []
+                active_sets = [{int(physical_dpu) for physical_dpu in stripe} for stripe in active_stripes]
+                for candidate_start_rank in range(rank_count):
+                    candidate = _build_candidate(candidate_start_rank)
+                    candidate_set = {int(physical_dpu) for physical_dpu in candidate}
+                    overlap_total = sum(len(candidate_set.intersection(active)) for active in active_sets)
+                    overlap_max = max((len(candidate_set.intersection(active)) for active in active_sets), default=0)
+                    alignment_penalty = 0 if int(candidate_start_rank) in aligned_starts else 1
+                    live_load = 0
+                    if isinstance(dpu_live_elems, list):
+                        live_load = sum(
+                            int(dpu_live_elems[int(physical_dpu) % max(self.num_dpus, 1)])
+                            for physical_dpu in candidate
+                        )
+                    rank_distance = abs(int(candidate_start_rank) - int(start_rank))
+                    rank_distance = min(rank_distance, rank_count - rank_distance)
+                    candidate_scores.append(
+                        (
+                            overlap_total,
+                            overlap_max,
+                            alignment_penalty,
+                            live_load,
+                            rank_distance,
+                            int(candidate_start_rank),
+                            candidate,
+                        )
+                    )
+                if candidate_scores:
+                    return min(candidate_scores)[-1]
+            if rank_span > 1:
+                aligned_start_list = sorted(aligned_starts)
+                aligned_start = aligned_start_list[request_hash % len(aligned_start_list)]
+                return _build_candidate(int(aligned_start))
+
+        return _build_candidate(start_rank)
 
     def _maybe_expand_request_stripe(self, request_state: RequestState) -> None:
         if self.num_dpus <= 0 or not request_state.layer_states:
@@ -1765,21 +1893,42 @@ class PimNaiveAttentionBackend:
         target_width = current_width
         base_medium_width = self._medium_stripe_target_width(max_layer_groups)
         context_len = int(request_state.context_len)
+        logical_context_len = int(request_state.logical_context_len or context_len)
+        sparse_tail_resident = (
+            int(self.attention_sparse_window) > 0
+            and logical_context_len > context_len
+        )
         short_growth_threshold = int(self.length) + max(16, self.block_tokens // 8)
         medium_growth_threshold = int(self.length) + max(48, self.block_tokens // 4)
         long_growth_threshold = int(self.length) + max(96, self.block_tokens // 2)
 
-        if current_width < base_medium_width and context_len >= short_growth_threshold:
+        if sparse_tail_resident:
+            # Sparse attention keeps only a logical tail window resident. Do not
+            # treat that resident tail as the full logical prompt. Still keep a
+            # floor based on the active window so 512-token software-FP kernels
+            # retain enough DPU parallelism.
+            target_width = max(
+                target_width,
+                min(
+                    self.num_dpus,
+                    max(
+                        base_medium_width,
+                        self._sparse_tail_stripe_target_width(context_len),
+                    ),
+                ),
+            )
+        elif current_width < base_medium_width and context_len >= short_growth_threshold:
             target_width = max(target_width, base_medium_width)
-        if max_layer_groups <= 4:
-            if context_len >= medium_growth_threshold:
-                target_width = max(target_width, 12)
-            if context_len >= long_growth_threshold:
-                target_width = max(target_width, 16)
-        else:
-            growth_blocks = max(0, (context_len - int(self.length)) // max(1, self.block_tokens // 2))
-            if growth_blocks > 0:
-                target_width = max(target_width, base_medium_width + min(8, growth_blocks * 2))
+        if not sparse_tail_resident:
+            if max_layer_groups <= 4:
+                if context_len >= medium_growth_threshold:
+                    target_width = max(target_width, 12)
+                if context_len >= long_growth_threshold:
+                    target_width = max(target_width, 16)
+            else:
+                growth_blocks = max(0, (context_len - int(self.length)) // max(1, self.block_tokens // 2))
+                if growth_blocks > 0:
+                    target_width = max(target_width, base_medium_width + min(8, growth_blocks * 2))
         target_width = min(self.num_dpus, max(current_width, target_width))
         if target_width <= current_width:
             return
@@ -1845,6 +1994,7 @@ class PimNaiveAttentionBackend:
             initial_kv,
             decode_reserve_tokens=decode_reserve_tokens,
             sharding_plan=sharding_plan,
+            logical_context_len=logical_len,
         )
         for layer_idx, layer in enumerate(initial_kv):
             layer_key = layer["key"].detach().cpu().contiguous()
@@ -2834,6 +2984,8 @@ class PimNaiveAttentionBackend:
             "max_resident_groups_per_layer": self.max_resident_groups_per_layer,
             "head_grouping_policy": self.head_grouping_policy,
             "dpu_placement_policy": self.dpu_placement_policy,
+            "expected_decode_batch_max_size": int(self.expected_decode_batch_max_size),
+            "sparse_tail_last_stripe_policy": dict(self.sparse_tail_last_stripe_policy),
             "resident_request_count": len(self.request_states),
             "resident_last_freed_request_id": self.last_freed_request_id,
             "resident_append_ops": self.resident_append_ops,

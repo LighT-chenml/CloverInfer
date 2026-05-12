@@ -1695,6 +1695,7 @@ class GlobalScheduler:
                 "qk_mixed_window": int(self.cluster_config.pim_qk_mixed_window),
                 "decode_batch_window_s": float(self.cluster_config.attention_actor_batch_window_s),
                 "decode_batch_max_size": int(self.cluster_config.attention_actor_batch_max_size),
+                "expected_decode_batch_max_size": int(self.cluster_config.decode_continuous_batch_max_size),
             })
             if self.cluster_config.attention_backend == "cloverinfer":
                 attention_backend_kwargs.update(
@@ -1833,11 +1834,19 @@ class GlobalScheduler:
         prompt_len = int(prefill_out["prompt_len"])
         first_token = int(prefill_out["first_token_id"])
         max_tokens = int(max_new_tokens or self.model_config.max_new_tokens)
+        expected_decode_batch_size = max(
+            1,
+            min(
+                max(int(self._inflight_request_count), int(self._active_decode_requests) + 1),
+                int(self.decode_continuous_batch_max_size),
+            ),
+        )
         rpc_started = time.perf_counter()
         init_result = await attention.init_request.remote(
             request_id,
             prefill_out["initial_kv"],
             max_tokens,
+            expected_decode_batch_size,
         )
         decode_state = self._new_decode_state(
             request_id=request_id,

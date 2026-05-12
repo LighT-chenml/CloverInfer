@@ -2111,6 +2111,39 @@ static int prepare_qk_slot_item_header(
     return 0;
 }
 
+static void restrict_qk_slot_item_to_tail_window(qk_slot_item_t *item)
+{
+    uint32_t token_offset;
+
+    if (item == NULL || item->slot == NULL || item->window >= item->slot->seq_len) {
+        return;
+    }
+
+    token_offset = item->slot->seq_len - item->window;
+    item->runtime_args.seq_len = item->window;
+    item->runtime_args.elem_offset = item->slot->elem_offset
+        + kvslot_logical_elem_offset_to_packed_words(
+            token_offset * item->slot->group_heads * item->slot->head_dim,
+            item->slot->dtype_code);
+}
+
+static void restrict_av_item_to_qk_tail_window(av_item_t *item, const qk_slot_item_t *qk_item)
+{
+    uint32_t token_offset;
+
+    if (item == NULL || qk_item == NULL || item->slot == NULL || qk_item->window >= item->slot->seq_len) {
+        return;
+    }
+
+    token_offset = item->slot->seq_len - qk_item->window;
+    item->runtime_args.seq_len = qk_item->window;
+    item->runtime_args.elem_offset = item->slot->elem_offset
+        + kvslot_logical_elem_offset_to_packed_words(
+            token_offset * item->slot->group_heads * item->slot->head_dim,
+            item->slot->dtype_code);
+    item->out.seq_len = qk_item->window;
+}
+
 static int prepare_grouped_qk_slot_item_header(
     kvslot_runner_t *runner,
     const uint32_t *slot_ids,
@@ -3266,8 +3299,8 @@ static int softmax_av_item_from_qk_scores(
         fprintf(stderr, "QK/AV head count mismatch for slot %u: qk=%u av=%u\n", qk_item->slot_id, qk_item->num_heads, av_item->slot->group_heads);
         return 1;
     }
-    if (av_item->slot->seq_len != qk_item->window) {
-        fprintf(stderr, "QK/AV window mismatch for slot %u: qk=%u av=%u\n", qk_item->slot_id, qk_item->window, av_item->slot->seq_len);
+    if (av_item->runtime_args.seq_len != qk_item->window) {
+        fprintf(stderr, "QK/AV window mismatch for slot %u: qk=%u av=%u\n", qk_item->slot_id, qk_item->window, av_item->runtime_args.seq_len);
         return 1;
     }
     if (qk_item->slot_args.mode == KVSLOT_QK_SLOT_MODE_SOFTMAX_NORMALIZED) {
@@ -4658,6 +4691,7 @@ static int handle_qk_softmax_av_partial_batch(kvslot_runner_t *runner)
             rc = 1;
             goto cleanup;
         }
+        restrict_qk_slot_item_to_tail_window(&qk_items[idx]);
         qk_items[idx].slot_args.mode = KVSLOT_QK_SLOT_MODE_CONTEXT_FUSED;
         if (read_qk_slot_item_payload(stdin, &qk_items[idx]) != 0) {
             fprintf(stderr, "Failed to read qk-softmax-av partial payload %u\n", idx);
@@ -4669,7 +4703,8 @@ static int handle_qk_softmax_av_partial_batch(kvslot_runner_t *runner)
             rc = 1;
             goto cleanup;
         }
-        if (av_items[idx].slot->seq_len != qk_items[idx].window || av_items[idx].slot->group_heads != qk_items[idx].num_heads) {
+        restrict_av_item_to_qk_tail_window(&av_items[idx], &qk_items[idx]);
+        if (av_items[idx].runtime_args.seq_len != qk_items[idx].window || av_items[idx].slot->group_heads != qk_items[idx].num_heads) {
             fprintf(stderr, "QK-softmax-av partial slot shape mismatch at item %u\n", idx);
             rc = 1;
             goto cleanup;
@@ -4709,6 +4744,11 @@ static int handle_qk_softmax_av_partial_batch(kvslot_runner_t *runner)
             for (uint32_t pos = 0; pos < round_count && rc == 0; ++pos) {
                 if (finish_qk_slot_item(&qk_items[round_indices[pos]], &runner->profile) != 0) {
                     fprintf(stderr, "Failed to finish qk-softmax-av partial qk item %u\n", round_indices[pos]);
+                    rc = 1;
+                    break;
+                }
+                if (fetch_qk_slot_row_maxes(&qk_items[round_indices[pos]]) != 0) {
+                    fprintf(stderr, "Failed to fetch qk-softmax-av partial row maxes %u\n", round_indices[pos]);
                     rc = 1;
                     break;
                 }
