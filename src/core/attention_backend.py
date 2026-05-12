@@ -1619,21 +1619,41 @@ class PimNaiveAttentionBackend:
 
         stripe = list(required)
         seen = set(seen_required)
-        # Interleave ranks first, then move to the next DPU within each rank.
-        # This matches the helper's rank-spread logical DPU order and prevents
-        # long-context requests from collapsing back to a single physical rank.
-        for offset_in_rank in range(max_rank_width):
+        remaining_width = max(0, stripe_width - len(stripe))
+        whole_rank_width = max(1, max_rank_width)
+        use_rank_packed_order = remaining_width > whole_rank_width
+        if use_rank_packed_order:
+            # Prefer whole-rank chunks when the stripe spans several ranks.
+            # UPMEM batched transfers iterate every DPU in an active rank, so
+            # one selected DPU per rank creates many dummy transfers. Packing
+            # consecutive DPUs inside a rank keeps the same cross-rank capacity
+            # expansion while making batched rounds materially denser.
             for rank_offset in range(rank_count):
                 _, group = rank_groups[(start_rank + rank_offset) % rank_count]
-                if offset_in_rank >= len(group):
-                    continue
-                physical_dpu = int(group[offset_in_rank]) % self.num_dpus
-                if physical_dpu in seen:
-                    continue
-                seen.add(physical_dpu)
-                stripe.append(physical_dpu)
-                if len(stripe) >= stripe_width:
-                    return stripe
+                for physical_dpu in group:
+                    normalized = int(physical_dpu) % self.num_dpus
+                    if normalized in seen:
+                        continue
+                    seen.add(normalized)
+                    stripe.append(normalized)
+                    if len(stripe) >= stripe_width:
+                        return stripe
+        else:
+            # Narrow cross-rank stripes still benefit from rank interleaving:
+            # it prevents long-context requests from collapsing back to one
+            # physical rank when only a few DPUs are needed.
+            for offset_in_rank in range(max_rank_width):
+                for rank_offset in range(rank_count):
+                    _, group = rank_groups[(start_rank + rank_offset) % rank_count]
+                    if offset_in_rank >= len(group):
+                        continue
+                    physical_dpu = int(group[offset_in_rank]) % self.num_dpus
+                    if physical_dpu in seen:
+                        continue
+                    seen.add(physical_dpu)
+                    stripe.append(physical_dpu)
+                    if len(stripe) >= stripe_width:
+                        return stripe
 
         base_dpu = request_hash % self.num_dpus
         for offset in range(self.num_dpus):

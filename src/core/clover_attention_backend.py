@@ -98,6 +98,11 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
             0,
             int(pim_reserve_segment_tail_capacity_tokens),
         )
+        self.pim_reserve_segment_tail_capacity_auto_enabled = (
+            self.pim_attention_enabled
+            and self.pim_rank_spread_alloc_experimental_enabled
+            and self.pim_cross_rank_stripe_experimental_enabled
+        )
         self.pim_perf_guard_enabled = bool(pim_perf_guard_enabled)
         self.pim_perf_guard_force_cpu_for_compressed_kv = bool(
             pim_perf_guard_force_cpu_for_compressed_kv
@@ -174,6 +179,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
             reserve_tail_capacity_enabled = (
                 self.pim_reserve_segment_tail_capacity_experimental_enabled
                 or self.pim_reserve_segment_tail_capacity_tokens > 0
+                or self.pim_reserve_segment_tail_capacity_auto_enabled
             )
             self.resident_store.set_experimental_flags(
                 context_fused_enabled=self.pim_context_fused_experimental_enabled,
@@ -1306,6 +1312,10 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         debug["clover_pim_reserve_segment_tail_capacity_effective_enabled"] = (
             self.pim_reserve_segment_tail_capacity_experimental_enabled
             or self.pim_reserve_segment_tail_capacity_tokens > 0
+            or self.pim_reserve_segment_tail_capacity_auto_enabled
+        )
+        debug["clover_pim_reserve_segment_tail_capacity_auto_enabled"] = bool(
+            self.pim_reserve_segment_tail_capacity_auto_enabled
         )
         debug["clover_pim_perf_guard_enabled"] = bool(self.pim_perf_guard_enabled)
         debug["clover_pim_perf_guard_force_cpu_for_compressed_kv"] = bool(

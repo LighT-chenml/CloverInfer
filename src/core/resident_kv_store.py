@@ -78,11 +78,128 @@ def _iter_candidate_kvslot_dirs(repo_root: str) -> List[str]:
     return kvslot_dirs
 
 
+def _kvslot_limit_config() -> tuple[Dict[str, str], bool]:
+    """Return Makefile limit overrides and whether the user explicitly set one."""
+    config: Dict[str, str] = {}
+    explicit = False
+    for make_name, clover_name, default_value in (
+        ("KVSLOT_MAX_CAPACITY", "CLOVER_KVSLOT_MAX_CAPACITY", "256"),
+        ("KVSLOT_MAX_HEADS", "CLOVER_KVSLOT_MAX_HEADS", "32"),
+    ):
+        raw_value = os.environ.get(clover_name)
+        if raw_value is None:
+            raw_value = os.environ.get(make_name)
+        else:
+            explicit = True
+        if raw_value is None:
+            raw_value = default_value
+        else:
+            explicit = True
+        try:
+            value = max(1, int(str(raw_value).strip()))
+        except Exception:
+            value = int(default_value)
+        config[make_name] = str(value)
+    return config, explicit
+
+
+def _kvslot_source_is_newer(kvslot_dir: str, helper_path: str) -> bool:
+    if not os.path.exists(helper_path):
+        return True
+    try:
+        helper_mtime = os.path.getmtime(helper_path)
+    except OSError:
+        return True
+    for rel_path in ("Makefile", "common.h", "dpu_kvslot.c", "host_kvslot.c"):
+        source_path = os.path.join(kvslot_dir, rel_path)
+        try:
+            if os.path.getmtime(source_path) > helper_mtime:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _read_kvslot_build_config(kvslot_dir: str) -> Dict[str, str]:
+    stamp_path = os.path.join(kvslot_dir, "build", ".kvslot_build_config")
+    config: Dict[str, str] = {}
+    try:
+        with open(stamp_path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if "=" not in line:
+                    continue
+                key, value = line.strip().split("=", 1)
+                if key:
+                    config[key] = value
+    except OSError:
+        pass
+    return config
+
+
+def _write_kvslot_build_config(kvslot_dir: str, config: Dict[str, str]) -> None:
+    stamp_path = os.path.join(kvslot_dir, "build", ".kvslot_build_config")
+    try:
+        os.makedirs(os.path.dirname(stamp_path), exist_ok=True)
+        with open(stamp_path, "w", encoding="utf-8") as handle:
+            for key in sorted(config):
+                handle.write(f"{key}={config[key]}\n")
+    except OSError:
+        pass
+
+
+def _kvslot_helper_needs_build(
+    kvslot_dir: str,
+    helper_path: str,
+    desired_config: Dict[str, str],
+    limits_explicit: bool,
+) -> tuple[bool, bool]:
+    if not os.path.exists(helper_path):
+        return True, False
+    if _kvslot_source_is_newer(kvslot_dir, helper_path):
+        return True, False
+    recorded_config = _read_kvslot_build_config(kvslot_dir)
+    if recorded_config:
+        return recorded_config != desired_config, recorded_config != desired_config
+    if limits_explicit:
+        # A pre-existing helper has no recorded compile-time limits. Rebuild
+        # when the caller asks for non-default limits so Python and DPU agree.
+        return True, True
+    return False, False
+
+
+def _run_kvslot_build(
+    kvslot_dir: str,
+    desired_config: Dict[str, str],
+    *,
+    clean_first: bool,
+) -> subprocess.CompletedProcess[str]:
+    upmem_env_script = os.environ.get("CLOVER_UPMEM_ENV", "/usr/upmem_env.sh")
+    build_target = "clean all" if clean_first else "all"
+    make_vars = " ".join(f"{key}={shlex.quote(value)}" for key, value in sorted(desired_config.items()))
+    build_cmd = f"make {build_target} {make_vars}".strip()
+    if os.path.exists(upmem_env_script):
+        build_cmd = f". {shlex.quote(upmem_env_script)} >/dev/null 2>&1 && {build_cmd}"
+    build_env = os.environ.copy()
+    build_env.update(desired_config)
+    return subprocess.run(
+        build_cmd,
+        cwd=kvslot_dir,
+        shell=True,
+        executable="/bin/bash",
+        env=build_env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=float(os.environ.get("CLOVER_KVSLOT_AUTOBUILD_TIMEOUT_S", "120")),
+    )
+
+
 def _resolve_kvslot_helper_paths(repo_root: str) -> tuple[str, str]:
     helper_override = os.environ.get("CLOVER_KVSLOT_HELPER")
     kvslot_dir_override = os.environ.get("CLOVER_KVSLOT_DIR")
     searched_paths: List[str] = []
     build_failures: List[str] = []
+    desired_config, limits_explicit = _kvslot_limit_config()
 
     if helper_override:
         helper_path = os.path.abspath(helper_override)
@@ -96,7 +213,13 @@ def _resolve_kvslot_helper_paths(repo_root: str) -> tuple[str, str]:
     for kvslot_dir in _iter_candidate_kvslot_dirs(repo_root):
         helper_path = os.path.join(kvslot_dir, "build", "host_kvslot")
         searched_paths.append(helper_path)
-        if os.path.exists(helper_path):
+        needs_build, clean_first = _kvslot_helper_needs_build(
+            kvslot_dir,
+            helper_path,
+            desired_config,
+            limits_explicit,
+        )
+        if os.path.exists(helper_path) and not needs_build:
             return kvslot_dir, helper_path
 
         if os.environ.get("CLOVER_KVSLOT_AUTOBUILD", "1").strip().lower() not in {
@@ -108,22 +231,13 @@ def _resolve_kvslot_helper_paths(repo_root: str) -> tuple[str, str]:
             makefile_path = os.path.join(kvslot_dir, "Makefile")
             if not os.path.exists(makefile_path):
                 continue
-            upmem_env_script = os.environ.get("CLOVER_UPMEM_ENV", "/usr/upmem_env.sh")
-            build_cmd = "make all"
-            if os.path.exists(upmem_env_script):
-                build_cmd = f". {shlex.quote(upmem_env_script)} >/dev/null 2>&1 && {build_cmd}"
-            completed = subprocess.run(
-                build_cmd,
-                cwd=kvslot_dir,
-                shell=True,
-                executable="/bin/bash",
-                env=os.environ.copy(),
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=float(os.environ.get("CLOVER_KVSLOT_AUTOBUILD_TIMEOUT_S", "120")),
+            completed = _run_kvslot_build(
+                kvslot_dir,
+                desired_config,
+                clean_first=clean_first,
             )
             if completed.returncode == 0 and os.path.exists(helper_path):
+                _write_kvslot_build_config(kvslot_dir, desired_config)
                 return kvslot_dir, helper_path
             build_output = "\n".join(
                 part.strip()
