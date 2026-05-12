@@ -435,6 +435,7 @@ def make_cluster_config(args, attention_backend: str) -> ClusterConfig:
         decode_dense_gpu_fraction=decode_dense_gpu_fraction,
         attention_gpu_fraction=attention_gpu_fraction,
         attention_backend=attention_backend,
+        attention_sparse_window=args.attention_sparse_window,
         pim_num_dpus=args.pim_num_dpus,
         pim_resident_store_backend=resident_store_backend,
         pim_qk_full_enabled=qk_full_enabled,
@@ -717,6 +718,12 @@ def main():
     parser.add_argument("--prompt-token-length", type=int, default=0)
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--dtype", default="float16")
+    parser.add_argument(
+        "--attention-sparse-window",
+        type=int,
+        default=0,
+        help="Sliding-window sparse decode attention. 0 keeps dense/full attention.",
+    )
     parser.add_argument(
         "--baselines",
         default="monolithic_gpu,split_gpu_full_decode,disagg_cpu,disagg_pim_naive",
@@ -1125,6 +1132,8 @@ def main():
         raise ValueError("--decode-continuous-batch-window-ms must be non-negative")
     if args.decode_continuous_batch_max_size <= 0:
         raise ValueError("--decode-continuous-batch-max-size must be positive")
+    if args.attention_sparse_window < 0:
+        raise ValueError("--attention-sparse-window must be non-negative")
     if args.decode_continuous_batch_window_ms > 0.0:
         args.decode_continuous_batch_window_s += args.decode_continuous_batch_window_ms / 1000.0
 
@@ -1156,6 +1165,7 @@ def main():
         "prompt_token_length_override": int(args.prompt_token_length),
         "concurrency": max(1, int(args.concurrency)),
         "max_new_tokens": int(args.max_new_tokens),
+        "attention_sparse_window": int(args.attention_sparse_window),
         "clover_capacity_aware_batching_enabled": bool(args.clover_capacity_aware_batching_enabled),
         "clover_capacity_aware_time_gap_threshold": float(args.clover_capacity_aware_time_gap_threshold),
         "clover_capacity_aware_lookahead_window": int(args.clover_capacity_aware_lookahead_window),

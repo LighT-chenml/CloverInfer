@@ -1673,9 +1673,11 @@ class GlobalScheduler:
                 f"requested={requested_gpus}, available={available_gpus}. "
                 "Adjust --prefill-gpu-fraction / --decode-dense-gpu-fraction or disable one side's GPU."
             )
-        attention_backend_kwargs = {}
+        attention_backend_kwargs = {
+            "attention_sparse_window": int(getattr(self.cluster_config, "attention_sparse_window", 0)),
+        }
         if self.cluster_config.attention_backend in {"pim_naive", "cloverinfer"}:
-            attention_backend_kwargs = {
+            attention_backend_kwargs.update({
                 "num_dpus": int(self.cluster_config.pim_num_dpus),
                 "length": int(self.cluster_config.pim_length),
                 "block_tokens": int(self.cluster_config.pim_block_tokens),
@@ -1693,7 +1695,7 @@ class GlobalScheduler:
                 "qk_mixed_window": int(self.cluster_config.pim_qk_mixed_window),
                 "decode_batch_window_s": float(self.cluster_config.attention_actor_batch_window_s),
                 "decode_batch_max_size": int(self.cluster_config.attention_actor_batch_max_size),
-            }
+            })
             if self.cluster_config.attention_backend == "cloverinfer":
                 attention_backend_kwargs.update(
                     {

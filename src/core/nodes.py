@@ -84,6 +84,7 @@ class AttentionNode:
         self.backend_name = backend
         self.device = _select_device(prefer_gpu)
         backend_kwargs = backend_kwargs or {}
+        attention_sparse_window = max(0, int(backend_kwargs.pop("attention_sparse_window", 0)))
         self.rankset_overlap_async_dispatch_enabled = bool(
             backend_kwargs.pop("rankset_overlap_async_dispatch_enabled", False)
         )
@@ -95,19 +96,19 @@ class AttentionNode:
         decode_batch_max_size = int(backend_kwargs.pop("decode_batch_max_size", decode_batch_max_size))
         if backend == "cpu":
             self.device = "cpu"
-            self.backend = CpuAttentionBackend()
+            self.backend = CpuAttentionBackend(attention_sparse_window=attention_sparse_window)
         elif backend == "gpu":
             self.device = _select_device(True)
-            self.backend = GpuAttentionBackend()
+            self.backend = GpuAttentionBackend(attention_sparse_window=attention_sparse_window)
         elif backend == "pim_naive":
             self.device = "cpu"
-            self.backend = PimNaiveAttentionBackend(**backend_kwargs)
+            self.backend = PimNaiveAttentionBackend(attention_sparse_window=attention_sparse_window, **backend_kwargs)
         elif backend == "cloverinfer":
             importlib.invalidate_caches()
             from .clover_attention_backend import CloverInferAttentionBackend
 
             self.device = "cpu"
-            self.backend = CloverInferAttentionBackend(**backend_kwargs)
+            self.backend = CloverInferAttentionBackend(attention_sparse_window=attention_sparse_window, **backend_kwargs)
         else:
             raise ValueError(f"Unsupported attention backend for now: {backend}")
         self.decode_batch_window_s = max(0.0, float(decode_batch_window_s))

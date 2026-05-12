@@ -228,11 +228,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
 
     def _compute_host_scores(self, record: Dict[str, object]) -> torch.Tensor:
         with self._timed("host_score_compute_s"):
-            return torch.einsum(
-                "hd,lhd->hl",
-                record["q_fp32"],
-                record["keys"].float(),
-            ) * float(record["score_scale"])
+            return super()._compute_host_scores(record)
 
     def _init_cpu_shadow_request(
         self,
@@ -407,15 +403,18 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                 v_new.unsqueeze(0),
             )
             keys, values = self._cpu_shadow_active_kv(request_id, layer_idx)
+            attention_window = self._attention_window_for_seq_len(int(keys.shape[0]))
             records.append(
                 {
                     "request_id": request_id,
                     "layer_idx": layer_idx,
                     "query_dtype": q.dtype,
                     "q_fp32": q if q.dtype == torch.float32 and q.is_contiguous() else q.to(torch.float32).contiguous(),
-                    "keys": keys,
-                    "values": values,
+                    "keys": self._tail_tensor_for_window(keys, attention_window),
+                    "values": self._tail_tensor_for_window(values, attention_window),
                     "score_scale": float(item.get("score_scale", 1.0)),
+                    "seq_len_after_append": int(keys.shape[0]),
+                    "attention_window": int(attention_window),
                 }
             )
 
@@ -439,6 +438,15 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         resident_values: torch.Tensor,
     ) -> None:
         cpu_keys, cpu_values = self._cpu_shadow_active_kv(request_id, layer_idx)
+        active_len = int(resident_keys.shape[0])
+        cpu_keys = self._tail_tensor_for_window(cpu_keys, active_len)
+        cpu_values = self._tail_tensor_for_window(cpu_values, active_len)
+        if tuple(cpu_keys.shape) != tuple(resident_keys.shape) or tuple(cpu_values.shape) != tuple(resident_values.shape):
+            raise RuntimeError(
+                f"resident shadow shape mismatch for request={request_id} layer={layer_idx}: "
+                f"resident_keys={tuple(resident_keys.shape)} cpu_keys={tuple(cpu_keys.shape)} "
+                f"resident_values={tuple(resident_values.shape)} cpu_values={tuple(cpu_values.shape)}"
+            )
         key_diff = float(torch.max(torch.abs(resident_keys.float() - cpu_keys.float())).item())
         value_diff = float(torch.max(torch.abs(resident_values.float() - cpu_values.float())).item())
         self.resident_shadow_max_abs_diff = max(self.resident_shadow_max_abs_diff, key_diff, value_diff)
@@ -494,7 +502,10 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
 
             should_shadow_check = False
             if self.shadow_checks_enabled and self.cpu_shadow_enabled:
-                current_token_idx = max(0, int(request_state.context_len) - 1)
+                current_token_idx = max(
+                    0,
+                    int(request_state.logical_context_len or request_state.context_len) - 1,
+                )
                 token_match = (current_token_idx % self.shadow_check_token_interval) == 0
                 layer_match = (layer_idx % self.shadow_check_layer_interval) == 0
                 should_shadow_check = bool(token_match and layer_match)
@@ -525,26 +536,32 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
             values = cpu_values
 
             q_fp32 = q if q.dtype == torch.float32 and q.is_contiguous() else q.to(torch.float32).contiguous()
-            scores = None
-            if not (self.resident_compute_enabled and self.qk_full_enabled):
-                if keys is None:
-                    with self._timed("resident_materialize_s"):
-                        keys, values = self._materialize_layer_kv(request_state, layer_idx)
-                scores = torch.einsum("hd,lhd->hl", q_fp32, keys.float()) * score_scale
-            return {
+            seq_len_after_append = self._record_seq_len_after_append(request_state, layer_idx, keys)
+            attention_window = self._attention_window_for_seq_len(seq_len_after_append)
+            record = {
                 "request_id": request_id,
                 "request_state": request_state,
                 "layer_idx": layer_idx,
                 "query_dtype": q.dtype,
                 "q_fp32": q_fp32,
-                "keys": keys,
-                "values": values,
-                "scores": scores,
+                "keys": None,
+                "values": None,
+                "scores": None,
                 "score_scale": score_scale,
                 "use_resident_av": use_resident_av,
                 "should_shadow_check": should_shadow_check,
                 "use_pim_attention": use_pim_attention,
+                "seq_len_after_append": int(seq_len_after_append),
+                "attention_window": int(attention_window),
             }
+            self._set_record_attention_kv(record, keys, values)
+            if not (self.resident_compute_enabled and self.qk_full_enabled):
+                if record["keys"] is None:
+                    with self._timed("resident_materialize_s"):
+                        keys, values = self._materialize_layer_kv(request_state, layer_idx)
+                    self._set_record_attention_kv(record, keys, values)
+                record["scores"] = torch.einsum("hd,lhd->hl", q_fp32, record["keys"].float()) * score_scale
+            return record
 
     def _apply_qk_context_fused_batch(self, records: List[Dict[str, object]]) -> None:
         with self._timed("qk_full_batch_s"):
@@ -556,12 +573,13 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                 record["fused_group_contexts"] = []
                 for group in layer_state.head_groups:
                     local_head_indices = list(range(group.group_heads))
+                    window = min(int(group.seq_len), int(record["attention_window"]))
                     flat_slot_queries.append(
                         (
                             group.k_slot,
                             group.v_slot,
                             local_head_indices,
-                            int(group.seq_len),
+                            int(window),
                             record["q_fp32"][group.head_start:group.head_end].contiguous(),
                             float(record["score_scale"]),
                         )
@@ -589,12 +607,13 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                         continue
                     layer_state = record["request_state"].layer_states[record["layer_idx"]]
                     for group in layer_state.head_groups:
+                        window = min(int(group.seq_len), int(record["attention_window"]))
                         shadow_slot_queries.append(
                             (
                                 group.k_slot,
                                 group.v_slot,
                                 list(range(group.group_heads)),
-                                int(group.seq_len),
+                                int(window),
                                 record["q_fp32"][group.head_start:group.head_end].contiguous(),
                             )
                         )
@@ -748,12 +767,13 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                 layer_state = record["request_state"].layer_states[record["layer_idx"]]
                 record["resident_slot_scores"] = []
                 for group in layer_state.head_groups:
+                    window = min(int(group.seq_len), int(record["attention_window"]))
                     flat_slot_queries.append(
                         (
                             group.k_slot,
                             group.v_slot,
                             list(range(group.group_heads)),
-                            int(group.seq_len),
+                            int(window),
                             record["q_fp32"][group.head_start:group.head_end].contiguous(),
                         )
                     )
@@ -772,10 +792,11 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                     for record in records:
                         if record["keys"] is None or record["values"] is None:
                             with self._timed("resident_materialize_s"):
-                                record["keys"], record["values"] = self._materialize_layer_kv(
+                                keys, values = self._materialize_layer_kv(
                                     record["request_state"],
                                     record["layer_idx"],
                                 )
+                            self._set_record_attention_kv(record, keys, values)
                         record["use_resident_av"] = False
                         record["resident_slot_scores"] = []
                         record["scores"] = self._compute_host_scores(record)
@@ -855,7 +876,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
 
                     total_mixed_heads += mixed_heads
                     layer_state = record["request_state"].layer_states[record["layer_idx"]]
-                    window = min(self.qk_mixed_window, int(keys.shape[0]))
+                    window = min(self.qk_mixed_window, int(record["attention_window"]), int(keys.shape[0]))
                     grouped_slot_queries: Dict[tuple[str, str], Dict[str, object]] = {}
                     head_to_slot_row: list[tuple[tuple[str, str], int]] = []
                     for head in range(mixed_heads):
@@ -955,10 +976,11 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
     ) -> None:
         if record.get("keys") is None or record.get("values") is None:
             with self._timed("resident_materialize_s"):
-                record["keys"], record["values"] = self._materialize_layer_kv(
+                keys, values = self._materialize_layer_kv(
                     record["request_state"],
                     record["layer_idx"],
                 )
+            self._set_record_attention_kv(record, keys, values)
         if record.get("scores") is None:
             record["scores"] = self._compute_host_scores(record)
         with self._timed("softmax_av_s"):
@@ -1112,6 +1134,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         head_start = int(group.head_start)
         head_end = int(group.head_end)
         local_query = record["q_fp32"][head_start:head_end].contiguous()
+        window = min(int(group.seq_len), int(record["attention_window"]))
         if record["use_resident_av"] and self.softmax_av_fused_enabled:
             with self._timed("resident_av_s"):
                 context = self.resident_store.qk_softmax_weighted_value_sum_batch(
@@ -1120,7 +1143,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                             group.k_slot,
                             group.v_slot,
                             list(range(group.group_heads)),
-                            int(group.seq_len),
+                            int(window),
                             local_query,
                             float(record["score_scale"]),
                         )
@@ -1139,7 +1162,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                             group.k_slot,
                             group.v_slot,
                             list(range(group.group_heads)),
-                            int(group.seq_len),
+                            int(window),
                             local_query,
                         )
                     ]
@@ -1245,10 +1268,12 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
             self.cpu_fast_path_request_ids.add(str(request_id))
             self.pim_perf_guard_forced_request_count += 1
         else:
+            resident_initial_kv, logical_context_len = self._resident_initial_kv_for_attention(initial_kv)
             self.request_states[request_id] = self._build_request_state(
                 request_id,
-                initial_kv,
+                resident_initial_kv,
                 decode_reserve_tokens,
+                logical_context_len=logical_context_len,
             )
         return seq_len
 
@@ -1258,7 +1283,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         request_state = self.request_states.get(request_id)
         if request_state is None:
             raise KeyError(f"Unknown request {request_id}")
-        return int(request_state.context_len)
+        return int(request_state.logical_context_len or request_state.context_len)
 
     def free_request(self, request_id: str) -> None:
         self.cpu_fast_path_request_ids.discard(str(request_id))

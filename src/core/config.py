@@ -25,6 +25,7 @@ class ClusterConfig(BaseModel):
     decode_dense_gpu_fraction: float = 1.0
     attention_gpu_fraction: float = 0.0
     attention_backend: str = "cpu"
+    attention_sparse_window: int = 0
     pim_num_dpus: int = 4
     pim_resident_store_backend: str = "host"
     pim_qk_full_enabled: bool = False

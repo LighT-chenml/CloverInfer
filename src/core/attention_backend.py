@@ -60,6 +60,7 @@ class RequestState:
     stripe_expand_count: int = 0
     last_stripe_update_reason: str = ""
     last_stripe_width: int = 0
+    logical_context_len: int = 0
 
 
 class CpuAttentionBackend:
@@ -69,10 +70,23 @@ class CpuAttentionBackend:
     apply another 1/sqrt(head_dim) factor.
     """
 
-    def __init__(self):
+    def __init__(self, attention_sparse_window: int = 0):
+        self.attention_sparse_window = max(0, int(attention_sparse_window))
         self.k_cache: Dict[str, List[torch.Tensor]] = {}
         self.v_cache: Dict[str, List[torch.Tensor]] = {}
         self.context_lens: Dict[str, int] = {}
+
+    def _attention_window_for_seq_len(self, seq_len: int) -> int:
+        seq_len = max(0, int(seq_len))
+        if self.attention_sparse_window <= 0:
+            return seq_len
+        return min(seq_len, int(self.attention_sparse_window))
+
+    def _tail_tensor_for_window(self, tensor: torch.Tensor, window: int) -> torch.Tensor:
+        window = max(0, min(int(window), int(tensor.shape[0])))
+        if window >= int(tensor.shape[0]):
+            return tensor
+        return tensor[-window:] if window > 0 else tensor[:0]
 
     def init_request(
         self,
@@ -126,6 +140,9 @@ class CpuAttentionBackend:
 
         keys = self.k_cache[request_id][layer_idx]
         values = self.v_cache[request_id][layer_idx]
+        attention_window = self._attention_window_for_seq_len(int(keys.shape[0]))
+        keys = self._tail_tensor_for_window(keys, attention_window)
+        values = self._tail_tensor_for_window(values, attention_window)
 
         # q: [heads, dim], keys/values: [seq, heads, dim]
         scores = torch.einsum("hd,lhd->hl", q.float(), keys.float()) * float(score_scale)
@@ -167,10 +184,10 @@ class GpuAttentionBackend(CpuAttentionBackend):
     machine.
     """
 
-    def __init__(self):
+    def __init__(self, attention_sparse_window: int = 0):
         if not torch.cuda.is_available():
             raise RuntimeError("GpuAttentionBackend requires CUDA, but no GPU is available")
-        super().__init__()
+        super().__init__(attention_sparse_window=attention_sparse_window)
         self.device = torch.device("cuda")
 
     def init_request(
@@ -225,6 +242,9 @@ class GpuAttentionBackend(CpuAttentionBackend):
 
         keys = self.k_cache[request_id][layer_idx]
         values = self.v_cache[request_id][layer_idx]
+        attention_window = self._attention_window_for_seq_len(int(keys.shape[0]))
+        keys = self._tail_tensor_for_window(keys, attention_window)
+        values = self._tail_tensor_for_window(values, attention_window)
         scores = torch.einsum("hd,lhd->hl", q.float(), keys.float()) * float(score_scale)
         weights = torch.softmax(scores, dim=-1)
         context = torch.einsum("hl,lhd->hd", weights, values.float()).to(query.dtype)
@@ -269,11 +289,13 @@ class PimNaiveAttentionBackend:
         host_partial_reduce_enabled: bool = True,
         compact_short_segments_enabled: bool = False,
         compact_short_segment_min_tokens: int = 16,
+        attention_sparse_window: int = 0,
     ):
         self.repo_root = repo_root or os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         self.num_dpus = num_dpus
         self.length = length
         self.block_tokens = max(1, int(block_tokens))
+        self.attention_sparse_window = max(0, int(attention_sparse_window))
         self.resident_store_backend = resident_store_backend
         self.max_resident_groups_per_layer = max(0, int(max_resident_groups_per_layer))
         self.head_grouping_policy = "balanced" if str(head_grouping_policy) == "auto" else str(head_grouping_policy)
@@ -287,7 +309,7 @@ class PimNaiveAttentionBackend:
             raise ValueError(f"Unsupported dpu_placement_policy: {self.dpu_placement_policy}")
         if self.resident_kv_dtype not in {"fp32", "fp16", "int8"}:
             raise ValueError(f"Unsupported resident_kv_dtype: {self.resident_kv_dtype}")
-        self.cpu_backend = CpuAttentionBackend()
+        self.cpu_backend = CpuAttentionBackend(attention_sparse_window=self.attention_sparse_window)
         self.smoke_test_ok = False
         self.smoke_test_output = ""
         self.qk_check_count = 0
@@ -360,6 +382,72 @@ class PimNaiveAttentionBackend:
         self.init_rank_last_reason = ""
         self._run_dot_smoke_test()
 
+    def _attention_window_for_seq_len(self, seq_len: int) -> int:
+        seq_len = max(0, int(seq_len))
+        if self.attention_sparse_window <= 0:
+            return seq_len
+        return min(seq_len, int(self.attention_sparse_window))
+
+    def _tail_tensor_for_window(self, tensor: torch.Tensor | None, window: int) -> torch.Tensor | None:
+        if tensor is None:
+            return None
+        window = max(0, min(int(window), int(tensor.shape[0])))
+        if window >= int(tensor.shape[0]):
+            return tensor
+        return tensor[-window:] if window > 0 else tensor[:0]
+
+    def _record_seq_len_after_append(
+        self,
+        request_state: RequestState,
+        layer_idx: int,
+        keys: torch.Tensor | None = None,
+    ) -> int:
+        if keys is not None:
+            return int(keys.shape[0])
+        layer_state = request_state.layer_states[int(layer_idx)]
+        if not layer_state.head_groups:
+            return 0
+        return max(int(group.seq_len) for group in layer_state.head_groups)
+
+    def _set_record_attention_kv(
+        self,
+        record: Dict[str, object],
+        keys: torch.Tensor | None,
+        values: torch.Tensor | None,
+    ) -> None:
+        window = int(record.get("attention_window", 0))
+        record["keys"] = self._tail_tensor_for_window(keys, window)
+        record["values"] = self._tail_tensor_for_window(values, window)
+
+    def _resident_initial_kv_for_attention(
+        self,
+        initial_kv: List[Dict[str, torch.Tensor]],
+    ) -> tuple[List[Dict[str, torch.Tensor]], int]:
+        if not initial_kv:
+            raise ValueError("initial_kv must contain at least one layer")
+
+        logical_context_len = int(initial_kv[0]["key"].shape[0])
+        active_window = self._attention_window_for_seq_len(logical_context_len)
+        if active_window >= logical_context_len:
+            return (initial_kv, logical_context_len)
+
+        resident_kv: List[Dict[str, torch.Tensor]] = []
+        for layer_idx, layer in enumerate(initial_kv):
+            layer_key = layer["key"].detach().cpu().contiguous()
+            layer_value = layer["value"].detach().cpu().contiguous()
+            if int(layer_key.shape[0]) != logical_context_len:
+                raise ValueError(
+                    f"inconsistent initial KV seq_len for layer {layer_idx}: "
+                    f"got={int(layer_key.shape[0])}, expected={logical_context_len}"
+                )
+            resident_kv.append(
+                {
+                    "key": self._tail_tensor_for_window(layer_key, active_window).contiguous(),
+                    "value": self._tail_tensor_for_window(layer_value, active_window).contiguous(),
+                }
+            )
+        return (resident_kv, logical_context_len)
+
     def _shares_persistent_dpu_owner(self) -> bool:
         return isinstance(self.resident_store, UpmemKVSlotStore)
 
@@ -417,6 +505,7 @@ class PimNaiveAttentionBackend:
         return {
             "request_id": request_state.request_id,
             "context_len": int(request_state.context_len),
+            "logical_context_len": int(request_state.logical_context_len or request_state.context_len),
             "num_layers": int(request_state.num_layers),
             "preferred_dpu_stripe": [int(physical_dpu) for physical_dpu in request_state.preferred_dpu_stripe],
             "stripe_width": len(request_state.preferred_dpu_stripe),
@@ -543,6 +632,7 @@ class PimNaiveAttentionBackend:
             )
         hint = {
             "context_len": int(request_state.context_len),
+            "logical_context_len": int(request_state.logical_context_len or request_state.context_len),
             "preferred_dpu_stripe": stripe,
             "stripe_width": len(stripe),
             "rank_index": None if rank_index is None else int(rank_index),
@@ -1730,6 +1820,7 @@ class PimNaiveAttentionBackend:
         request_id: str,
         initial_kv: List[Dict[str, torch.Tensor]],
         decode_reserve_tokens: int = 0,
+        logical_context_len: int | None = None,
     ) -> RequestState:
         layer_states = []
         if not initial_kv:
@@ -1743,6 +1834,7 @@ class PimNaiveAttentionBackend:
             )
 
         context_len = int(first_layer_key.shape[0])
+        logical_len = int(context_len if logical_context_len is None else logical_context_len)
         sharding_plan = plan_sharding(
             [{"request_id": str(request_id), "seq_len": int(context_len)}],
             D=max(1, int(self.num_dpus)),
@@ -1796,6 +1888,7 @@ class PimNaiveAttentionBackend:
             stripe_expand_count=0,
             last_stripe_update_reason="init",
             last_stripe_width=len(preferred_dpu_stripe),
+            logical_context_len=logical_len,
         )
 
     def _append_resident_kv(
@@ -1872,6 +1965,9 @@ class PimNaiveAttentionBackend:
             self.resident_append_ops += 1
 
         if layer_idx == request_state.num_layers - 1:
+            if int(request_state.logical_context_len) <= 0:
+                request_state.logical_context_len = int(request_state.context_len)
+            request_state.logical_context_len = int(request_state.logical_context_len) + 1
             request_state.context_len = expected_seq_len
 
     def _materialize_layer_kv(self, request_state: RequestState, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1916,6 +2012,15 @@ class PimNaiveAttentionBackend:
     ) -> None:
         cpu_keys = self.cpu_backend.k_cache[request_id][layer_idx]
         cpu_values = self.cpu_backend.v_cache[request_id][layer_idx]
+        active_len = int(resident_keys.shape[0])
+        cpu_keys = self._tail_tensor_for_window(cpu_keys, active_len)
+        cpu_values = self._tail_tensor_for_window(cpu_values, active_len)
+        if tuple(cpu_keys.shape) != tuple(resident_keys.shape) or tuple(cpu_values.shape) != tuple(resident_values.shape):
+            raise RuntimeError(
+                f"resident shadow shape mismatch for request={request_id} layer={layer_idx}: "
+                f"resident_keys={tuple(resident_keys.shape)} cpu_keys={tuple(cpu_keys.shape)} "
+                f"resident_values={tuple(resident_values.shape)} cpu_values={tuple(cpu_values.shape)}"
+            )
         key_diff = float(torch.max(torch.abs(resident_keys.float() - cpu_keys.float())).item())
         value_diff = float(torch.max(torch.abs(resident_values.float() - cpu_values.float())).item())
         self.resident_shadow_max_abs_diff = max(self.resident_shadow_max_abs_diff, key_diff, value_diff)
@@ -2139,10 +2244,12 @@ class PimNaiveAttentionBackend:
         decode_reserve_tokens: int = 0,
     ) -> int:
         seq_len = self.cpu_backend.init_request(request_id, initial_kv)
+        resident_initial_kv, logical_context_len = self._resident_initial_kv_for_attention(initial_kv)
         self.request_states[request_id] = self._build_request_state(
             request_id,
-            initial_kv,
+            resident_initial_kv,
             decode_reserve_tokens,
+            logical_context_len=logical_context_len,
         )
         return seq_len
 
@@ -2207,28 +2314,37 @@ class PimNaiveAttentionBackend:
             keys = self.cpu_backend.k_cache[request_id][layer_idx]
             values = self.cpu_backend.v_cache[request_id][layer_idx]
 
+        seq_len_after_append = self._record_seq_len_after_append(request_state, layer_idx, keys)
+        attention_window = self._attention_window_for_seq_len(seq_len_after_append)
         q_fp32 = q if q.dtype == torch.float32 and q.is_contiguous() else q.to(torch.float32).contiguous()
-        scores = None
-        if not (self.resident_compute_enabled and self.qk_full_enabled):
-            scores = torch.einsum("hd,lhd->hl", q_fp32, keys.float()) * score_scale
-        return {
+        record = {
             "request_id": request_id,
             "request_state": request_state,
             "layer_idx": layer_idx,
             "query_dtype": q.dtype,
             "q_fp32": q_fp32,
-            "keys": keys,
-            "values": values,
-            "scores": scores,
+            "keys": None,
+            "values": None,
+            "scores": None,
             "score_scale": score_scale,
             "use_resident_av": use_resident_av,
+            "seq_len_after_append": int(seq_len_after_append),
+            "attention_window": int(attention_window),
         }
+        self._set_record_attention_kv(record, keys, values)
+        if not (self.resident_compute_enabled and self.qk_full_enabled):
+            record["scores"] = torch.einsum("hd,lhd->hl", q_fp32, record["keys"].float()) * score_scale
+        return record
 
     def _compute_host_scores(self, record: Dict[str, object]) -> torch.Tensor:
+        keys = record.get("keys")
+        if keys is None:
+            full_keys = self.cpu_backend.k_cache[record["request_id"]][record["layer_idx"]]
+            keys = self._tail_tensor_for_window(full_keys, int(record.get("attention_window", full_keys.shape[0])))
         return torch.einsum(
             "hd,lhd->hl",
             record["q_fp32"],
-            self.cpu_backend.k_cache[record["request_id"]][record["layer_idx"]].float(),
+            keys.float(),
         ) * float(record["score_scale"])
 
     def _finalize_ready_context_records(self, records: List[Dict[str, object]]) -> List[torch.Tensor]:
@@ -2251,12 +2367,13 @@ class PimNaiveAttentionBackend:
             layer_state = record["request_state"].layer_states[record["layer_idx"]]
             record["full_qk_group_scores"] = []
             for group in layer_state.head_groups:
+                window = min(int(group.seq_len), int(record["attention_window"]))
                 flat_slot_queries.append(
                     (
                         group.k_slot,
                         group.v_slot,
                         list(range(group.group_heads)),
-                        int(group.seq_len),
+                        int(window),
                         record["q_fp32"][group.head_start:group.head_end].contiguous(),
                     )
                 )
@@ -2298,12 +2415,13 @@ class PimNaiveAttentionBackend:
             record["fused_group_contexts"] = []
             for group in layer_state.head_groups:
                 local_head_indices = list(range(group.group_heads))
+                window = min(int(group.seq_len), int(record["attention_window"]))
                 flat_slot_queries.append(
                     (
                         group.k_slot,
                         group.v_slot,
                         local_head_indices,
-                        int(group.seq_len),
+                        int(window),
                         record["q_fp32"][group.head_start:group.head_end].contiguous(),
                         float(record["score_scale"]),
                     )
@@ -2396,7 +2514,7 @@ class PimNaiveAttentionBackend:
 
             total_mixed_heads += mixed_heads
             layer_state = record["request_state"].layer_states[record["layer_idx"]]
-            window = min(self.qk_mixed_window, int(keys.shape[0]))
+            window = min(self.qk_mixed_window, int(record["attention_window"]), int(keys.shape[0]))
             grouped_slot_queries: Dict[tuple[str, str], Dict[str, object]] = {}
             head_to_slot_row: list[tuple[tuple[str, str], int]] = []
             for head in range(mixed_heads):
@@ -2632,6 +2750,7 @@ class PimNaiveAttentionBackend:
                     {
                         "request_id": request_state.request_id,
                         "context_len": int(request_state.context_len),
+                        "logical_context_len": int(request_state.logical_context_len or request_state.context_len),
                         "num_layers": int(request_state.num_layers),
                         "preferred_dpu_stripe": [int(physical_dpu) for physical_dpu in request_state.preferred_dpu_stripe],
                         "stripe_width": len(request_state.preferred_dpu_stripe),
@@ -2658,6 +2777,7 @@ class PimNaiveAttentionBackend:
             "num_dpus": self.num_dpus,
             "length": self.length,
             "block_tokens": self.block_tokens,
+            "attention_sparse_window": self.attention_sparse_window,
             "smoke_test_output": self.smoke_test_output,
             "qk_check_interval": self.qk_check_interval,
             "qk_check_limit": self.qk_check_limit,
