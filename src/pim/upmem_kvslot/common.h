@@ -57,7 +57,7 @@ typedef struct {
     uint32_t dtype_code;
     float k_scale;
     float v_scale;
-    uint32_t reserved;
+    uint32_t v_dtype_code;
 } kvslot_slot_args_t;
 
 typedef struct {
@@ -80,9 +80,10 @@ typedef struct {
     uint32_t head_dim;
     uint32_t dtype_code;
     uint32_t elem_offset;
+    uint32_t v_elem_offset;
     float k_scale;
     float v_scale;
-    uint32_t reserved;
+    uint32_t v_dtype_code;
 } kvslot_runtime_slot_args_t;
 
 typedef struct {

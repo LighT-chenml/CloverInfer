@@ -19,6 +19,49 @@ import torch
 _HOST_REDUCTION_MODULE = None
 _HOST_REDUCTION_IMPORT_ATTEMPTED = False
 
+KVSLOT_DTYPE_FP32 = 0
+KVSLOT_DTYPE_FP16 = 1
+KVSLOT_DTYPE_INT8 = 2
+MIXED_INT8_FP16_KV_DTYPE = "mixed_int8_fp16"
+SUPPORTED_RESIDENT_KV_DTYPES = {"fp32", "fp16", "int8", MIXED_INT8_FP16_KV_DTYPE}
+
+
+def normalize_resident_kv_dtype(value: str) -> str:
+    normalized = str(value).strip().lower().replace("-", "_")
+    if normalized in {"int8_fp16", "k_int8_v_fp16", "int8k_fp16v"}:
+        return MIXED_INT8_FP16_KV_DTYPE
+    return normalized
+
+
+def resident_kv_dtype_code(kv_dtype: str, part: str = "k") -> int:
+    normalized = normalize_resident_kv_dtype(kv_dtype)
+    if normalized == MIXED_INT8_FP16_KV_DTYPE:
+        return KVSLOT_DTYPE_INT8 if str(part).lower().startswith("k") else KVSLOT_DTYPE_FP16
+    if normalized == "int8":
+        return KVSLOT_DTYPE_INT8
+    if normalized == "fp16":
+        return KVSLOT_DTYPE_FP16
+    return KVSLOT_DTYPE_FP32
+
+
+def kvslot_dtype_elem_bytes(dtype_code: int) -> int:
+    if int(dtype_code) == KVSLOT_DTYPE_INT8:
+        return 1
+    if int(dtype_code) == KVSLOT_DTYPE_FP16:
+        return 2
+    return 4
+
+
+def kvslot_packed_word_count(logical_elems: int, dtype_code: int) -> int:
+    elems = max(1, int(logical_elems))
+    if int(dtype_code) == KVSLOT_DTYPE_INT8:
+        words = (elems + 3) // 4
+    elif int(dtype_code) == KVSLOT_DTYPE_FP16:
+        words = (elems + 1) // 2
+    else:
+        words = elems
+    return (words + 1) & ~1
+
 
 def _load_host_reduction_module():
     global _HOST_REDUCTION_MODULE
@@ -401,7 +444,7 @@ class _KVSlotHelperClient:
         self.binary_path = binary_path
         self.num_dpus = num_dpus
         self.cwd = cwd
-        self.kv_dtype = str(kv_dtype)
+        self.kv_dtype = normalize_resident_kv_dtype(kv_dtype)
         self.proc: subprocess.Popen | None = None
         self.restarts = 0
         self.persistent_state_active = False
@@ -465,14 +508,16 @@ class _KVSlotHelperClient:
                 pass
 
     def _dtype_code(self) -> int:
-        if self.kv_dtype == "int8":
-            return 2
-        return 1 if self.kv_dtype == "fp16" else 0
+        return resident_kv_dtype_code(self.kv_dtype, "k")
+
+    def _v_dtype_code(self) -> int:
+        return resident_kv_dtype_code(self.kv_dtype, "v")
 
     def _elem_bytes(self) -> int:
-        if self.kv_dtype == "int8":
-            return 1
-        return 2 if self.kv_dtype == "fp16" else 4
+        return kvslot_dtype_elem_bytes(self._dtype_code())
+
+    def _v_elem_bytes(self) -> int:
+        return kvslot_dtype_elem_bytes(self._v_dtype_code())
 
     def _slot_arg_scales(
         self,
@@ -504,7 +549,7 @@ class _KVSlotHelperClient:
             int(self._dtype_code()),
             float(k_scale),
             float(v_scale),
-            0,
+            int(self._v_dtype_code()),
         )
 
     def _read_slot_args(self) -> tuple[int, int, int, int, int, float, float, int]:
@@ -566,8 +611,10 @@ class _KVSlotHelperClient:
             "seq_len": int(out[1]),
             "group_heads": int(out[2]),
             "head_dim": int(out[3]),
+            "dtype_code": int(out[4]),
             "k_scale": float(out[5]),
             "v_scale": float(out[6]),
+            "v_dtype_code": int(out[7]),
         }
 
     def append_group(
@@ -591,8 +638,10 @@ class _KVSlotHelperClient:
             "seq_len": int(out[1]),
             "group_heads": int(out[2]),
             "head_dim": int(out[3]),
+            "dtype_code": int(out[4]),
             "k_scale": float(out[5]),
             "v_scale": float(out[6]),
+            "v_dtype_code": int(out[7]),
         }
 
     def materialize_group(self, slot_id: int) -> tuple[torch.Tensor, torch.Tensor, Dict[str, int]]:
@@ -600,31 +649,40 @@ class _KVSlotHelperClient:
         self._write(header)
         out = self._read_slot_args()
         capacity, seq_len, group_heads, head_dim = (int(item) for item in out[:4])
+        k_dtype_code = int(out[4])
+        v_dtype_code = int(out[7])
         elems = seq_len * group_heads * head_dim
-        elem_bytes = self._elem_bytes()
+        k_elem_bytes = kvslot_dtype_elem_bytes(k_dtype_code)
+        v_elem_bytes = kvslot_dtype_elem_bytes(v_dtype_code)
         if elems == 0:
-            dtype = torch.int8 if elem_bytes == 1 else (torch.int16 if elem_bytes == 2 else torch.int32)
-            k = torch.empty((0, group_heads, head_dim), dtype=dtype)
-            v = torch.empty((0, group_heads, head_dim), dtype=dtype)
+            k_dtype = torch.int8 if k_elem_bytes == 1 else (torch.int16 if k_elem_bytes == 2 else torch.int32)
+            v_dtype = torch.int8 if v_elem_bytes == 1 else (torch.int16 if v_elem_bytes == 2 else torch.int32)
+            k = torch.empty((0, group_heads, head_dim), dtype=k_dtype)
+            v = torch.empty((0, group_heads, head_dim), dtype=v_dtype)
         else:
-            k_bytes = self._read_exact(elems * elem_bytes)
-            v_bytes = self._read_exact(elems * elem_bytes)
-            if elem_bytes == 1:
+            k_bytes = self._read_exact(elems * k_elem_bytes)
+            v_bytes = self._read_exact(elems * v_elem_bytes)
+            if k_elem_bytes == 1:
                 k = torch.from_numpy(np.frombuffer(k_bytes, dtype=np.int8).copy()).view(seq_len, group_heads, head_dim)
-                v = torch.from_numpy(np.frombuffer(v_bytes, dtype=np.int8).copy()).view(seq_len, group_heads, head_dim)
-            elif elem_bytes == 2:
+            elif k_elem_bytes == 2:
                 k = torch.tensor(struct.unpack(f"<{elems}h", k_bytes), dtype=torch.int16).view(seq_len, group_heads, head_dim)
-                v = torch.tensor(struct.unpack(f"<{elems}h", v_bytes), dtype=torch.int16).view(seq_len, group_heads, head_dim)
             else:
                 k = torch.tensor(struct.unpack(f"<{elems}i", k_bytes), dtype=torch.int32).view(seq_len, group_heads, head_dim)
+            if v_elem_bytes == 1:
+                v = torch.from_numpy(np.frombuffer(v_bytes, dtype=np.int8).copy()).view(seq_len, group_heads, head_dim)
+            elif v_elem_bytes == 2:
+                v = torch.tensor(struct.unpack(f"<{elems}h", v_bytes), dtype=torch.int16).view(seq_len, group_heads, head_dim)
+            else:
                 v = torch.tensor(struct.unpack(f"<{elems}i", v_bytes), dtype=torch.int32).view(seq_len, group_heads, head_dim)
         return k, v, {
             "capacity": capacity,
             "seq_len": seq_len,
             "group_heads": group_heads,
             "head_dim": head_dim,
+            "dtype_code": k_dtype_code,
             "k_scale": float(out[5]),
             "v_scale": float(out[6]),
+            "v_dtype_code": v_dtype_code,
         }
 
     def free_group(self, slot_id: int) -> None:
@@ -1721,7 +1779,7 @@ class UpmemKVSlotStore(ResidentKVStore):
     ):
         self.repo_root = repo_root
         self.num_dpus = num_dpus
-        self.kv_dtype = str(kv_dtype)
+        self.kv_dtype = normalize_resident_kv_dtype(kv_dtype)
         self.block_tokens = max(1, int(block_tokens))
         # Decode-time growth blocks should stay small enough to react to
         # stripe expansion, but not so small that one logical request turns
@@ -1730,7 +1788,7 @@ class UpmemKVSlotStore(ResidentKVStore):
         self.base_block_rollover_tokens = max(32, min(self.block_tokens, 160))
         self.placement_policy = str(placement_policy)
         self.host_partial_reduce_enabled = bool(host_partial_reduce_enabled)
-        if self.kv_dtype not in {"fp32", "fp16", "int8"}:
+        if self.kv_dtype not in SUPPORTED_RESIDENT_KV_DTYPES:
             raise ValueError(f"Unsupported resident kv dtype: {self.kv_dtype}")
         kvslot_dir, helper_binary_path = _resolve_kvslot_helper_paths(repo_root)
         self.helper = _KVSlotHelperClient(
@@ -2541,12 +2599,20 @@ class UpmemKVSlotStore(ResidentKVStore):
         )
 
     def _encode_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
-        if self.kv_dtype == "int8":
-            encoded, _ = self._encode_tensor_int8(tensor)
-            return encoded
-        if self.kv_dtype == "fp16":
-            return tensor.detach().cpu().to(torch.float16).contiguous().view(torch.int16)
-        return tensor.detach().cpu().float().contiguous().view(torch.int32)
+        return self._encode_tensor_for_dtype(tensor, resident_kv_dtype_code(self.kv_dtype, "k"))[0]
+
+    def _encode_tensor_for_dtype(
+        self,
+        tensor: torch.Tensor,
+        dtype_code: int,
+        *,
+        scale: float | None = None,
+    ) -> tuple[torch.Tensor, float]:
+        if int(dtype_code) == KVSLOT_DTYPE_INT8:
+            return self._encode_tensor_int8(tensor, scale=scale)
+        if int(dtype_code) == KVSLOT_DTYPE_FP16:
+            return tensor.detach().cpu().to(torch.float16).contiguous().view(torch.int16), 1.0
+        return tensor.detach().cpu().float().contiguous().view(torch.int32), 1.0
 
     def _encode_tensor_int8(
         self,
@@ -2572,13 +2638,17 @@ class UpmemKVSlotStore(ResidentKVStore):
         k_scale: float | None = None,
         v_scale: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, float, float]:
-        if self.kv_dtype == "int8":
-            encoded_k, resolved_k_scale = self._encode_tensor_int8(k_tensor, scale=k_scale)
-            encoded_v, resolved_v_scale = self._encode_tensor_int8(v_tensor, scale=v_scale)
-            return encoded_k, encoded_v, resolved_k_scale, resolved_v_scale
-        encoded_k = self._encode_tensor(k_tensor)
-        encoded_v = self._encode_tensor(v_tensor)
-        return encoded_k, encoded_v, 1.0, 1.0
+        encoded_k, resolved_k_scale = self._encode_tensor_for_dtype(
+            k_tensor,
+            resident_kv_dtype_code(self.kv_dtype, "k"),
+            scale=k_scale,
+        )
+        encoded_v, resolved_v_scale = self._encode_tensor_for_dtype(
+            v_tensor,
+            resident_kv_dtype_code(self.kv_dtype, "v"),
+            scale=v_scale,
+        )
+        return encoded_k, encoded_v, resolved_k_scale, resolved_v_scale
 
     def _decode_tensor(
         self,
@@ -2586,21 +2656,30 @@ class UpmemKVSlotStore(ResidentKVStore):
         *,
         scale: float | None = None,
     ) -> torch.Tensor:
-        if self.kv_dtype == "int8":
+        return self._decode_tensor_for_dtype(
+            tensor,
+            resident_kv_dtype_code(self.kv_dtype, "k"),
+            scale=scale,
+        )
+
+    def _decode_tensor_for_dtype(
+        self,
+        tensor: torch.Tensor,
+        dtype_code: int,
+        *,
+        scale: float | None = None,
+    ) -> torch.Tensor:
+        if int(dtype_code) == KVSLOT_DTYPE_INT8:
             return (tensor.to(torch.float32) * float(1.0 if scale is None else scale)).contiguous()
-        if self.kv_dtype == "fp16":
+        if int(dtype_code) == KVSLOT_DTYPE_FP16:
             return tensor.view(torch.float16).to(torch.float32).contiguous()
         return tensor.view(torch.float32).contiguous()
 
     def _slot_elem_count(self, capacity: int, group_heads: int, head_dim: int) -> int:
         elem_count = int(capacity) * int(group_heads) * int(head_dim)
-        if self.kv_dtype == "int8":
-            packed_words = max(1, (elem_count + 3) // 4)
-            return (packed_words + 1) & ~1
-        if self.kv_dtype == "fp16":
-            packed_words = max(1, (elem_count + 1) // 2)
-            return (packed_words + 1) & ~1
-        return (max(1, elem_count) + 1) & ~1
+        k_words = kvslot_packed_word_count(elem_count, resident_kv_dtype_code(self.kv_dtype, "k"))
+        v_words = kvslot_packed_word_count(elem_count, resident_kv_dtype_code(self.kv_dtype, "v"))
+        return max(k_words, v_words)
 
     def _build_block_layout(self, capacity: int, seq_len: int) -> list[tuple[int, int]]:
         remaining_capacity = int(capacity)
@@ -3371,8 +3450,16 @@ class UpmemKVSlotStore(ResidentKVStore):
                     append_offset += take_len
 
                 if tail_take_len > 0 and tail_block is not None:
-                    tail_k_scale = float(tail_block.get("k_scale", 1.0)) if self.kv_dtype == "int8" else None
-                    tail_v_scale = float(tail_block.get("v_scale", 1.0)) if self.kv_dtype == "int8" else None
+                    tail_k_scale = (
+                        float(tail_block.get("k_scale", 1.0))
+                        if resident_kv_dtype_code(self.kv_dtype, "k") == KVSLOT_DTYPE_INT8
+                        else None
+                    )
+                    tail_v_scale = (
+                        float(tail_block.get("v_scale", 1.0))
+                        if resident_kv_dtype_code(self.kv_dtype, "v") == KVSLOT_DTYPE_INT8
+                        else None
+                    )
                     encoded_k, encoded_v, k_scale, v_scale = self._encode_kv_pair(
                         k_new[:tail_take_len].contiguous(),
                         v_new[:tail_take_len].contiguous(),
@@ -3412,8 +3499,16 @@ class UpmemKVSlotStore(ResidentKVStore):
             self._record_timing("append_group", started_at)
             return out
         if slot_info["backend"] == "dpu":
-            slot_k_scale = float(slot_info.get("k_scale", 1.0)) if self.kv_dtype == "int8" else None
-            slot_v_scale = float(slot_info.get("v_scale", 1.0)) if self.kv_dtype == "int8" else None
+            slot_k_scale = (
+                float(slot_info.get("k_scale", 1.0))
+                if resident_kv_dtype_code(self.kv_dtype, "k") == KVSLOT_DTYPE_INT8
+                else None
+            )
+            slot_v_scale = (
+                float(slot_info.get("v_scale", 1.0))
+                if resident_kv_dtype_code(self.kv_dtype, "v") == KVSLOT_DTYPE_INT8
+                else None
+            )
             encoded_k, encoded_v, k_scale, v_scale = self._encode_kv_pair(
                 k_new,
                 v_new,
@@ -3455,8 +3550,16 @@ class UpmemKVSlotStore(ResidentKVStore):
                 block["capacity"] = int(info["capacity"])
                 materialized_blocks.append(
                     (
-                        self._decode_tensor(k, scale=float(info.get("k_scale", 1.0))),
-                        self._decode_tensor(v, scale=float(info.get("v_scale", 1.0))),
+                        self._decode_tensor_for_dtype(
+                            k,
+                            int(info.get("dtype_code", resident_kv_dtype_code(self.kv_dtype, "k"))),
+                            scale=float(info.get("k_scale", 1.0)),
+                        ),
+                        self._decode_tensor_for_dtype(
+                            v,
+                            int(info.get("v_dtype_code", resident_kv_dtype_code(self.kv_dtype, "v"))),
+                            scale=float(info.get("v_scale", 1.0)),
+                        ),
                     )
                 )
             out = (
@@ -3470,8 +3573,16 @@ class UpmemKVSlotStore(ResidentKVStore):
             slot_info["seq_len"] = int(info["seq_len"])
             slot_info["capacity"] = int(info["capacity"])
             out = (
-                self._decode_tensor(k, scale=float(info.get("k_scale", 1.0))),
-                self._decode_tensor(v, scale=float(info.get("v_scale", 1.0))),
+                self._decode_tensor_for_dtype(
+                    k,
+                    int(info.get("dtype_code", resident_kv_dtype_code(self.kv_dtype, "k"))),
+                    scale=float(info.get("k_scale", 1.0)),
+                ),
+                self._decode_tensor_for_dtype(
+                    v,
+                    int(info.get("v_dtype_code", resident_kv_dtype_code(self.kv_dtype, "v"))),
+                    scale=float(info.get("v_scale", 1.0)),
+                ),
             )
             self._record_timing("materialize_group", started_at)
             return out
@@ -3755,7 +3866,11 @@ class UpmemKVSlotStore(ResidentKVStore):
         slot_info["capacity"] = int(info["capacity"])
         slot_info["k_scale"] = float(info.get("k_scale", slot_info.get("k_scale", 1.0)))
         slot_info["v_scale"] = float(info.get("v_scale", slot_info.get("v_scale", 1.0)))
-        decoded_values = self._decode_tensor(values, scale=float(info.get("v_scale", 1.0)))
+        decoded_values = self._decode_tensor_for_dtype(
+            values,
+            int(info.get("v_dtype_code", resident_kv_dtype_code(self.kv_dtype, "v"))),
+            scale=float(info.get("v_scale", 1.0)),
+        )
         w = weights.detach().cpu().to(torch.float32).contiguous()
         if w.dim() != 2 or int(w.shape[0]) != int(decoded_values.shape[1]) or int(w.shape[1]) > int(decoded_values.shape[0]):
             raise ValueError(

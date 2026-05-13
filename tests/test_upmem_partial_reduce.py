@@ -95,6 +95,46 @@ def test_partial_reduce_helper_matches_legacy_merge():
         assert torch.allclose(merged[logical_idx], reference[logical_idx], atol=1e-5, rtol=1e-5)
 
 
+def test_partial_reduce_python_fallback_merges_unnormalized_numerators():
+    store = object.__new__(UpmemKVSlotStore)
+    entries = [
+        {
+            "logical_idx": 0,
+            "payload": (10, [0, 1], 3, torch.ones(2, 4), 0.5),
+        },
+        {
+            "logical_idx": 0,
+            "payload": (11, [0, 1], 2, torch.ones(2, 4), 0.5),
+        },
+    ]
+    outputs = [
+        (
+            torch.tensor([[3.0, 6.0], [8.0, 2.0]], dtype=torch.float32),
+            torch.tensor([1.0, 2.0], dtype=torch.float32),
+            torch.tensor([1.5, 2.0], dtype=torch.float32),
+        ),
+        (
+            torch.tensor([[5.0, -1.0], [1.0, 7.0]], dtype=torch.float32),
+            torch.tensor([4.0, -1.0], dtype=torch.float32),
+            torch.tensor([1.25, 0.75], dtype=torch.float32),
+        ),
+    ]
+
+    old_module = resident_kv_store._HOST_REDUCTION_MODULE
+    old_attempted = resident_kv_store._HOST_REDUCTION_IMPORT_ATTEMPTED
+    resident_kv_store._HOST_REDUCTION_MODULE = None
+    resident_kv_store._HOST_REDUCTION_IMPORT_ATTEMPTED = True
+    try:
+        merged = UpmemKVSlotStore._merge_partial_contexts(store, entries, outputs)
+    finally:
+        resident_kv_store._HOST_REDUCTION_MODULE = old_module
+        resident_kv_store._HOST_REDUCTION_IMPORT_ATTEMPTED = old_attempted
+
+    reference = _merge_reference(entries, outputs)
+    assert sorted(merged.keys()) == [0]
+    assert torch.allclose(merged[0], reference[0], atol=1e-5, rtol=1e-5)
+
+
 def test_int8_kv_quantization_round_trips_with_scales_without_upmem():
     store = object.__new__(UpmemKVSlotStore)
     store.kv_dtype = "int8"
@@ -124,6 +164,46 @@ def test_int8_slot_elem_count_uses_packed_aligned_words_without_upmem():
     assert UpmemKVSlotStore._slot_elem_count(store, capacity=1, group_heads=1, head_dim=1) == 2
     assert UpmemKVSlotStore._slot_elem_count(store, capacity=1, group_heads=1, head_dim=8) == 2
     assert UpmemKVSlotStore._slot_elem_count(store, capacity=1, group_heads=1, head_dim=9) == 4
+
+
+def test_mixed_int8_fp16_kv_encodes_k_and_v_separately_without_upmem():
+    store = object.__new__(UpmemKVSlotStore)
+    store.kv_dtype = "mixed_int8_fp16"
+
+    keys = torch.tensor(
+        [[[0.0, 0.25, -0.5, 1.0], [1.5, -2.0, 0.75, -1.25]]],
+        dtype=torch.float32,
+    )
+    values = keys * 0.5
+
+    encoded_k, encoded_v, k_scale, v_scale = UpmemKVSlotStore._encode_kv_pair(store, keys, values)
+    assert encoded_k.dtype == torch.int8
+    assert encoded_v.dtype == torch.int16
+    assert k_scale > 0.0
+    assert v_scale == 1.0
+
+    decoded_k = UpmemKVSlotStore._decode_tensor_for_dtype(
+        store,
+        encoded_k,
+        resident_kv_store.KVSLOT_DTYPE_INT8,
+        scale=k_scale,
+    )
+    decoded_v = UpmemKVSlotStore._decode_tensor_for_dtype(
+        store,
+        encoded_v,
+        resident_kv_store.KVSLOT_DTYPE_FP16,
+        scale=v_scale,
+    )
+    assert torch.allclose(decoded_k, keys, atol=max(k_scale, 1e-6), rtol=0.0)
+    assert torch.allclose(decoded_v, values, atol=1e-3, rtol=1e-3)
+
+
+def test_mixed_int8_fp16_slot_elem_count_reserves_larger_kv_packing_without_upmem():
+    store = object.__new__(UpmemKVSlotStore)
+    store.kv_dtype = "mixed_int8_fp16"
+
+    assert UpmemKVSlotStore._slot_elem_count(store, capacity=1, group_heads=1, head_dim=8) == 4
+    assert UpmemKVSlotStore._slot_elem_count(store, capacity=1, group_heads=1, head_dim=9) == 6
 
 
 def test_partial_reduce_flag_can_be_toggled_without_helper():

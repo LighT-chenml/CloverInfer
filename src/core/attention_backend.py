@@ -11,7 +11,12 @@ from typing import Dict, List, Sequence, Tuple
 import torch
 
 from .clover_planner import plan_sharding
-from .resident_kv_store import HostResidentKVStore, UpmemKVSlotStore
+from .resident_kv_store import (
+    HostResidentKVStore,
+    SUPPORTED_RESIDENT_KV_DTYPES,
+    UpmemKVSlotStore,
+    normalize_resident_kv_dtype,
+)
 
 
 def _query_to_kv_head_indices(num_query_heads: int, num_kv_heads: int) -> torch.Tensor:
@@ -370,14 +375,14 @@ class PimNaiveAttentionBackend:
         self.max_resident_groups_per_layer = max(0, int(max_resident_groups_per_layer))
         self.head_grouping_policy = "balanced" if str(head_grouping_policy) == "auto" else str(head_grouping_policy)
         self.dpu_placement_policy = "rotated" if str(dpu_placement_policy) == "auto" else str(dpu_placement_policy)
-        self.resident_kv_dtype = str(resident_kv_dtype)
+        self.resident_kv_dtype = normalize_resident_kv_dtype(resident_kv_dtype)
         self.qk_check_interval = qk_check_interval
         self.qk_check_limit = qk_check_limit
         if self.head_grouping_policy not in {"legacy", "balanced", "coarse", "segment_aware"}:
             raise ValueError(f"Unsupported head_grouping_policy: {self.head_grouping_policy}")
         if self.dpu_placement_policy not in {"identity", "rotated", "rank_spread", "load_aware"}:
             raise ValueError(f"Unsupported dpu_placement_policy: {self.dpu_placement_policy}")
-        if self.resident_kv_dtype not in {"fp32", "fp16", "int8"}:
+        if self.resident_kv_dtype not in SUPPORTED_RESIDENT_KV_DTYPES:
             raise ValueError(f"Unsupported resident_kv_dtype: {self.resident_kv_dtype}")
         self.cpu_backend = CpuAttentionBackend(attention_sparse_window=self.attention_sparse_window)
         self.smoke_test_ok = False

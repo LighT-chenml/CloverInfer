@@ -6,6 +6,7 @@ from typing import Dict, List
 import torch
 
 from .attention_backend import PimNaiveAttentionBackend
+from .resident_kv_store import normalize_resident_kv_dtype
 
 
 class _NoopTimer:
@@ -161,7 +162,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
             self.pim_attention_enabled
             and self.pim_perf_guard_enabled
             and self.pim_perf_guard_force_cpu_for_compressed_kv
-            and str(self.resident_kv_dtype) in {"fp16", "int8"}
+            and normalize_resident_kv_dtype(self.resident_kv_dtype) != "fp32"
         ):
             self.pim_perf_guard_triggered = True
             self.pim_perf_guard_reason = (

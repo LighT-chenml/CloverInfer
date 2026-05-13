@@ -22,6 +22,7 @@ typedef struct {
     uint32_t group_heads;
     uint32_t head_dim;
     uint32_t dtype_code;
+    uint32_t v_dtype_code;
     float k_scale;
     float v_scale;
     uint32_t elem_offset;
@@ -450,7 +451,8 @@ static int av_items_round_compatible(const av_item_t *seed, const av_item_t *ite
     }
     if (item->runtime_args.group_heads != seed->runtime_args.group_heads
         || item->runtime_args.head_dim != seed->runtime_args.head_dim
-        || item->runtime_args.dtype_code != seed->runtime_args.dtype_code) {
+        || item->runtime_args.dtype_code != seed->runtime_args.dtype_code
+        || item->runtime_args.v_dtype_code != seed->runtime_args.v_dtype_code) {
         return 0;
     }
     if (item->padded_context_bytes != seed->padded_context_bytes) {
@@ -816,6 +818,7 @@ static int ensure_slot(host_slot_t *slot, uint32_t capacity, uint32_t group_head
     slot->group_heads = group_heads;
     slot->head_dim = head_dim;
     slot->dtype_code = KVSLOT_DTYPE_FP32;
+    slot->v_dtype_code = KVSLOT_DTYPE_FP32;
     slot->k_scale = 1.0f;
     slot->v_scale = 1.0f;
     return 0;
@@ -867,6 +870,14 @@ static int kvslot_dtype_supported(uint32_t dtype_code)
     return dtype_code == KVSLOT_DTYPE_FP32
         || dtype_code == KVSLOT_DTYPE_FP16
         || dtype_code == KVSLOT_DTYPE_INT8;
+}
+
+static uint32_t kvslot_normalize_v_dtype_code(uint32_t dtype_code, uint32_t v_dtype_code)
+{
+    if (v_dtype_code == 0u || v_dtype_code == 0xffffffffu) {
+        return dtype_code;
+    }
+    return v_dtype_code;
 }
 
 static float kvslot_sanitize_scale(float scale)
@@ -1203,16 +1214,21 @@ static int handle_allocate(kvslot_runner_t *runner, uint32_t slot_id)
     if (ensure_slot(slot, args.capacity, args.group_heads, args.head_dim) != 0) {
         return 1;
     }
-    if (!kvslot_dtype_supported(args.dtype_code)) {
-        fprintf(stderr, "Unsupported kvslot dtype_code=%u\n", args.dtype_code);
+    args.v_dtype_code = kvslot_normalize_v_dtype_code(args.dtype_code, args.v_dtype_code);
+    if (!kvslot_dtype_supported(args.dtype_code) || !kvslot_dtype_supported(args.v_dtype_code)) {
+        fprintf(stderr, "Unsupported kvslot dtype_code=%u v_dtype_code=%u\n", args.dtype_code, args.v_dtype_code);
         return 1;
     }
 
     size_t logical_elems = (size_t)args.seq_len * args.group_heads * args.head_dim;
-    size_t elem_size = kvslot_dtype_elem_size(args.dtype_code);
-    size_t bytes = logical_elems * elem_size;
+    size_t k_elem_size = kvslot_dtype_elem_size(args.dtype_code);
+    size_t v_elem_size = kvslot_dtype_elem_size(args.v_dtype_code);
+    size_t k_bytes = logical_elems * k_elem_size;
+    size_t v_bytes = logical_elems * v_elem_size;
     uint32_t slot_total_logical_elems = args.capacity * args.group_heads * args.head_dim;
-    uint32_t slot_total_elems = kvslot_packed_elem_count(slot_total_logical_elems, args.dtype_code);
+    uint32_t k_slot_total_elems = kvslot_packed_elem_count(slot_total_logical_elems, args.dtype_code);
+    uint32_t v_slot_total_elems = kvslot_packed_elem_count(slot_total_logical_elems, args.v_dtype_code);
+    uint32_t slot_total_elems = k_slot_total_elems > v_slot_total_elems ? k_slot_total_elems : v_slot_total_elems;
     if (args.seq_len > args.capacity) {
         fprintf(stderr, "Initial seq_len exceeds capacity\n");
         return 1;
@@ -1220,16 +1236,16 @@ static int handle_allocate(kvslot_runner_t *runner, uint32_t slot_id)
     void *k_data = NULL;
     void *v_data = NULL;
     if (logical_elems > 0) {
-        k_data = calloc(logical_elems, elem_size);
-        v_data = calloc(logical_elems, elem_size);
+        k_data = calloc(logical_elems, k_elem_size);
+        v_data = calloc(logical_elems, v_elem_size);
         if (k_data == NULL || v_data == NULL) {
             fprintf(stderr, "Failed to allocate allocate payload buffers\n");
             free(k_data);
             free(v_data);
             return 1;
         }
-        if (read_exact(stdin, k_data, bytes) != 0
-            || read_exact(stdin, v_data, bytes) != 0) {
+        if (read_exact(stdin, k_data, k_bytes) != 0
+            || read_exact(stdin, v_data, v_bytes) != 0) {
             fprintf(stderr, "Failed to read allocate payload\n");
             free(k_data);
             free(v_data);
@@ -1237,6 +1253,7 @@ static int handle_allocate(kvslot_runner_t *runner, uint32_t slot_id)
         }
     }
     slot->dtype_code = args.dtype_code;
+    slot->v_dtype_code = args.v_dtype_code;
     slot->k_scale = kvslot_sanitize_scale(args.k_scale);
     slot->v_scale = kvslot_sanitize_scale(args.v_scale);
     args.k_scale = slot->k_scale;
@@ -1250,12 +1267,12 @@ static int handle_allocate(kvslot_runner_t *runner, uint32_t slot_id)
         return 1;
     }
     slot->elem_count = slot_total_elems;
-    if (bytes > 0) {
+    if (logical_elems > 0) {
         size_t byte_offset = (size_t)slot->elem_offset * sizeof(int32_t);
         DPU_ASSERT(dpu_prepare_xfer(target_dpu, k_data));
-        DPU_ASSERT(dpu_push_xfer(target_dpu, DPU_XFER_TO_DPU, "k_cache", byte_offset, bytes, DPU_XFER_DEFAULT));
+        DPU_ASSERT(dpu_push_xfer(target_dpu, DPU_XFER_TO_DPU, "k_cache", byte_offset, k_bytes, DPU_XFER_DEFAULT));
         DPU_ASSERT(dpu_prepare_xfer(target_dpu, v_data));
-        DPU_ASSERT(dpu_push_xfer(target_dpu, DPU_XFER_TO_DPU, "v_cache", byte_offset, bytes, DPU_XFER_DEFAULT));
+        DPU_ASSERT(dpu_push_xfer(target_dpu, DPU_XFER_TO_DPU, "v_cache", byte_offset, v_bytes, DPU_XFER_DEFAULT));
     }
     slot->seq_len = args.seq_len;
     free(k_data);
@@ -1269,7 +1286,7 @@ static int handle_allocate(kvslot_runner_t *runner, uint32_t slot_id)
         .dtype_code = slot->dtype_code,
         .k_scale = slot->k_scale,
         .v_scale = slot->v_scale,
-        .reserved = 0,
+        .v_dtype_code = slot->v_dtype_code,
     };
     if (write_exact(stdout, &out, sizeof(out)) != 0 || flush_exact(stdout) != 0) {
         fprintf(stderr, "Failed to write allocate response\n");
@@ -1299,7 +1316,12 @@ static int handle_append(kvslot_runner_t *runner, uint32_t slot_id)
         fprintf(stderr, "Append on uninitialized slot %u\n", slot_id);
         return 1;
     }
-    if (args.seq_len != 1 || args.group_heads != slot->group_heads || args.head_dim != slot->head_dim || args.dtype_code != slot->dtype_code) {
+    args.v_dtype_code = kvslot_normalize_v_dtype_code(args.dtype_code, args.v_dtype_code);
+    if (args.seq_len != 1
+        || args.group_heads != slot->group_heads
+        || args.head_dim != slot->head_dim
+        || args.dtype_code != slot->dtype_code
+        || args.v_dtype_code != slot->v_dtype_code) {
         fprintf(stderr, "Append args mismatch for slot %u\n", slot_id);
         return 1;
     }
@@ -1309,28 +1331,31 @@ static int handle_append(kvslot_runner_t *runner, uint32_t slot_id)
     }
 
     size_t token_elems = (size_t)slot->group_heads * slot->head_dim;
-    size_t token_elem_size = kvslot_dtype_elem_size(slot->dtype_code);
-    size_t token_bytes = token_elems * token_elem_size;
-    void *k_token = calloc(token_elems, token_elem_size);
-    void *v_token = calloc(token_elems, token_elem_size);
+    size_t k_token_elem_size = kvslot_dtype_elem_size(slot->dtype_code);
+    size_t v_token_elem_size = kvslot_dtype_elem_size(slot->v_dtype_code);
+    size_t k_token_bytes = token_elems * k_token_elem_size;
+    size_t v_token_bytes = token_elems * v_token_elem_size;
+    void *k_token = calloc(token_elems, k_token_elem_size);
+    void *v_token = calloc(token_elems, v_token_elem_size);
     if (k_token == NULL || v_token == NULL) {
         fprintf(stderr, "Failed to allocate append buffers\n");
         free(k_token);
         free(v_token);
         return 1;
     }
-    if (read_exact(stdin, k_token, token_bytes) != 0
-        || read_exact(stdin, v_token, token_bytes) != 0) {
+    if (read_exact(stdin, k_token, k_token_bytes) != 0
+        || read_exact(stdin, v_token, v_token_bytes) != 0) {
         fprintf(stderr, "Failed to read append payload\n");
         free(k_token);
         free(v_token);
         return 1;
     }
-    size_t byte_offset = ((size_t)slot->elem_offset * sizeof(int32_t)) + ((size_t)slot->seq_len * token_bytes);
+    size_t k_byte_offset = ((size_t)slot->elem_offset * sizeof(int32_t)) + ((size_t)slot->seq_len * k_token_bytes);
+    size_t v_byte_offset = ((size_t)slot->elem_offset * sizeof(int32_t)) + ((size_t)slot->seq_len * v_token_bytes);
     DPU_ASSERT(dpu_prepare_xfer(target_dpu, k_token));
-    DPU_ASSERT(dpu_push_xfer(target_dpu, DPU_XFER_TO_DPU, "k_cache", byte_offset, token_bytes, DPU_XFER_DEFAULT));
+    DPU_ASSERT(dpu_push_xfer(target_dpu, DPU_XFER_TO_DPU, "k_cache", k_byte_offset, k_token_bytes, DPU_XFER_DEFAULT));
     DPU_ASSERT(dpu_prepare_xfer(target_dpu, v_token));
-    DPU_ASSERT(dpu_push_xfer(target_dpu, DPU_XFER_TO_DPU, "v_cache", byte_offset, token_bytes, DPU_XFER_DEFAULT));
+    DPU_ASSERT(dpu_push_xfer(target_dpu, DPU_XFER_TO_DPU, "v_cache", v_byte_offset, v_token_bytes, DPU_XFER_DEFAULT));
     slot->seq_len += 1;
     free(k_token);
     free(v_token);
@@ -1343,7 +1368,7 @@ static int handle_append(kvslot_runner_t *runner, uint32_t slot_id)
         .dtype_code = slot->dtype_code,
         .k_scale = slot->k_scale,
         .v_scale = slot->v_scale,
-        .reserved = 0,
+        .v_dtype_code = slot->v_dtype_code,
     };
     if (write_exact(stdout, &out, sizeof(out)) != 0 || flush_exact(stdout) != 0) {
         fprintf(stderr, "Failed to write append response\n");
@@ -1376,16 +1401,18 @@ static int handle_readback(kvslot_runner_t *runner, uint32_t slot_id)
         .dtype_code = slot->dtype_code,
         .k_scale = slot->k_scale,
         .v_scale = slot->v_scale,
-        .reserved = 0,
+        .v_dtype_code = slot->v_dtype_code,
     };
     size_t elems = (size_t)slot->seq_len * slot->group_heads * slot->head_dim;
-    size_t elem_size = kvslot_dtype_elem_size(slot->dtype_code);
-    size_t bytes = elems * elem_size;
+    size_t k_elem_size = kvslot_dtype_elem_size(slot->dtype_code);
+    size_t v_elem_size = kvslot_dtype_elem_size(slot->v_dtype_code);
+    size_t k_bytes = elems * k_elem_size;
+    size_t v_bytes = elems * v_elem_size;
     void *k_data = NULL;
     void *v_data = NULL;
     if (elems > 0) {
-        k_data = calloc(elems, elem_size);
-        v_data = calloc(elems, elem_size);
+        k_data = calloc(elems, k_elem_size);
+        v_data = calloc(elems, v_elem_size);
         if (k_data == NULL || v_data == NULL) {
             fprintf(stderr, "Failed to allocate readback buffers\n");
             free(k_data);
@@ -1394,13 +1421,13 @@ static int handle_readback(kvslot_runner_t *runner, uint32_t slot_id)
         }
         size_t byte_offset = (size_t)slot->elem_offset * sizeof(int32_t);
         DPU_ASSERT(dpu_prepare_xfer(target_dpu, k_data));
-        DPU_ASSERT(dpu_push_xfer(target_dpu, DPU_XFER_FROM_DPU, "k_cache", byte_offset, bytes, DPU_XFER_DEFAULT));
+        DPU_ASSERT(dpu_push_xfer(target_dpu, DPU_XFER_FROM_DPU, "k_cache", byte_offset, k_bytes, DPU_XFER_DEFAULT));
         DPU_ASSERT(dpu_prepare_xfer(target_dpu, v_data));
-        DPU_ASSERT(dpu_push_xfer(target_dpu, DPU_XFER_FROM_DPU, "v_cache", byte_offset, bytes, DPU_XFER_DEFAULT));
+        DPU_ASSERT(dpu_push_xfer(target_dpu, DPU_XFER_FROM_DPU, "v_cache", byte_offset, v_bytes, DPU_XFER_DEFAULT));
     }
     if (write_exact(stdout, &out, sizeof(out)) != 0
-        || (elems > 0 && write_exact(stdout, k_data, bytes) != 0)
-        || (elems > 0 && write_exact(stdout, v_data, bytes) != 0)
+        || (elems > 0 && write_exact(stdout, k_data, k_bytes) != 0)
+        || (elems > 0 && write_exact(stdout, v_data, v_bytes) != 0)
         || flush_exact(stdout) != 0) {
         fprintf(stderr, "Failed to write readback response\n");
         free(k_data);
@@ -2099,9 +2126,10 @@ static int prepare_qk_slot_item_header(
     item->runtime_args.head_dim = item->slot->head_dim;
     item->runtime_args.dtype_code = item->slot->dtype_code;
     item->runtime_args.elem_offset = item->slot->elem_offset;
+    item->runtime_args.v_elem_offset = item->slot->elem_offset;
     item->runtime_args.k_scale = item->slot->k_scale;
     item->runtime_args.v_scale = item->slot->v_scale;
-    item->runtime_args.reserved = 0;
+    item->runtime_args.v_dtype_code = item->slot->v_dtype_code;
 
     item->slot_args.num_heads = num_heads;
     item->slot_args.window = window;
@@ -2126,6 +2154,10 @@ static void restrict_qk_slot_item_to_tail_window(qk_slot_item_t *item)
         + kvslot_logical_elem_offset_to_packed_words(
             token_offset * item->slot->group_heads * item->slot->head_dim,
             item->slot->dtype_code);
+    item->runtime_args.v_elem_offset = item->slot->elem_offset
+        + kvslot_logical_elem_offset_to_packed_words(
+            token_offset * item->slot->group_heads * item->slot->head_dim,
+            item->slot->v_dtype_code);
 }
 
 static void restrict_av_item_to_qk_tail_window(av_item_t *item, const qk_slot_item_t *qk_item)
@@ -2142,6 +2174,10 @@ static void restrict_av_item_to_qk_tail_window(av_item_t *item, const qk_slot_it
         + kvslot_logical_elem_offset_to_packed_words(
             token_offset * item->slot->group_heads * item->slot->head_dim,
             item->slot->dtype_code);
+    item->runtime_args.v_elem_offset = item->slot->elem_offset
+        + kvslot_logical_elem_offset_to_packed_words(
+            token_offset * item->slot->group_heads * item->slot->head_dim,
+            item->slot->v_dtype_code);
     item->out.seq_len = qk_item->window;
 }
 
@@ -2200,6 +2236,7 @@ static int prepare_grouped_qk_slot_item_header(
             if (slot->group_heads != first_slot->group_heads
                 || slot->head_dim != first_slot->head_dim
                 || slot->dtype_code != first_slot->dtype_code
+                || slot->v_dtype_code != first_slot->v_dtype_code
                 || slot->k_scale != first_slot->k_scale
                 || slot->v_scale != first_slot->v_scale) {
                 fprintf(stderr, "Grouped qk item shape mismatch across segments\n");
@@ -2226,9 +2263,13 @@ static int prepare_grouped_qk_slot_item_header(
             + kvslot_logical_elem_offset_to_packed_words(
                 (slot->seq_len - segment_lengths[seg_idx]) * slot->group_heads * slot->head_dim,
                 slot->dtype_code);
+        item->segment_runtime_args[seg_idx].v_elem_offset = slot->elem_offset
+            + kvslot_logical_elem_offset_to_packed_words(
+                (slot->seq_len - segment_lengths[seg_idx]) * slot->group_heads * slot->head_dim,
+                slot->v_dtype_code);
         item->segment_runtime_args[seg_idx].k_scale = slot->k_scale;
         item->segment_runtime_args[seg_idx].v_scale = slot->v_scale;
-        item->segment_runtime_args[seg_idx].reserved = 0;
+        item->segment_runtime_args[seg_idx].v_dtype_code = slot->v_dtype_code;
         total_window += segment_lengths[seg_idx];
     }
 
@@ -2264,9 +2305,10 @@ static int prepare_grouped_qk_slot_item_header(
     item->runtime_args.head_dim = first_slot->head_dim;
     item->runtime_args.dtype_code = first_slot->dtype_code;
     item->runtime_args.elem_offset = 0;
+    item->runtime_args.v_elem_offset = 0;
     item->runtime_args.k_scale = first_slot->k_scale;
     item->runtime_args.v_scale = first_slot->v_scale;
-    item->runtime_args.reserved = 0;
+    item->runtime_args.v_dtype_code = first_slot->v_dtype_code;
 
     item->slot_args.num_heads = num_heads;
     item->slot_args.window = total_window;
@@ -3083,9 +3125,10 @@ static int prepare_av_item_header(kvslot_runner_t *runner, uint32_t slot_id, av_
     item->runtime_args.head_dim = slot->head_dim;
     item->runtime_args.dtype_code = slot->dtype_code;
     item->runtime_args.elem_offset = slot->elem_offset;
+    item->runtime_args.v_elem_offset = slot->elem_offset;
     item->runtime_args.k_scale = slot->k_scale;
     item->runtime_args.v_scale = slot->v_scale;
-    item->runtime_args.reserved = 0;
+    item->runtime_args.v_dtype_code = slot->v_dtype_code;
 
     item->out.capacity = slot->capacity;
     item->out.seq_len = slot->seq_len;
@@ -3094,7 +3137,7 @@ static int prepare_av_item_header(kvslot_runner_t *runner, uint32_t slot_id, av_
     item->out.dtype_code = slot->dtype_code;
     item->out.k_scale = slot->k_scale;
     item->out.v_scale = slot->v_scale;
-    item->out.reserved = 0;
+    item->out.v_dtype_code = slot->v_dtype_code;
     item->context_prefetched = 0;
     item->ready = 1;
     return 0;
@@ -3149,7 +3192,7 @@ static int prepare_grouped_av_item_header(
             item->out.dtype_code = slot->dtype_code;
             item->out.k_scale = slot->k_scale;
             item->out.v_scale = slot->v_scale;
-            item->out.reserved = 0;
+            item->out.v_dtype_code = slot->v_dtype_code;
         } else {
             if (physical_dpu_id != first_physical_dpu_id) {
                 fprintf(stderr, "Grouped av item spans multiple physical DPUs\n");
@@ -3158,6 +3201,7 @@ static int prepare_grouped_av_item_header(
             if (slot->group_heads != first_slot->group_heads
                 || slot->head_dim != first_slot->head_dim
                 || slot->dtype_code != first_slot->dtype_code
+                || slot->v_dtype_code != first_slot->v_dtype_code
                 || slot->k_scale != first_slot->k_scale
                 || slot->v_scale != first_slot->v_scale) {
                 fprintf(stderr, "Grouped av item shape mismatch across segments\n");
@@ -3184,9 +3228,13 @@ static int prepare_grouped_av_item_header(
             + kvslot_logical_elem_offset_to_packed_words(
                 (slot->seq_len - segment_lengths[seg_idx]) * slot->group_heads * slot->head_dim,
                 slot->dtype_code);
+        item->segment_runtime_args[seg_idx].v_elem_offset = slot->elem_offset
+            + kvslot_logical_elem_offset_to_packed_words(
+                (slot->seq_len - segment_lengths[seg_idx]) * slot->group_heads * slot->head_dim,
+                slot->v_dtype_code);
         item->segment_runtime_args[seg_idx].k_scale = slot->k_scale;
         item->segment_runtime_args[seg_idx].v_scale = slot->v_scale;
-        item->segment_runtime_args[seg_idx].reserved = 0;
+        item->segment_runtime_args[seg_idx].v_dtype_code = slot->v_dtype_code;
         total_seq_len += segment_lengths[seg_idx];
         item->out.capacity += slot->capacity;
     }
@@ -3197,13 +3245,14 @@ static int prepare_grouped_av_item_header(
     item->runtime_args.head_dim = first_slot->head_dim;
     item->runtime_args.dtype_code = first_slot->dtype_code;
     item->runtime_args.elem_offset = 0;
+    item->runtime_args.v_elem_offset = 0;
     item->runtime_args.k_scale = first_slot->k_scale;
     item->runtime_args.v_scale = first_slot->v_scale;
-    item->runtime_args.reserved = 0;
+    item->runtime_args.v_dtype_code = first_slot->v_dtype_code;
     item->out.seq_len = total_seq_len;
     item->out.k_scale = first_slot->k_scale;
     item->out.v_scale = first_slot->v_scale;
-    item->out.reserved = 0;
+    item->out.v_dtype_code = first_slot->v_dtype_code;
     item->weight_bytes = (size_t)total_seq_len * first_slot->group_heads * sizeof(float);
     item->context_bytes = (size_t)first_slot->group_heads * first_slot->head_dim * sizeof(float);
     item->padded_weight_bytes = ((item->weight_bytes + 7u) / 8u) * 8u;
@@ -3468,6 +3517,7 @@ static int can_use_batched_av_round(
         if (item->runtime_args.group_heads != items[round_indices[0]].runtime_args.group_heads
             || item->runtime_args.head_dim != items[round_indices[0]].runtime_args.head_dim
             || item->runtime_args.dtype_code != items[round_indices[0]].runtime_args.dtype_code
+            || item->runtime_args.v_dtype_code != items[round_indices[0]].runtime_args.v_dtype_code
             || item->padded_context_bytes != padded_context_bytes
             || item->weights_resident_on_dpu != items[round_indices[0]].weights_resident_on_dpu
             || item->context_from_qk_kernel != items[round_indices[0]].context_from_qk_kernel

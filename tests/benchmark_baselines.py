@@ -25,6 +25,7 @@ from benchmark_utils import DATASET_FORMAT_CHOICES, load_benchmark_samples, load
 from src.core.config import ClusterConfig, ModelConfig
 from src.core.model_adapter import CausalModelAdapter
 from src.core.nodes import DecodeDenseNode, PrefillNode
+from src.core.resident_kv_store import SUPPORTED_RESIDENT_KV_DTYPES, normalize_resident_kv_dtype
 from src.core.scheduler import GlobalScheduler
 
 
@@ -448,7 +449,7 @@ def make_cluster_config(args, attention_backend: str) -> ClusterConfig:
         pim_max_resident_groups_per_layer=args.pim_max_resident_groups_per_layer,
         pim_head_grouping_policy=pim_head_grouping_policy,
         pim_dpu_placement_policy=pim_dpu_placement_policy,
-        pim_resident_kv_dtype=args.pim_resident_kv_dtype,
+        pim_resident_kv_dtype=normalize_resident_kv_dtype(args.pim_resident_kv_dtype),
         pim_qk_mixed_enabled=args.pim_qk_mixed_enabled,
         pim_qk_mixed_heads=args.pim_qk_mixed_heads,
         pim_qk_mixed_window=args.pim_qk_mixed_window,
@@ -755,7 +756,11 @@ def main():
         default="auto",
         choices=["auto", "identity", "rotated", "rank_spread", "load_aware"],
     )
-    parser.add_argument("--pim-resident-kv-dtype", default="fp32", choices=["fp32", "fp16", "int8"])
+    parser.add_argument(
+        "--pim-resident-kv-dtype",
+        default="fp32",
+        choices=sorted(SUPPORTED_RESIDENT_KV_DTYPES | {"int8_fp16", "int8-fp16", "k_int8_v_fp16"}),
+    )
     parser.add_argument("--pim-qk-full-enabled", action="store_true")
     parser.add_argument("--no-pim-qk-full-enabled", action="store_true")
     parser.add_argument("--pim-qk-full-shadow-check", action="store_true")

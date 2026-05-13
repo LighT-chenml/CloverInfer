@@ -24,6 +24,8 @@ __host uint32_t grouped_segment_count;
 __host kvslot_meta_t kvslot_meta;
 __host uint32_t kvslot_kernel_command;
 
+#define KVSLOT_UNSET_U32 0xffffffffu
+
 __mram_noinit int32_t k_cache[KVSLOT_MAX_CAPACITY * KVSLOT_MAX_HEADS * KVSLOT_MAX_HEAD_DIM];
 __mram_noinit int32_t v_cache[KVSLOT_MAX_CAPACITY * KVSLOT_MAX_HEADS * KVSLOT_MAX_HEAD_DIM];
 __mram_noinit int32_t qk_query[KVSLOT_MAX_HEADS * KVSLOT_MAX_HEAD_DIM];
@@ -190,13 +192,21 @@ static void write_av_context_pair(uint32_t pair_idx, uint32_t low_bits, uint32_t
 
 static float read_v_value(const kvslot_runtime_slot_args_t *slot, uint32_t logical_idx)
 {
-    if (slot->dtype_code == KVSLOT_DTYPE_INT8) {
-        return read_int8_v_value(slot->elem_offset, logical_idx, slot->v_scale);
+    uint32_t elem_offset = slot->v_elem_offset;
+    uint32_t dtype_code = slot->v_dtype_code;
+    if (elem_offset == KVSLOT_UNSET_U32) {
+        elem_offset = slot->elem_offset;
     }
-    if (slot->dtype_code == KVSLOT_DTYPE_FP16) {
+    if (dtype_code == KVSLOT_UNSET_U32) {
+        dtype_code = slot->dtype_code;
+    }
+    if (dtype_code == KVSLOT_DTYPE_INT8) {
+        return read_int8_v_value(elem_offset, logical_idx, slot->v_scale);
+    }
+    if (dtype_code == KVSLOT_DTYPE_FP16) {
         uint64_t packed64 = 0;
         uint32_t packed = 0;
-        uint32_t word_idx = slot->elem_offset + (logical_idx / 2u);
+        uint32_t word_idx = elem_offset + (logical_idx / 2u);
         uint32_t pair_base = word_idx & ~1u;
         uint16_t fp16_bits;
         mram_read(&v_cache[pair_base], &packed64, sizeof(packed64));
@@ -206,7 +216,7 @@ static float read_v_value(const kvslot_runtime_slot_args_t *slot, uint32_t logic
     }
 
     uint64_t packed = 0;
-    uint32_t word_idx = slot->elem_offset + logical_idx;
+    uint32_t word_idx = elem_offset + logical_idx;
     uint32_t pair_base = word_idx & ~1u;
     uint32_t bits = 0;
     mram_read(&v_cache[pair_base], &packed, sizeof(packed));
@@ -217,7 +227,8 @@ static float read_v_value(const kvslot_runtime_slot_args_t *slot, uint32_t logic
 static void read_fp16_v_pair(const kvslot_runtime_slot_args_t *slot, uint32_t logical_idx, float *value0, float *value1)
 {
     uint64_t packed64 = 0;
-    uint32_t word_idx = slot->elem_offset + (logical_idx / 2u);
+    uint32_t elem_offset = slot->v_elem_offset == KVSLOT_UNSET_U32 ? slot->elem_offset : slot->v_elem_offset;
+    uint32_t word_idx = elem_offset + (logical_idx / 2u);
     uint32_t pair_base = word_idx & ~1u;
     uint32_t packed;
 
@@ -430,6 +441,7 @@ static void run_qk_kernel(void)
 static void run_context_from_local_softmax(uint32_t num_heads, uint32_t window, uint32_t group_heads, uint32_t head_dim)
 {
     uint32_t tasklet_id = me();
+    uint32_t v_dtype_code = runtime_slot_args.v_dtype_code == KVSLOT_UNSET_U32 ? runtime_slot_args.dtype_code : runtime_slot_args.v_dtype_code;
     uint32_t total_outputs = num_heads * head_dim;
     uint32_t total_pairs = (total_outputs + 1u) / 2u;
 
@@ -465,12 +477,13 @@ static void run_context_from_local_softmax(uint32_t num_heads, uint32_t window, 
         }
 
         if (same_head_pair) {
-            if (runtime_slot_args.dtype_code == KVSLOT_DTYPE_INT8) {
+            if (v_dtype_code == KVSLOT_DTYPE_INT8) {
                 for (uint32_t token_idx = 0; token_idx < window; ++token_idx) {
                     uint32_t value_idx0 = ((token_idx * group_heads) + kv_head_idx0) * head_dim + dim_idx0;
                     float weight0 = u32_bits_to_float(qk_slot_score_local[(size_t)head_idx0 * window + token_idx]);
-                    uint32_t pair_base0 = int8_cache_pair_base(runtime_slot_args.elem_offset, value_idx0);
-                    uint32_t pair_base1 = int8_cache_pair_base(runtime_slot_args.elem_offset, value_idx0 + 1u);
+                    uint32_t value_elem_offset = runtime_slot_args.v_elem_offset == KVSLOT_UNSET_U32 ? runtime_slot_args.elem_offset : runtime_slot_args.v_elem_offset;
+                    uint32_t pair_base0 = int8_cache_pair_base(value_elem_offset, value_idx0);
+                    uint32_t pair_base1 = int8_cache_pair_base(value_elem_offset, value_idx0 + 1u);
                     uint64_t packed_v0 = 0;
                     uint64_t packed_v1 = 0;
                     mram_read(&v_cache[pair_base0], &packed_v0, sizeof(packed_v0));
@@ -479,22 +492,23 @@ static void run_context_from_local_softmax(uint32_t num_heads, uint32_t window, 
                     } else {
                         mram_read(&v_cache[pair_base1], &packed_v1, sizeof(packed_v1));
                     }
-                    acc0 += weight0 * unpack_int8_scaled_value(packed_v0, runtime_slot_args.elem_offset, value_idx0, runtime_slot_args.v_scale);
-                    acc1 += weight0 * unpack_int8_scaled_value(packed_v1, runtime_slot_args.elem_offset, value_idx0 + 1u, runtime_slot_args.v_scale);
+                    acc0 += weight0 * unpack_int8_scaled_value(packed_v0, value_elem_offset, value_idx0, runtime_slot_args.v_scale);
+                    acc1 += weight0 * unpack_int8_scaled_value(packed_v1, value_elem_offset, value_idx0 + 1u, runtime_slot_args.v_scale);
                 }
             } else
             for (uint32_t token_idx = 0; token_idx < window; ++token_idx) {
                 uint32_t value_idx0 = ((token_idx * group_heads) + kv_head_idx0) * head_dim + dim_idx0;
                 float weight0 = u32_bits_to_float(qk_slot_score_local[(size_t)head_idx0 * window + token_idx]);
-                if (runtime_slot_args.dtype_code == KVSLOT_DTYPE_FP16) {
+                if (v_dtype_code == KVSLOT_DTYPE_FP16) {
                     float value0;
                     float value1;
                     read_fp16_v_pair(&runtime_slot_args, value_idx0, &value0, &value1);
                     acc0 += weight0 * value0;
                     acc1 += weight0 * value1;
-                } else if (runtime_slot_args.dtype_code == KVSLOT_DTYPE_FP32 && (value_idx0 % 2u) == 0) {
+                } else if (v_dtype_code == KVSLOT_DTYPE_FP32 && (value_idx0 % 2u) == 0) {
                     uint64_t packed_v = 0;
-                    uint32_t word_idx0 = runtime_slot_args.elem_offset + value_idx0;
+                    uint32_t value_elem_offset = runtime_slot_args.v_elem_offset == KVSLOT_UNSET_U32 ? runtime_slot_args.elem_offset : runtime_slot_args.v_elem_offset;
+                    uint32_t word_idx0 = value_elem_offset + value_idx0;
                     mram_read(&v_cache[word_idx0], &packed_v, sizeof(packed_v));
                     acc0 += weight0 * u32_bits_to_float((uint32_t)(packed_v & 0xffffffffu));
                     acc1 += weight0 * u32_bits_to_float((uint32_t)(packed_v >> 32));
@@ -529,6 +543,7 @@ static void run_av_kernel(void)
     uint32_t seq_len = runtime_slot_args.seq_len;
     uint32_t group_heads = runtime_slot_args.group_heads;
     uint32_t head_dim = runtime_slot_args.head_dim;
+    uint32_t v_dtype_code = runtime_slot_args.v_dtype_code == KVSLOT_UNSET_U32 ? runtime_slot_args.dtype_code : runtime_slot_args.v_dtype_code;
     uint32_t total_outputs = group_heads * head_dim;
 
     if (seq_len > KVSLOT_MAX_CAPACITY) {
@@ -564,7 +579,7 @@ static void run_av_kernel(void)
         if (same_head_pair) {
             uint32_t token_idx = 0;
             uint32_t weight_row_base = head_idx0 * seq_len;
-            if (runtime_slot_args.dtype_code == KVSLOT_DTYPE_INT8) {
+            if (v_dtype_code == KVSLOT_DTYPE_INT8) {
                 for (; token_idx + 8u <= seq_len; token_idx += 8u) {
                     uint32_t logical_weight_start = weight_row_base + token_idx;
                     uint32_t weight_pair_base = logical_weight_start & ~1u;
@@ -579,8 +594,9 @@ static void run_av_kernel(void)
                         float weight0 = u32_bits_to_float(
                             (packed_rel_idx & 1u) == 0 ? (uint32_t)(packed_weight & 0xffffffffu)
                                                        : (uint32_t)(packed_weight >> 32));
-                        uint32_t pair_base0 = int8_cache_pair_base(runtime_slot_args.elem_offset, value_idx0);
-                        uint32_t pair_base1 = int8_cache_pair_base(runtime_slot_args.elem_offset, value_idx0 + 1u);
+                        uint32_t value_elem_offset = runtime_slot_args.v_elem_offset == KVSLOT_UNSET_U32 ? runtime_slot_args.elem_offset : runtime_slot_args.v_elem_offset;
+                        uint32_t pair_base0 = int8_cache_pair_base(value_elem_offset, value_idx0);
+                        uint32_t pair_base1 = int8_cache_pair_base(value_elem_offset, value_idx0 + 1u);
                         uint64_t packed_v0 = 0;
                         uint64_t packed_v1 = 0;
                         mram_read(&v_cache[pair_base0], &packed_v0, sizeof(packed_v0));
@@ -589,8 +605,8 @@ static void run_av_kernel(void)
                         } else {
                             mram_read(&v_cache[pair_base1], &packed_v1, sizeof(packed_v1));
                         }
-                        acc0 += weight0 * unpack_int8_scaled_value(packed_v0, runtime_slot_args.elem_offset, value_idx0, runtime_slot_args.v_scale);
-                        acc1 += weight0 * unpack_int8_scaled_value(packed_v1, runtime_slot_args.elem_offset, value_idx0 + 1u, runtime_slot_args.v_scale);
+                        acc0 += weight0 * unpack_int8_scaled_value(packed_v0, value_elem_offset, value_idx0, runtime_slot_args.v_scale);
+                        acc1 += weight0 * unpack_int8_scaled_value(packed_v1, value_elem_offset, value_idx0 + 1u, runtime_slot_args.v_scale);
                     }
                 }
             } else
@@ -608,9 +624,10 @@ static void run_av_kernel(void)
                     float weight0 = u32_bits_to_float(
                         (packed_rel_idx & 1u) == 0 ? (uint32_t)(packed_weight & 0xffffffffu)
                                                    : (uint32_t)(packed_weight >> 32));
-                    if (runtime_slot_args.dtype_code == KVSLOT_DTYPE_FP32 && (value_idx0 % 2u) == 0) {
+                    if (v_dtype_code == KVSLOT_DTYPE_FP32 && (value_idx0 % 2u) == 0) {
                         uint64_t packed_v = 0;
-                        uint32_t word_idx0 = runtime_slot_args.elem_offset + value_idx0;
+                        uint32_t value_elem_offset = runtime_slot_args.v_elem_offset == KVSLOT_UNSET_U32 ? runtime_slot_args.elem_offset : runtime_slot_args.v_elem_offset;
+                        uint32_t word_idx0 = value_elem_offset + value_idx0;
                         mram_read(&v_cache[word_idx0], &packed_v, sizeof(packed_v));
                         acc0 += weight0 * u32_bits_to_float((uint32_t)(packed_v & 0xffffffffu));
                         acc1 += weight0 * u32_bits_to_float((uint32_t)(packed_v >> 32));
@@ -626,9 +643,10 @@ static void run_av_kernel(void)
                 uint32_t weight_idx0 = head_idx0 * seq_len + token_idx;
                 uint32_t value_idx0 = ((token_idx * group_heads) + head_idx0) * head_dim + dim_idx0;
                 float weight0 = read_av_weight(weight_idx0);
-                if (runtime_slot_args.dtype_code == KVSLOT_DTYPE_INT8) {
-                    uint32_t pair_base0 = int8_cache_pair_base(runtime_slot_args.elem_offset, value_idx0);
-                    uint32_t pair_base1 = int8_cache_pair_base(runtime_slot_args.elem_offset, value_idx0 + 1u);
+                if (v_dtype_code == KVSLOT_DTYPE_INT8) {
+                    uint32_t value_elem_offset = runtime_slot_args.v_elem_offset == KVSLOT_UNSET_U32 ? runtime_slot_args.elem_offset : runtime_slot_args.v_elem_offset;
+                    uint32_t pair_base0 = int8_cache_pair_base(value_elem_offset, value_idx0);
+                    uint32_t pair_base1 = int8_cache_pair_base(value_elem_offset, value_idx0 + 1u);
                     uint64_t packed_v0 = 0;
                     uint64_t packed_v1 = 0;
                     mram_read(&v_cache[pair_base0], &packed_v0, sizeof(packed_v0));
@@ -637,11 +655,12 @@ static void run_av_kernel(void)
                     } else {
                         mram_read(&v_cache[pair_base1], &packed_v1, sizeof(packed_v1));
                     }
-                    acc0 += weight0 * unpack_int8_scaled_value(packed_v0, runtime_slot_args.elem_offset, value_idx0, runtime_slot_args.v_scale);
-                    acc1 += weight0 * unpack_int8_scaled_value(packed_v1, runtime_slot_args.elem_offset, value_idx0 + 1u, runtime_slot_args.v_scale);
-                } else if (runtime_slot_args.dtype_code == KVSLOT_DTYPE_FP32 && (value_idx0 % 2u) == 0) {
+                    acc0 += weight0 * unpack_int8_scaled_value(packed_v0, value_elem_offset, value_idx0, runtime_slot_args.v_scale);
+                    acc1 += weight0 * unpack_int8_scaled_value(packed_v1, value_elem_offset, value_idx0 + 1u, runtime_slot_args.v_scale);
+                } else if (v_dtype_code == KVSLOT_DTYPE_FP32 && (value_idx0 % 2u) == 0) {
                     uint64_t packed_v = 0;
-                    uint32_t word_idx0 = runtime_slot_args.elem_offset + value_idx0;
+                    uint32_t value_elem_offset = runtime_slot_args.v_elem_offset == KVSLOT_UNSET_U32 ? runtime_slot_args.elem_offset : runtime_slot_args.v_elem_offset;
+                    uint32_t word_idx0 = value_elem_offset + value_idx0;
                     mram_read(&v_cache[word_idx0], &packed_v, sizeof(packed_v));
                     acc0 += weight0 * u32_bits_to_float((uint32_t)(packed_v & 0xffffffffu));
                     acc1 += weight0 * u32_bits_to_float((uint32_t)(packed_v >> 32));
@@ -714,6 +733,7 @@ static void run_grouped_av_kernel(void)
 
         for (uint32_t seg_idx = 0; seg_idx < segment_count; ++seg_idx) {
             kvslot_runtime_slot_args_t *segment_slot = &grouped_runtime_slot_args[seg_idx];
+            uint32_t segment_v_dtype_code = segment_slot->v_dtype_code == KVSLOT_UNSET_U32 ? segment_slot->dtype_code : segment_slot->v_dtype_code;
             uint32_t seq_len = grouped_segment_lengths[seg_idx];
             uint32_t slot_group_heads = segment_slot->group_heads;
             if (seq_len == 0) {
@@ -727,9 +747,10 @@ static void run_grouped_av_kernel(void)
                     uint32_t weight_idx0 = head_idx0 * runtime_slot_args.seq_len + weight_row_offset + token_idx;
                     uint32_t value_idx0 = ((token_idx * slot_group_heads) + head_idx0) * segment_slot->head_dim + dim_idx0;
                     float weight0 = read_av_weight(weight_idx0);
-                    if (segment_slot->dtype_code == KVSLOT_DTYPE_INT8) {
-                        uint32_t pair_base0 = int8_cache_pair_base(segment_slot->elem_offset, value_idx0);
-                        uint32_t pair_base1 = int8_cache_pair_base(segment_slot->elem_offset, value_idx0 + 1u);
+                    if (segment_v_dtype_code == KVSLOT_DTYPE_INT8) {
+                        uint32_t value_elem_offset = segment_slot->v_elem_offset == KVSLOT_UNSET_U32 ? segment_slot->elem_offset : segment_slot->v_elem_offset;
+                        uint32_t pair_base0 = int8_cache_pair_base(value_elem_offset, value_idx0);
+                        uint32_t pair_base1 = int8_cache_pair_base(value_elem_offset, value_idx0 + 1u);
                         uint64_t packed_v0 = 0;
                         uint64_t packed_v1 = 0;
                         mram_read(&v_cache[pair_base0], &packed_v0, sizeof(packed_v0));
@@ -738,11 +759,12 @@ static void run_grouped_av_kernel(void)
                         } else {
                             mram_read(&v_cache[pair_base1], &packed_v1, sizeof(packed_v1));
                         }
-                        acc0 += weight0 * unpack_int8_scaled_value(packed_v0, segment_slot->elem_offset, value_idx0, segment_slot->v_scale);
-                        acc1 += weight0 * unpack_int8_scaled_value(packed_v1, segment_slot->elem_offset, value_idx0 + 1u, segment_slot->v_scale);
-                    } else if (segment_slot->dtype_code == KVSLOT_DTYPE_FP32 && (value_idx0 % 2u) == 0) {
+                        acc0 += weight0 * unpack_int8_scaled_value(packed_v0, value_elem_offset, value_idx0, segment_slot->v_scale);
+                        acc1 += weight0 * unpack_int8_scaled_value(packed_v1, value_elem_offset, value_idx0 + 1u, segment_slot->v_scale);
+                    } else if (segment_v_dtype_code == KVSLOT_DTYPE_FP32 && (value_idx0 % 2u) == 0) {
                         uint64_t packed_v = 0;
-                        uint32_t word_idx0 = segment_slot->elem_offset + value_idx0;
+                        uint32_t value_elem_offset = segment_slot->v_elem_offset == KVSLOT_UNSET_U32 ? segment_slot->elem_offset : segment_slot->v_elem_offset;
+                        uint32_t word_idx0 = value_elem_offset + value_idx0;
                         mram_read(&v_cache[word_idx0], &packed_v, sizeof(packed_v));
                         acc0 += weight0 * u32_bits_to_float((uint32_t)(packed_v & 0xffffffffu));
                         acc1 += weight0 * u32_bits_to_float((uint32_t)(packed_v >> 32));
