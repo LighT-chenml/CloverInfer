@@ -1865,14 +1865,13 @@ class UpmemKVSlotStore(ResidentKVStore):
             for entry, (segment_context, segment_row_max, segment_row_sum) in zip(partial_entries, partial_outputs):
                 logical_idx = int(entry["logical_idx"])
                 score_scale = float(entry["payload"][4])
-                segment_context = segment_context.to(torch.float32).contiguous()
+                segment_numerator = segment_context.to(torch.float32).contiguous()
                 segment_row_max = (segment_row_max.to(torch.float32) * score_scale).contiguous()
                 segment_row_sum = segment_row_sum.to(torch.float32).contiguous()
-                local_output = (segment_context * segment_row_sum.unsqueeze(1)).contiguous()
                 ordered_indices.append(logical_idx)
                 local_max_parts.append(segment_row_max)
                 local_sum_parts.append(segment_row_sum)
-                local_output_parts.append(local_output)
+                local_output_parts.append(segment_numerator)
 
             if ordered_indices:
                 reduced = host_reduce.merge_partial_contexts(
@@ -1883,37 +1882,39 @@ class UpmemKVSlotStore(ResidentKVStore):
                 )
                 return {int(logical_idx): context for logical_idx, context in reduced.items()}
 
-        merged_contexts: Dict[int, torch.Tensor] = {}
+        merged_numerators: Dict[int, torch.Tensor] = {}
         merged_row_max: Dict[int, torch.Tensor] = {}
         merged_row_sum: Dict[int, torch.Tensor] = {}
 
         for entry, (segment_context, segment_row_max, segment_row_sum) in zip(partial_entries, partial_outputs):
             logical_idx = int(entry["logical_idx"])
             score_scale = float(entry["payload"][4])
-            segment_context = segment_context.to(torch.float32)
+            segment_numerator = segment_context.to(torch.float32)
             segment_row_max = segment_row_max.to(torch.float32) * score_scale
             segment_row_sum = segment_row_sum.to(torch.float32)
-            if logical_idx not in merged_contexts:
-                merged_contexts[logical_idx] = segment_context
+            if logical_idx not in merged_numerators:
+                merged_numerators[logical_idx] = segment_numerator
                 merged_row_max[logical_idx] = segment_row_max
                 merged_row_sum[logical_idx] = segment_row_sum
                 continue
 
             prev_row_max = merged_row_max[logical_idx]
             prev_row_sum = merged_row_sum[logical_idx]
-            prev_context = merged_contexts[logical_idx]
+            prev_numerator = merged_numerators[logical_idx]
             combined_row_max = torch.maximum(prev_row_max, segment_row_max)
             prev_scale = torch.exp(prev_row_max - combined_row_max)
             seg_scale = torch.exp(segment_row_max - combined_row_max)
             combined_row_sum = prev_row_sum * prev_scale + segment_row_sum * seg_scale
-            safe_sum = torch.clamp(combined_row_sum, min=1e-12)
-            prev_weight = (prev_row_sum * prev_scale / safe_sum).unsqueeze(1)
-            seg_weight = (segment_row_sum * seg_scale / safe_sum).unsqueeze(1)
-            merged_contexts[logical_idx] = (prev_context * prev_weight) + (segment_context * seg_weight)
+            merged_numerators[logical_idx] = (
+                prev_numerator * prev_scale.unsqueeze(1)
+            ) + (segment_numerator * seg_scale.unsqueeze(1))
             merged_row_max[logical_idx] = combined_row_max
             merged_row_sum[logical_idx] = combined_row_sum
 
-        return merged_contexts
+        return {
+            logical_idx: numerator / torch.clamp(merged_row_sum[logical_idx], min=1e-12).unsqueeze(1)
+            for logical_idx, numerator in merged_numerators.items()
+        }
 
     def _topology_rank_index(self, physical_dpu: int) -> int | None:
         item = self._helper_topology_cache.get(int(physical_dpu))
@@ -4424,34 +4425,38 @@ class UpmemKVSlotStore(ResidentKVStore):
                 if self.host_partial_reduce_enabled:
                     merged_contexts = self._merge_partial_contexts(ordered_entries, partial_outputs)
                 else:
-                    merged_contexts: Dict[int, torch.Tensor] = {}
+                    merged_numerators: Dict[int, torch.Tensor] = {}
                     merged_row_max: Dict[int, torch.Tensor] = {}
                     merged_row_sum: Dict[int, torch.Tensor] = {}
                     for entry, (segment_context, segment_row_max, segment_row_sum) in zip(ordered_entries, partial_outputs):
                         logical_idx = int(entry["logical_idx"])
                         score_scale = float(entry["payload"][4])
-                        segment_context = segment_context.to(torch.float32)
+                        segment_numerator = segment_context.to(torch.float32)
                         segment_row_max = segment_row_max.to(torch.float32) * score_scale
                         segment_row_sum = segment_row_sum.to(torch.float32)
-                        if logical_idx not in merged_contexts:
-                            merged_contexts[logical_idx] = segment_context
+                        if logical_idx not in merged_numerators:
+                            merged_numerators[logical_idx] = segment_numerator
                             merged_row_max[logical_idx] = segment_row_max
                             merged_row_sum[logical_idx] = segment_row_sum
                             continue
 
                         prev_row_max = merged_row_max[logical_idx]
                         prev_row_sum = merged_row_sum[logical_idx]
-                        prev_context = merged_contexts[logical_idx]
+                        prev_numerator = merged_numerators[logical_idx]
                         combined_row_max = torch.maximum(prev_row_max, segment_row_max)
                         prev_scale = torch.exp(prev_row_max - combined_row_max)
                         seg_scale = torch.exp(segment_row_max - combined_row_max)
                         combined_row_sum = prev_row_sum * prev_scale + segment_row_sum * seg_scale
-                        safe_sum = torch.clamp(combined_row_sum, min=1e-12)
-                        prev_weight = (prev_row_sum * prev_scale / safe_sum).unsqueeze(1)
-                        seg_weight = (segment_row_sum * seg_scale / safe_sum).unsqueeze(1)
-                        merged_contexts[logical_idx] = (prev_context * prev_weight) + (segment_context * seg_weight)
+                        merged_numerators[logical_idx] = (
+                            prev_numerator * prev_scale.unsqueeze(1)
+                        ) + (segment_numerator * seg_scale.unsqueeze(1))
                         merged_row_max[logical_idx] = combined_row_max
                         merged_row_sum[logical_idx] = combined_row_sum
+                    merged_contexts = {
+                        logical_idx: numerator
+                        / torch.clamp(merged_row_sum[logical_idx], min=1e-12).unsqueeze(1)
+                        for logical_idx, numerator in merged_numerators.items()
+                    }
                 self._record_timing("qk_softmax_weighted_value_sum_batch_host_reduce", reduce_started_at)
                 self.batch_item_totals["qk_softmax_weighted_value_sum_batch_host_reduce_items"] += len(ordered_entries)
 

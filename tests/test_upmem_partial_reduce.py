@@ -12,35 +12,37 @@ from src.core.resident_kv_store import UpmemKVSlotStore, _KVSlotHelperClient
 
 
 def _merge_reference(entries, outputs):
-    merged_contexts = {}
+    merged_numerators = {}
     merged_row_max = {}
     merged_row_sum = {}
     for entry, (segment_context, segment_row_max, segment_row_sum) in zip(entries, outputs):
         logical_idx = int(entry["logical_idx"])
         score_scale = float(entry["payload"][4])
-        segment_context = segment_context.to(torch.float32)
+        segment_numerator = segment_context.to(torch.float32)
         segment_row_max = segment_row_max.to(torch.float32) * score_scale
         segment_row_sum = segment_row_sum.to(torch.float32)
-        if logical_idx not in merged_contexts:
-            merged_contexts[logical_idx] = segment_context
+        if logical_idx not in merged_numerators:
+            merged_numerators[logical_idx] = segment_numerator
             merged_row_max[logical_idx] = segment_row_max
             merged_row_sum[logical_idx] = segment_row_sum
             continue
 
         prev_row_max = merged_row_max[logical_idx]
         prev_row_sum = merged_row_sum[logical_idx]
-        prev_context = merged_contexts[logical_idx]
+        prev_numerator = merged_numerators[logical_idx]
         combined_row_max = torch.maximum(prev_row_max, segment_row_max)
         prev_scale = torch.exp(prev_row_max - combined_row_max)
         seg_scale = torch.exp(segment_row_max - combined_row_max)
         combined_row_sum = prev_row_sum * prev_scale + segment_row_sum * seg_scale
-        safe_sum = torch.clamp(combined_row_sum, min=1e-12)
-        prev_weight = (prev_row_sum * prev_scale / safe_sum).unsqueeze(1)
-        seg_weight = (segment_row_sum * seg_scale / safe_sum).unsqueeze(1)
-        merged_contexts[logical_idx] = (prev_context * prev_weight) + (segment_context * seg_weight)
+        merged_numerators[logical_idx] = (
+            prev_numerator * prev_scale.unsqueeze(1)
+        ) + (segment_numerator * seg_scale.unsqueeze(1))
         merged_row_max[logical_idx] = combined_row_max
         merged_row_sum[logical_idx] = combined_row_sum
-    return merged_contexts
+    return {
+        logical_idx: numerator / torch.clamp(merged_row_sum[logical_idx], min=1e-12).unsqueeze(1)
+        for logical_idx, numerator in merged_numerators.items()
+    }
 
 
 def test_partial_reduce_helper_matches_legacy_merge():
@@ -65,22 +67,22 @@ def test_partial_reduce_helper_matches_legacy_merge():
     ]
     outputs = [
         (
-            torch.tensor([[6.224593, 7.550813]], dtype=torch.float32),
+            torch.tensor([[10.000002, 12.130615]], dtype=torch.float32),
             torch.tensor([1.0], dtype=torch.float32),
             torch.tensor([1.606531], dtype=torch.float32),
         ),
         (
-            torch.tensor([[6.867378, 2.510163]], dtype=torch.float32),
+            torch.tensor([[11.032656, 4.032655]], dtype=torch.float32),
             torch.tensor([2.0], dtype=torch.float32),
             torch.tensor([1.606531], dtype=torch.float32),
         ),
         (
-            torch.tensor([[2.0, 4.0]], dtype=torch.float32),
+            torch.tensor([[5.0, 10.0]], dtype=torch.float32),
             torch.tensor([3.0], dtype=torch.float32),
             torch.tensor([2.5], dtype=torch.float32),
         ),
         (
-            torch.tensor([[8.0, 1.0]], dtype=torch.float32),
+            torch.tensor([[6.0, 0.75]], dtype=torch.float32),
             torch.tensor([1.0], dtype=torch.float32),
             torch.tensor([0.75], dtype=torch.float32),
         ),
@@ -151,12 +153,12 @@ def test_partial_reduce_uses_cpp_module_when_available():
     ]
     outputs = [
         (
-            torch.tensor([[6.224593, 7.550813]], dtype=torch.float32),
+            torch.tensor([[10.000002, 12.130615]], dtype=torch.float32),
             torch.tensor([1.0], dtype=torch.float32),
             torch.tensor([1.606531], dtype=torch.float32),
         ),
         (
-            torch.tensor([[6.867378, 2.510163]], dtype=torch.float32),
+            torch.tensor([[11.032656, 4.032655]], dtype=torch.float32),
             torch.tensor([2.0], dtype=torch.float32),
             torch.tensor([1.606531], dtype=torch.float32),
         ),

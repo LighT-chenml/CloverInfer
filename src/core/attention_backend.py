@@ -14,6 +14,55 @@ from .clover_planner import plan_sharding
 from .resident_kv_store import HostResidentKVStore, UpmemKVSlotStore
 
 
+def _query_to_kv_head_indices(num_query_heads: int, num_kv_heads: int) -> torch.Tensor:
+    num_query_heads = int(num_query_heads)
+    num_kv_heads = int(num_kv_heads)
+    if num_query_heads <= 0 or num_kv_heads <= 0:
+        raise ValueError(
+            f"attention head counts must be positive, got query={num_query_heads} kv={num_kv_heads}"
+        )
+    if num_query_heads == num_kv_heads:
+        return torch.arange(num_query_heads, dtype=torch.long)
+    if num_query_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"num_query_heads={num_query_heads} must be divisible by num_kv_heads={num_kv_heads}"
+        )
+    repeat_factor = num_query_heads // num_kv_heads
+    return torch.arange(num_query_heads, dtype=torch.long) // int(repeat_factor)
+
+
+def _expand_kv_heads_for_queries(kv: torch.Tensor, num_query_heads: int) -> torch.Tensor:
+    """Return a query-head view of KV without changing full-MHA tensors."""
+
+    if kv.dim() != 3:
+        raise ValueError(f"KV cache tensor must be 3D [seq, heads, dim], got {tuple(kv.shape)}")
+    kv_heads = int(kv.shape[1])
+    num_query_heads = int(num_query_heads)
+    if kv_heads == num_query_heads:
+        return kv
+    head_map = _query_to_kv_head_indices(num_query_heads, kv_heads).to(kv.device)
+    return kv.index_select(1, head_map)
+
+
+def _attention_scores_for_kv_heads(
+    query: torch.Tensor,
+    keys: torch.Tensor,
+    score_scale: float,
+) -> torch.Tensor:
+    q = query.float()
+    k_for_q = _expand_kv_heads_for_queries(keys.float(), int(q.shape[0]))
+    return torch.einsum("hd,lhd->hl", q, k_for_q) * float(score_scale)
+
+
+def _attention_context_for_kv_heads(
+    weights: torch.Tensor,
+    values: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    values_for_q = _expand_kv_heads_for_queries(values.float(), int(weights.shape[0]))
+    return torch.einsum("hl,lhd->hd", weights, values_for_q).to(dtype)
+
+
 @dataclass
 class HeadGroupState:
     dpu_id: int
@@ -26,18 +75,32 @@ class HeadGroupState:
     v_slot: str
     physical_dpus: List[int] | None = None
     token_segments: List[Dict[str, int]] | None = None
+    kv_head_start: int | None = None
+    kv_head_end: int | None = None
 
     @property
     def group_heads(self) -> int:
         return int(self.head_end - self.head_start)
 
     @property
+    def slot_head_start(self) -> int:
+        return int(self.head_start if self.kv_head_start is None else self.kv_head_start)
+
+    @property
+    def slot_head_end(self) -> int:
+        return int(self.head_end if self.kv_head_end is None else self.kv_head_end)
+
+    @property
+    def slot_group_heads(self) -> int:
+        return int(self.slot_head_end - self.slot_head_start)
+
+    @property
     def live_elems(self) -> int:
-        return int(self.seq_len) * self.group_heads * int(self.head_dim)
+        return int(self.seq_len) * self.slot_group_heads * int(self.head_dim)
 
     @property
     def capacity_elems(self) -> int:
-        return int(self.capacity) * self.group_heads * int(self.head_dim)
+        return int(self.capacity) * self.slot_group_heads * int(self.head_dim)
 
 
 @dataclass
@@ -46,6 +109,11 @@ class LayerState:
     num_heads: int
     head_dim: int
     head_groups: List[HeadGroupState]
+    num_kv_heads: int | None = None
+
+    @property
+    def kv_heads(self) -> int:
+        return int(self.num_heads if self.num_kv_heads is None else self.num_kv_heads)
 
 
 @dataclass
@@ -144,10 +212,11 @@ class CpuAttentionBackend:
         keys = self._tail_tensor_for_window(keys, attention_window)
         values = self._tail_tensor_for_window(values, attention_window)
 
-        # q: [heads, dim], keys/values: [seq, heads, dim]
-        scores = torch.einsum("hd,lhd->hl", q.float(), keys.float()) * float(score_scale)
+        # q: [query_heads, dim], keys/values: [seq, kv_heads, dim]. For
+        # GQA/MQA, multiple query heads share one KV head.
+        scores = _attention_scores_for_kv_heads(q, keys, float(score_scale))
         weights = torch.softmax(scores, dim=-1)
-        context = torch.einsum("hl,lhd->hd", weights, values.float()).to(query.dtype)
+        context = _attention_context_for_kv_heads(weights, values, query.dtype)
 
         if layer_idx == len(self.k_cache[request_id]) - 1:
             self.context_lens[request_id] += 1
@@ -245,9 +314,9 @@ class GpuAttentionBackend(CpuAttentionBackend):
         attention_window = self._attention_window_for_seq_len(int(keys.shape[0]))
         keys = self._tail_tensor_for_window(keys, attention_window)
         values = self._tail_tensor_for_window(values, attention_window)
-        scores = torch.einsum("hd,lhd->hl", q.float(), keys.float()) * float(score_scale)
+        scores = _attention_scores_for_kv_heads(q, keys, float(score_scale))
         weights = torch.softmax(scores, dim=-1)
-        context = torch.einsum("hl,lhd->hd", weights, values.float()).to(query.dtype)
+        context = _attention_context_for_kv_heads(weights, values, query.dtype)
 
         if layer_idx == len(self.k_cache[request_id]) - 1:
             self.context_lens[request_id] += 1
@@ -422,6 +491,103 @@ class PimNaiveAttentionBackend:
         record["keys"] = self._tail_tensor_for_window(keys, window)
         record["values"] = self._tail_tensor_for_window(values, window)
 
+    def _compute_scores_from_record_kv(self, record: Dict[str, object]) -> torch.Tensor:
+        keys = record.get("keys")
+        if keys is None:
+            raise RuntimeError("host score computation requires materialized keys")
+        return _attention_scores_for_kv_heads(
+            record["q_fp32"],
+            keys,
+            float(record.get("score_scale", 1.0)),
+        )
+
+    def _compute_context_from_record_values(
+        self,
+        record: Dict[str, object],
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        values = record.get("values")
+        if values is None:
+            raise RuntimeError("host context computation requires materialized values")
+        return _attention_context_for_kv_heads(weights, values, record["query_dtype"])
+
+    def _layer_state_uses_gqa(self, layer_state: LayerState, num_query_heads: int | None = None) -> bool:
+        query_heads = int(layer_state.num_heads if num_query_heads is None else num_query_heads)
+        return int(layer_state.kv_heads) != int(query_heads)
+
+    def _local_head_indices_for_group(
+        self,
+        layer_state: LayerState,
+        group: HeadGroupState,
+        num_query_heads: int,
+    ) -> List[int]:
+        num_query_heads = int(num_query_heads)
+        num_kv_heads = int(layer_state.kv_heads)
+        if num_query_heads == num_kv_heads:
+            return list(range(group.slot_group_heads))
+        head_map = _query_to_kv_head_indices(num_query_heads, num_kv_heads)
+        local_indices = []
+        for query_head in range(int(group.head_start), int(group.head_end)):
+            kv_head = int(head_map[int(query_head)].item())
+            local_indices.append(kv_head - int(group.slot_head_start))
+        return local_indices
+
+    def _query_slice_for_group(
+        self,
+        record: Dict[str, object],
+        layer_state: LayerState,
+        group: HeadGroupState,
+    ) -> tuple[list[int], torch.Tensor]:
+        num_query_heads = int(record["q_fp32"].shape[0])
+        local_head_indices = self._local_head_indices_for_group(
+            layer_state,
+            group,
+            num_query_heads,
+        )
+        if len(local_head_indices) != int(group.group_heads):
+            raise RuntimeError(
+                "query/KV head mapping produced an invalid group shape: "
+                f"query_heads={num_query_heads}, kv_heads={layer_state.kv_heads}, "
+                f"group=({group.head_start},{group.head_end}), local={local_head_indices}"
+            )
+        return (
+            local_head_indices,
+            record["q_fp32"][group.head_start:group.head_end].contiguous(),
+        )
+
+    def _local_head_index_for_query_head(
+        self,
+        layer_state: LayerState,
+        group: HeadGroupState,
+        query_head: int,
+        num_query_heads: int,
+    ) -> int:
+        return self._local_head_indices_for_group(
+            layer_state,
+            group,
+            int(num_query_heads),
+        )[int(query_head) - int(group.head_start)]
+
+    def _storage_kv_for_layer_state(
+        self,
+        tensor: torch.Tensor,
+        layer_state: LayerState,
+    ) -> torch.Tensor:
+        if int(tensor.shape[0]) == int(layer_state.kv_heads):
+            return tensor
+        if int(tensor.shape[0]) != int(layer_state.num_heads):
+            raise RuntimeError(
+                f"KV append head count mismatch for layer={layer_state.layer_idx}: "
+                f"got={int(tensor.shape[0])}, expected kv={layer_state.kv_heads} "
+                f"or query={layer_state.num_heads}"
+            )
+        if int(layer_state.num_heads) % int(layer_state.kv_heads) != 0:
+            raise RuntimeError(
+                f"query heads={layer_state.num_heads} not divisible by kv heads={layer_state.kv_heads}"
+            )
+        repeat_factor = int(layer_state.num_heads) // int(layer_state.kv_heads)
+        return tensor[::repeat_factor].contiguous()
+
     def _resident_initial_kv_for_attention(
         self,
         initial_kv: List[Dict[str, torch.Tensor]],
@@ -447,6 +613,8 @@ class PimNaiveAttentionBackend:
                 {
                     "key": self._tail_tensor_for_window(layer_key, active_window).contiguous(),
                     "value": self._tail_tensor_for_window(layer_value, active_window).contiguous(),
+                    "num_query_heads": int(layer.get("num_query_heads", layer_key.shape[1])),
+                    "num_key_value_heads": int(layer.get("num_key_value_heads", layer_key.shape[1])),
                 }
             )
         return (resident_kv, logical_context_len)
@@ -460,6 +628,8 @@ class PimNaiveAttentionBackend:
             "physical_dpus": [int(physical_dpu) for physical_dpu in list(group.physical_dpus or [group.dpu_id])],
             "heads": [int(group.head_start), int(group.head_end)],
             "group_heads": int(group.group_heads),
+            "kv_heads": [int(group.slot_head_start), int(group.slot_head_end)],
+            "slot_group_heads": int(group.slot_group_heads),
             "seq_len": int(group.seq_len),
             "capacity": int(group.capacity),
             "head_dim": int(group.head_dim),
@@ -482,6 +652,7 @@ class PimNaiveAttentionBackend:
         return {
             "layer_idx": int(layer_state.layer_idx),
             "num_heads": int(layer_state.num_heads),
+            "num_kv_heads": int(layer_state.kv_heads),
             "head_dim": int(layer_state.head_dim),
             "group_count": len(layer_state.head_groups),
             "live_elems": int(live_elems),
@@ -563,6 +734,9 @@ class PimNaiveAttentionBackend:
                         "head_start": int(group.head_start),
                         "head_end": int(group.head_end),
                         "group_heads": int(group.group_heads),
+                        "kv_head_start": int(group.slot_head_start),
+                        "kv_head_end": int(group.slot_head_end),
+                        "slot_group_heads": int(group.slot_group_heads),
                         "physical_dpu": int(group.dpu_id),
                         "physical_dpus": [int(physical_dpu) for physical_dpu in group_physical_dpus],
                         "token_segments": [
@@ -595,6 +769,15 @@ class PimNaiveAttentionBackend:
                             "head_start": int(group["head_start"]),
                             "head_end": int(group["head_end"]),
                             "group_heads": int(group["group_heads"]),
+                            "kv_head_start": int(group.get("kv_head_start", group["head_start"])),
+                            "kv_head_end": int(group.get("kv_head_end", group["head_end"])),
+                            "slot_group_heads": int(
+                                group.get(
+                                    "slot_group_heads",
+                                    int(group.get("kv_head_end", group["head_end"]))
+                                    - int(group.get("kv_head_start", group["head_start"])),
+                                )
+                            ),
                             "physical_dpu": int(group["physical_dpu"]),
                             "physical_dpus": [int(physical_dpu) for physical_dpu in list(group.get("physical_dpus", []) or [])],
                             "token_segments": [
@@ -797,6 +980,7 @@ class PimNaiveAttentionBackend:
         head_end: int,
         head_dim: int,
         allowed_dpus: List[int],
+        slot_group_heads: int | None = None,
     ) -> List[Dict[str, int]]:
         def _target_segment_dpus() -> List[int]:
             if not allowed_dpus:
@@ -812,7 +996,7 @@ class PimNaiveAttentionBackend:
             if pool_capacity_elems <= 0:
                 return list(allowed_dpus)
 
-            group_heads = max(1, int(head_end) - int(head_start))
+            group_heads = max(1, int(slot_group_heads or (int(head_end) - int(head_start))))
             logical_capacity = max(int(seq_len), int(capacity))
             slot_elem_count_fn = getattr(self.resident_store, "_slot_elem_count", None)
             if callable(slot_elem_count_fn):
@@ -1319,41 +1503,51 @@ class PimNaiveAttentionBackend:
         decode_reserve_tokens: int = 0,
         preferred_dpu_stripe: List[int] | None = None,
         sharding_plan: Dict[str, object] | None = None,
+        num_query_heads: int | None = None,
     ) -> List[HeadGroupState]:
-        seq_len, num_heads, head_dim = (int(dim) for dim in layer_key.shape)
-        if num_heads <= 0:
+        seq_len, num_kv_heads, head_dim = (int(dim) for dim in layer_key.shape)
+        num_query_heads = int(num_kv_heads if num_query_heads is None else num_query_heads)
+        if num_kv_heads <= 0:
             raise ValueError(f"layer {layer_idx} in request {request_id} has no attention heads")
+        if num_query_heads % num_kv_heads != 0:
+            raise ValueError(
+                f"request={request_id} layer={layer_idx} has incompatible query/KV heads: "
+                f"query={num_query_heads} kv={num_kv_heads}"
+            )
 
         capacity = max(self.length, seq_len + max(0, int(decode_reserve_tokens)))
         head_groups = []
         request_hash = sum(ord(ch) for ch in request_id)
         dpu_rotation = (request_hash + int(layer_idx)) % max(self.num_dpus, 1)
-        group_specs = self._planner_group_specs(sharding_plan, seq_len, num_heads, head_dim)
+        group_specs = self._planner_group_specs(sharding_plan, seq_len, num_kv_heads, head_dim)
         if not group_specs:
-            num_groups = self._effective_head_group_count(seq_len, num_heads, head_dim)
+            num_groups = self._effective_head_group_count(seq_len, num_kv_heads, head_dim)
             group_ranges: List[tuple[int, int]] = []
             if self.head_grouping_policy == "legacy":
-                heads_per_group = math.ceil(num_heads / num_groups)
+                heads_per_group = math.ceil(num_kv_heads / num_groups)
                 for group_idx in range(num_groups):
                     head_start = group_idx * heads_per_group
-                    head_end = min(num_heads, head_start + heads_per_group)
+                    head_end = min(num_kv_heads, head_start + heads_per_group)
                     if head_start >= head_end:
                         break
                     group_ranges.append((head_start, head_end))
             else:
-                base_heads_per_group = num_heads // num_groups
-                extra_head_groups = num_heads % num_groups
+                base_heads_per_group = num_kv_heads // num_groups
+                extra_head_groups = num_kv_heads % num_groups
                 head_start = 0
                 for _ in range(num_groups):
                     group_heads = base_heads_per_group + (1 if len(group_ranges) < extra_head_groups else 0)
-                    head_end = min(num_heads, head_start + group_heads)
+                    head_end = min(num_kv_heads, head_start + group_heads)
                     if head_start >= head_end:
                         break
                     group_ranges.append((head_start, head_end))
                     head_start = head_end
             group_specs = [(head_start, head_end, []) for head_start, head_end in group_ranges]
 
-        for group_idx, (head_start, head_end, logical_dpu_ids) in enumerate(group_specs):
+        query_heads_per_kv = num_query_heads // num_kv_heads
+        for group_idx, (kv_head_start, kv_head_end, logical_dpu_ids) in enumerate(group_specs):
+            query_head_start = int(kv_head_start) * int(query_heads_per_kv)
+            query_head_end = int(kv_head_end) * int(query_heads_per_kv)
             allowed_dpus = (
                 self._map_logical_dpus_to_physical(
                     logical_dpu_ids,
@@ -1368,10 +1562,11 @@ class PimNaiveAttentionBackend:
                 request_id=request_id,
                 seq_len=seq_len,
                 capacity=capacity,
-                head_start=head_start,
-                head_end=head_end,
+                head_start=kv_head_start,
+                head_end=kv_head_end,
                 head_dim=head_dim,
                 allowed_dpus=allowed_dpus,
+                slot_group_heads=int(kv_head_end) - int(kv_head_start),
             )
             use_segment_plan, segment_decision = self._planner_segment_materialization_decision(segment_plan)
             if segment_plan:
@@ -1396,8 +1591,8 @@ class PimNaiveAttentionBackend:
             )
             k_slot = f"{request_id}:layer{layer_idx}:group{group_idx}:k"
             v_slot = f"{request_id}:layer{layer_idx}:group{group_idx}:v"
-            initial_k_group = layer_key[:, head_start:head_end, :].contiguous()
-            initial_v_group = layer_value[:, head_start:head_end, :].contiguous()
+            initial_k_group = layer_key[:, kv_head_start:kv_head_end, :].contiguous()
+            initial_v_group = layer_value[:, kv_head_start:kv_head_end, :].contiguous()
             allocation_info = self.resident_store.allocate_group(
                 k_slot,
                 v_slot,
@@ -1422,8 +1617,8 @@ class PimNaiveAttentionBackend:
             head_groups.append(
                 HeadGroupState(
                     dpu_id=physical_dpu if actual_physical_dpu is None else int(actual_physical_dpu),
-                    head_start=head_start,
-                    head_end=head_end,
+                    head_start=query_head_start,
+                    head_end=query_head_end,
                     seq_len=seq_len,
                     capacity=capacity,
                     head_dim=head_dim,
@@ -1438,6 +1633,8 @@ class PimNaiveAttentionBackend:
                         }
                         for segment in allocation_segments
                     ],
+                    kv_head_start=kv_head_start,
+                    kv_head_end=kv_head_end,
                 )
             )
         return head_groups
@@ -1983,11 +2180,18 @@ class PimNaiveAttentionBackend:
             )
 
         context_len = int(first_layer_key.shape[0])
+        first_num_kv_heads = int(first_layer_key.shape[1])
+        requested_num_query_heads = None
+        if isinstance(initial_kv[0], dict) and "num_query_heads" in initial_kv[0]:
+            requested_num_query_heads = int(initial_kv[0]["num_query_heads"])
+        elif isinstance(initial_kv[0], dict) and "num_attention_heads" in initial_kv[0]:
+            requested_num_query_heads = int(initial_kv[0]["num_attention_heads"])
+        num_query_heads_for_plan = int(requested_num_query_heads or first_num_kv_heads)
         logical_len = int(context_len if logical_context_len is None else logical_context_len)
         sharding_plan = plan_sharding(
             [{"request_id": str(request_id), "seq_len": int(context_len)}],
             D=max(1, int(self.num_dpus)),
-            H=max(1, int(first_layer_key.shape[1])),
+            H=max(1, first_num_kv_heads),
         )
         preferred_dpu_stripe = self._preferred_dpu_stripe_for_request(
             request_id,
@@ -2004,7 +2208,15 @@ class PimNaiveAttentionBackend:
                     f"got shape {tuple(layer_key.shape)}"
                 )
 
-            seq_len, num_heads, head_dim = (int(dim) for dim in layer_key.shape)
+            seq_len, num_kv_heads, head_dim = (int(dim) for dim in layer_key.shape)
+            num_query_heads = int(
+                layer.get("num_query_heads", layer.get("num_attention_heads", num_query_heads_for_plan))
+            )
+            if num_query_heads % num_kv_heads != 0:
+                raise ValueError(
+                    f"request={request_id} layer={layer_idx} has incompatible query/KV heads: "
+                    f"query={num_query_heads} kv={num_kv_heads}"
+                )
             layer_preferred_dpu_stripe = self._preferred_dpu_stripe_for_layer(
                 request_id,
                 layer_idx,
@@ -2013,8 +2225,9 @@ class PimNaiveAttentionBackend:
             layer_states.append(
                 LayerState(
                     layer_idx=layer_idx,
-                    num_heads=num_heads,
+                    num_heads=num_query_heads,
                     head_dim=head_dim,
+                    num_kv_heads=num_kv_heads,
                     head_groups=self._build_head_groups(
                         request_id,
                         layer_idx,
@@ -2023,6 +2236,7 @@ class PimNaiveAttentionBackend:
                         decode_reserve_tokens,
                         preferred_dpu_stripe=layer_preferred_dpu_stripe,
                         sharding_plan=sharding_plan,
+                        num_query_heads=num_query_heads,
                     ),
                 )
             )
@@ -2081,9 +2295,11 @@ class PimNaiveAttentionBackend:
                     f"layer={layer_idx} dpu={group.dpu_id}: group_seq_len={group.seq_len} "
                     f"context_len={request_state.context_len}"
                 )
-            group_k_new = k_new[group.head_start:group.head_end, :].unsqueeze(0).contiguous()
-            group_v_new = v_new[group.head_start:group.head_end, :].unsqueeze(0).contiguous()
-            if group_k_new.shape[1] != group.head_end - group.head_start:
+            storage_k_new = self._storage_kv_for_layer_state(k_new, layer_state)
+            storage_v_new = self._storage_kv_for_layer_state(v_new, layer_state)
+            group_k_new = storage_k_new[group.slot_head_start:group.slot_head_end, :].unsqueeze(0).contiguous()
+            group_v_new = storage_v_new[group.slot_head_start:group.slot_head_end, :].unsqueeze(0).contiguous()
+            if group_k_new.shape[1] != group.slot_group_heads:
                 raise RuntimeError(
                     f"resident k append shape mismatch for request={request_state.request_id} "
                     f"layer={layer_idx} dpu={group.dpu_id}: got={tuple(group_k_new.shape)}"
@@ -2138,11 +2354,11 @@ class PimNaiveAttentionBackend:
         ]
         keys = torch.cat([pair[0] for pair in materialized_groups], dim=1).contiguous()
         values = torch.cat([pair[1] for pair in materialized_groups], dim=1).contiguous()
-        if int(keys.shape[1]) != layer_state.num_heads or int(values.shape[1]) != layer_state.num_heads:
+        if int(keys.shape[1]) != layer_state.kv_heads or int(values.shape[1]) != layer_state.kv_heads:
             raise RuntimeError(
                 f"resident materialization head mismatch for request={request_state.request_id} "
                 f"layer={layer_idx}: keys={tuple(keys.shape)} values={tuple(values.shape)} "
-                f"expected_heads={layer_state.num_heads}"
+                f"expected_kv_heads={layer_state.kv_heads}"
             )
         self.resident_materialize_ops += 1
         return keys, values
@@ -2483,7 +2699,7 @@ class PimNaiveAttentionBackend:
         }
         self._set_record_attention_kv(record, keys, values)
         if not (self.resident_compute_enabled and self.qk_full_enabled):
-            record["scores"] = torch.einsum("hd,lhd->hl", q_fp32, record["keys"].float()) * score_scale
+            record["scores"] = self._compute_scores_from_record_kv(record)
         return record
 
     def _compute_host_scores(self, record: Dict[str, object]) -> torch.Tensor:
@@ -2491,11 +2707,8 @@ class PimNaiveAttentionBackend:
         if keys is None:
             full_keys = self.cpu_backend.k_cache[record["request_id"]][record["layer_idx"]]
             keys = self._tail_tensor_for_window(full_keys, int(record.get("attention_window", full_keys.shape[0])))
-        return torch.einsum(
-            "hd,lhd->hl",
-            record["q_fp32"],
-            keys.float(),
-        ) * float(record["score_scale"])
+            record["keys"] = keys
+        return self._compute_scores_from_record_kv(record)
 
     def _finalize_ready_context_records(self, records: List[Dict[str, object]]) -> List[torch.Tensor]:
         outputs: List[torch.Tensor] = []
@@ -2517,14 +2730,15 @@ class PimNaiveAttentionBackend:
             layer_state = record["request_state"].layer_states[record["layer_idx"]]
             record["full_qk_group_scores"] = []
             for group in layer_state.head_groups:
+                local_head_indices, local_query = self._query_slice_for_group(record, layer_state, group)
                 window = min(int(group.seq_len), int(record["attention_window"]))
                 flat_slot_queries.append(
                     (
                         group.k_slot,
                         group.v_slot,
-                        list(range(group.group_heads)),
+                        local_head_indices,
                         int(window),
-                        record["q_fp32"][group.head_start:group.head_end].contiguous(),
+                        local_query,
                     )
                 )
                 slot_query_refs.append((record, int(group.head_start), int(group.head_end)))
@@ -2564,7 +2778,7 @@ class PimNaiveAttentionBackend:
             layer_state = record["request_state"].layer_states[record["layer_idx"]]
             record["fused_group_contexts"] = []
             for group in layer_state.head_groups:
-                local_head_indices = list(range(group.group_heads))
+                local_head_indices, local_query = self._query_slice_for_group(record, layer_state, group)
                 window = min(int(group.seq_len), int(record["attention_window"]))
                 flat_slot_queries.append(
                     (
@@ -2572,7 +2786,7 @@ class PimNaiveAttentionBackend:
                         group.v_slot,
                         local_head_indices,
                         int(window),
-                        record["q_fp32"][group.head_start:group.head_end].contiguous(),
+                        local_query,
                         float(record["score_scale"]),
                     )
                 )
@@ -2624,7 +2838,7 @@ class PimNaiveAttentionBackend:
 
             if need_context_shadow:
                 weights = torch.softmax(host_scores, dim=-1)
-                cpu_context = torch.einsum("hl,lhd->hd", weights, record["values"].float()).to(record["query_dtype"])
+                cpu_context = self._compute_context_from_record_values(record, weights)
                 av_diff = float(torch.max(torch.abs(record["context"].float() - cpu_context.float())).item())
                 self.softmax_av_fused_shadow_max_abs_diff = max(self.softmax_av_fused_shadow_max_abs_diff, av_diff)
 
@@ -2677,7 +2891,14 @@ class PimNaiveAttentionBackend:
                         "window": int(window),
                     }
                 slot_entry = grouped_slot_queries[slot_key]
-                slot_entry["local_head_indices"].append(int(head - group.head_start))
+                slot_entry["local_head_indices"].append(
+                    self._local_head_index_for_query_head(
+                        layer_state,
+                        group,
+                        head,
+                        int(record["q_fp32"].shape[0]),
+                    )
+                )
                 slot_entry["head_rows"].append(int(head))
                 head_to_slot_row.append((slot_key, len(slot_entry["local_head_indices"]) - 1))
 
@@ -2756,8 +2977,13 @@ class PimNaiveAttentionBackend:
 
         for record_idx, record in enumerate(records):
             use_fused_softmax_av = bool(record["use_resident_av"] and self.softmax_av_fused_enabled)
+            layer_state = record["request_state"].layer_states[record["layer_idx"]]
+            if self._layer_state_uses_gqa(layer_state, int(record["q_fp32"].shape[0])):
+                record["use_resident_av"] = False
+                use_fused_softmax_av = False
+                if record.get("scores") is None:
+                    record["scores"] = self._compute_host_scores(record)
             if use_fused_softmax_av:
-                layer_state = record["request_state"].layer_states[record["layer_idx"]]
                 slot_scores = [
                     (
                         group.k_slot,
@@ -2775,7 +3001,6 @@ class PimNaiveAttentionBackend:
                 weights = torch.softmax(record["scores"], dim=-1)
                 record["weights"] = weights
                 if record["use_resident_av"]:
-                    layer_state = record["request_state"].layer_states[record["layer_idx"]]
                     slot_weights = [
                         (
                             group.k_slot,
@@ -2787,7 +3012,7 @@ class PimNaiveAttentionBackend:
                     flat_slot_weights.extend(slot_weights)
                     slot_weight_refs.append((record_idx, len(slot_weights)))
                 else:
-                    record["context"] = torch.einsum("hl,lhd->hd", weights, record["values"].float()).to(record["query_dtype"])
+                    record["context"] = self._compute_context_from_record_values(record, weights)
 
         if flat_slot_scores:
             group_contexts = self.resident_store.softmax_weighted_value_sum_batch(flat_slot_scores)
@@ -2798,7 +3023,7 @@ class PimNaiveAttentionBackend:
                 context = torch.cat(group_contexts[offset : offset + group_count], dim=0).to(record["query_dtype"])
                 offset += group_count
                 if self.softmax_av_shadow_check:
-                    cpu_context = torch.einsum("hl,lhd->hd", record["weights"], record["values"].float()).to(record["query_dtype"])
+                    cpu_context = self._compute_context_from_record_values(record, record["weights"])
                     av_diff = float(torch.max(torch.abs(context.float() - cpu_context.float())).item())
                     self.softmax_av_fused_shadow_max_abs_diff = max(self.softmax_av_fused_shadow_max_abs_diff, av_diff)
                 self.softmax_av_fused_ops += 1
@@ -2812,7 +3037,7 @@ class PimNaiveAttentionBackend:
                 record = records[record_idx]
                 context = torch.cat(group_contexts[offset : offset + group_count], dim=0).to(record["query_dtype"])
                 offset += group_count
-                cpu_context = torch.einsum("hl,lhd->hd", record["weights"], record["values"].float()).to(record["query_dtype"])
+                cpu_context = self._compute_context_from_record_values(record, record["weights"])
                 av_diff = float(torch.max(torch.abs(context.float() - cpu_context.float())).item())
                 self.resident_av_shadow_max_abs_diff = max(self.resident_av_shadow_max_abs_diff, av_diff)
                 self.resident_av_ops += 1

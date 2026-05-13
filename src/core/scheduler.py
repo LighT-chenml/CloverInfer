@@ -68,6 +68,7 @@ class GlobalScheduler:
             "num_layers": int(model_config.num_layers),
             "hidden_size": int(model_config.hidden_size),
             "num_heads": int(model_config.num_heads),
+            "num_key_value_heads": int(getattr(model_config, "num_key_value_heads", model_config.num_heads)),
             "vocab_size": 0,
         }
         self.decode_step_sync_window_s = max(0.0, float(cluster_config.decode_step_sync_window_s))
@@ -431,48 +432,6 @@ class GlobalScheduler:
                         self.clover_rankset_overlap_transfer_granularity,
                     )
                 )
-                if layer_groups and self.clover_rankset_overlap_transfer_granularity == "rankset":
-                    for group in layer_groups:
-                        head_start = int(group.get("head_start", 0))
-                        head_end = int(group.get("head_end", 0))
-                        physical_dpu = int(group.get("physical_dpu", 0))
-                        work_item_key = (
-                            f"{rankset_id}:dpu{physical_dpu}:h{head_start}-{head_end}"
-                        )
-                        work_item = grouped.get(work_item_key)
-                        if work_item is None:
-                            work_item = {
-                                "work_item_id": f"layer{int(layer_idx)}:{work_item_key}",
-                                "layer_idx": int(layer_idx),
-                                "rankset_id": rankset_id,
-                                "rank_index": request_rankset.get("rank_index"),
-                                "physical_dpus": [physical_dpu],
-                                "stripe_width": 1,
-                                "transfer_granularity": transfer_granularity,
-                                "request_ids": [],
-                                "request_group_slices": {},
-                                "group_signature": {
-                                    "head_start": head_start,
-                                    "head_end": head_end,
-                                    "group_heads": int(group.get("group_heads", 0)),
-                                    "physical_dpu": physical_dpu,
-                                },
-                                "status": "planned",
-                            }
-                            grouped[work_item_key] = work_item
-                        work_item["request_ids"].append(request_id)
-                        work_item["request_group_slices"].setdefault(request_id, []).append(
-                            {
-                                "head_start": head_start,
-                                "head_end": head_end,
-                                "group_heads": int(group.get("group_heads", 0)),
-                                "physical_dpu": physical_dpu,
-                                "k_slot": str(group.get("k_slot", "")),
-                                "v_slot": str(group.get("v_slot", "")),
-                            }
-                        )
-                    continue
-
                 work_item = grouped.get(rankset_id)
                 if work_item is None:
                     work_item = {

@@ -160,6 +160,11 @@ class CausalModelAdapter:
             "hidden_size": self.hidden_size,
             "num_heads": self.num_heads,
             "num_key_value_heads": self.num_key_value_heads,
+            "query_heads_per_kv_head": (
+                self.num_heads // self.num_key_value_heads
+                if self.num_key_value_heads > 0 and self.num_heads % self.num_key_value_heads == 0
+                else 1
+            ),
             "vocab_size": self.vocab_size,
         }
 
@@ -184,6 +189,8 @@ class CausalModelAdapter:
                 {
                     "key": self._normalize_key_cache(key),
                     "value": self._normalize_value_cache(value),
+                    "num_query_heads": int(self.num_heads),
+                    "num_key_value_heads": int(self.num_key_value_heads),
                 }
             )
 
@@ -214,7 +221,7 @@ class CausalModelAdapter:
         if self.model_type == "qwen":
             return key[0].contiguous().cpu()
         if self.model_type == "llama":
-            return self._expand_kv_heads(key[0].transpose(0, 1).contiguous()).cpu()
+            return key[0].transpose(0, 1).contiguous().cpu()
         raise ValueError(f"Unsupported model type for cache normalization: {self.model_type}")
 
     def _normalize_value_cache(self, value: torch.Tensor) -> torch.Tensor:
@@ -223,7 +230,7 @@ class CausalModelAdapter:
         if self.model_type == "qwen":
             return value[0].contiguous().cpu()
         if self.model_type == "llama":
-            return self._expand_kv_heads(value[0].transpose(0, 1).contiguous()).cpu()
+            return value[0].transpose(0, 1).contiguous().cpu()
         raise ValueError(f"Unsupported model type for cache normalization: {self.model_type}")
 
     def _expand_kv_heads(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -525,8 +532,6 @@ class CausalModelAdapter:
         query = query[:, :, 0, :].contiguous()
         key = key[:, :, 0, :].contiguous()
         value = value[:, :, 0, :].contiguous()
-        key = self._expand_kv_heads(key.transpose(0, 1)).transpose(0, 1)
-        value = self._expand_kv_heads(value.transpose(0, 1)).transpose(0, 1)
 
         return {
             "residual": residual.detach().cpu(),
@@ -534,6 +539,8 @@ class CausalModelAdapter:
             "key": key.squeeze(0).detach().cpu(),
             "value": value.squeeze(0).detach().cpu(),
             "score_scale": float(attn.scaling),
+            "num_query_heads": int(self.num_heads),
+            "num_key_value_heads": int(self.num_key_value_heads),
         }
 
     def finish_layer(self, residual: torch.Tensor, attention_context: torch.Tensor, layer_idx: int) -> torch.Tensor:

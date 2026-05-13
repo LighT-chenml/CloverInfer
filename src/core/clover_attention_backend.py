@@ -248,6 +248,20 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         for layer in initial_kv:
             layer_k = layer["key"].detach().cpu().contiguous()
             layer_v = layer["value"].detach().cpu().contiguous()
+            query_heads = int(
+                layer.get("num_query_heads", layer.get("num_attention_heads", layer_k.shape[1]))
+            )
+            kv_heads = int(layer.get("num_key_value_heads", layer_k.shape[1]))
+            if int(layer_k.shape[1]) != kv_heads or int(layer_v.shape[1]) != kv_heads:
+                raise ValueError(
+                    "CPU shadow KV head metadata does not match tensor shape: "
+                    f"key_shape={tuple(layer_k.shape)}, value_shape={tuple(layer_v.shape)}, "
+                    f"num_key_value_heads={kv_heads}"
+                )
+            if query_heads % kv_heads != 0:
+                raise ValueError(
+                    f"num_query_heads={query_heads} must be divisible by num_key_value_heads={kv_heads}"
+                )
             seq_len, num_heads, head_dim = (int(dim) for dim in layer_k.shape)
             capacity = max(seq_len + max(0, int(decode_reserve_tokens)), seq_len, 1)
             k_buf = torch.empty((capacity, num_heads, head_dim), dtype=layer_k.dtype)
@@ -348,7 +362,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                 continue
             scores = self._compute_host_scores(record)
             weights = torch.softmax(scores, dim=-1)
-            _ = torch.einsum("hl,lhd->hd", weights, record["values"].float())
+            _ = self._compute_context_from_record_values(record, weights)
         return max(0.0, float(time.perf_counter() - started_at))
 
     def _maybe_trigger_pim_perf_guard(
@@ -422,7 +436,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         for record in records:
             scores = self._compute_host_scores(record)
             weights = torch.softmax(scores, dim=-1)
-            context = torch.einsum("hl,lhd->hd", weights, record["values"].float()).to(record["query_dtype"])
+            context = self._compute_context_from_record_values(record, weights)
             if record["layer_idx"] == len(self.shadow_k_buffers[record["request_id"]]) - 1:
                 self.cpu_backend.context_lens[record["request_id"]] += 1
             outputs.append(context.unsqueeze(0))
@@ -560,7 +574,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                     with self._timed("resident_materialize_s"):
                         keys, values = self._materialize_layer_kv(request_state, layer_idx)
                     self._set_record_attention_kv(record, keys, values)
-                record["scores"] = torch.einsum("hd,lhd->hl", q_fp32, record["keys"].float()) * score_scale
+                record["scores"] = self._compute_scores_from_record_kv(record)
             return record
 
     def _apply_qk_context_fused_batch(self, records: List[Dict[str, object]]) -> None:
@@ -572,7 +586,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                 layer_state = record["request_state"].layer_states[record["layer_idx"]]
                 record["fused_group_contexts"] = []
                 for group in layer_state.head_groups:
-                    local_head_indices = list(range(group.group_heads))
+                    local_head_indices, local_query = self._query_slice_for_group(record, layer_state, group)
                     window = min(int(group.seq_len), int(record["attention_window"]))
                     flat_slot_queries.append(
                         (
@@ -580,7 +594,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                             group.v_slot,
                             local_head_indices,
                             int(window),
-                            record["q_fp32"][group.head_start:group.head_end].contiguous(),
+                            local_query,
                             float(record["score_scale"]),
                         )
                     )
@@ -607,14 +621,15 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                         continue
                     layer_state = record["request_state"].layer_states[record["layer_idx"]]
                     for group in layer_state.head_groups:
+                        local_head_indices, local_query = self._query_slice_for_group(record, layer_state, group)
                         window = min(int(group.seq_len), int(record["attention_window"]))
                         shadow_slot_queries.append(
                             (
                                 group.k_slot,
                                 group.v_slot,
-                                list(range(group.group_heads)),
+                                local_head_indices,
                                 int(window),
-                                record["q_fp32"][group.head_start:group.head_end].contiguous(),
+                                local_query,
                             )
                         )
                         shadow_slot_refs.append((record, int(group.head_start), int(group.head_end)))
@@ -654,9 +669,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                 if should_shadow_check and need_context_shadow and record["values"] is not None:
                     with self._timed("softmax_av_s"):
                         weights = torch.softmax(host_scores, dim=-1)
-                    cpu_context = torch.einsum("hl,lhd->hd", weights, record["values"].float()).to(
-                        record["query_dtype"]
-                    )
+                    cpu_context = self._compute_context_from_record_values(record, weights)
                     av_diff = float(torch.max(torch.abs(record["context"].float() - cpu_context.float())).item())
                     self.softmax_av_fused_shadow_max_abs_diff = max(self.softmax_av_fused_shadow_max_abs_diff, av_diff)
 
@@ -767,14 +780,15 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                 layer_state = record["request_state"].layer_states[record["layer_idx"]]
                 record["resident_slot_scores"] = []
                 for group in layer_state.head_groups:
+                    local_head_indices, local_query = self._query_slice_for_group(record, layer_state, group)
                     window = min(int(group.seq_len), int(record["attention_window"]))
                     flat_slot_queries.append(
                         (
                             group.k_slot,
                             group.v_slot,
-                            list(range(group.group_heads)),
+                            local_head_indices,
                             int(window),
-                            record["q_fp32"][group.head_start:group.head_end].contiguous(),
+                            local_query,
                         )
                     )
                     slot_query_refs.append((record, group.k_slot, group.v_slot))
@@ -889,7 +903,14 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                                 "window": int(window),
                             }
                         slot_entry = grouped_slot_queries[slot_key]
-                        slot_entry["local_head_indices"].append(int(head - group.head_start))
+                        slot_entry["local_head_indices"].append(
+                            self._local_head_index_for_query_head(
+                                layer_state,
+                                group,
+                                head,
+                                int(record["q_fp32"].shape[0]),
+                            )
+                        )
                         slot_entry["head_rows"].append(int(head))
                         head_to_slot_row.append((slot_key, len(slot_entry["local_head_indices"]) - 1))
 
@@ -986,11 +1007,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         with self._timed("softmax_av_s"):
             weights = torch.softmax(record["scores"], dim=-1)
         with self._timed("host_context_compute_s"):
-            record["context"] = torch.einsum(
-                "hl,lhd->hd",
-                weights,
-                record["values"].float(),
-            ).to(record["query_dtype"])
+            record["context"] = self._compute_context_from_record_values(record, weights)
         self.resident_context_fallbacks += 1
         self.resident_context_fallback_reason = str(reason)
         self.resident_runtime_fallbacks += 1
@@ -1006,6 +1023,12 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
 
             for record_idx, record in enumerate(records):
                 use_fused_softmax_av = bool(record["use_resident_av"] and self.softmax_av_fused_enabled)
+                layer_state = record["request_state"].layer_states[record["layer_idx"]]
+                if self._layer_state_uses_gqa(layer_state, int(record["q_fp32"].shape[0])):
+                    record["use_resident_av"] = False
+                    use_fused_softmax_av = False
+                    if record.get("scores") is None:
+                        record["scores"] = self._compute_host_scores(record)
                 if use_fused_softmax_av:
                     slot_scores = [
                         (k_slot, v_slot, score_mat.contiguous())
@@ -1032,7 +1055,6 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                         weights = torch.softmax(record["scores"], dim=-1)
                     if record["use_resident_av"]:
                         record["weights"] = weights
-                        layer_state = record["request_state"].layer_states[record["layer_idx"]]
                         slot_weights = [
                             (
                                 group.k_slot,
@@ -1047,9 +1069,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                         if record["values"] is None:
                             raise RuntimeError("CloverInfer host AV fallback requires materialized values")
                         with self._timed("host_context_compute_s"):
-                            record["context"] = torch.einsum(
-                                "hl,lhd->hd", weights, record["values"].float()
-                            ).to(record["query_dtype"])
+                            record["context"] = self._compute_context_from_record_values(record, weights)
 
             if flat_slot_scores:
                 with self._timed("resident_av_s"):
@@ -1062,9 +1082,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                         context = torch.cat(group_contexts[offset : offset + group_count], dim=0).to(record["query_dtype"])
                     offset += group_count
                     if record.get("should_shadow_check", False) and record.get("weights") is not None and record["values"] is not None:
-                        cpu_context = torch.einsum(
-                            "hl,lhd->hd", record["weights"], record["values"].float()
-                        ).to(record["query_dtype"])
+                        cpu_context = self._compute_context_from_record_values(record, record["weights"])
                         av_diff = float(torch.max(torch.abs(context.float() - cpu_context.float())).item())
                         self.softmax_av_fused_shadow_max_abs_diff = max(
                             self.softmax_av_fused_shadow_max_abs_diff, av_diff
@@ -1084,9 +1102,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                         context = torch.cat(group_contexts[offset : offset + group_count], dim=0).to(record["query_dtype"])
                     offset += group_count
                     if record.get("should_shadow_check", False) and record["values"] is not None:
-                        cpu_context = torch.einsum(
-                            "hl,lhd->hd", record["weights"], record["values"].float()
-                        ).to(record["query_dtype"])
+                        cpu_context = self._compute_context_from_record_values(record, record["weights"])
                         av_diff = float(torch.max(torch.abs(context.float() - cpu_context.float())).item())
                         self.resident_av_shadow_max_abs_diff = max(self.resident_av_shadow_max_abs_diff, av_diff)
                     self.resident_av_ops += 1
@@ -1133,7 +1149,8 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         group = self._match_record_group(record, group_slice)
         head_start = int(group.head_start)
         head_end = int(group.head_end)
-        local_query = record["q_fp32"][head_start:head_end].contiguous()
+        layer_state = record["request_state"].layer_states[record["layer_idx"]]
+        local_head_indices, local_query = self._query_slice_for_group(record, layer_state, group)
         window = min(int(group.seq_len), int(record["attention_window"]))
         if record["use_resident_av"] and self.softmax_av_fused_enabled:
             with self._timed("resident_av_s"):
@@ -1142,7 +1159,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                         (
                             group.k_slot,
                             group.v_slot,
-                            list(range(group.group_heads)),
+                            local_head_indices,
                             int(window),
                             local_query,
                             float(record["score_scale"]),
@@ -1154,14 +1171,17 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
             self.softmax_av_fused_ops += 1
             return (head_start, head_end, context.to(record["query_dtype"]))
 
-        if record["use_resident_av"]:
+        if record["use_resident_av"] and not self._layer_state_uses_gqa(
+            layer_state,
+            int(record["q_fp32"].shape[0]),
+        ):
             with self._timed("resident_qk_batch_s"):
                 score_mat = self.resident_store.qk_slot_scores_batch(
                     [
                         (
                             group.k_slot,
                             group.v_slot,
-                            list(range(group.group_heads)),
+                            local_head_indices,
                             int(window),
                             local_query,
                         )
@@ -1177,14 +1197,24 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
             self.resident_av_ops += 1
             return (head_start, head_end, context.to(record["query_dtype"]))
 
-        keys = record["keys"][:, head_start:head_end, :]
-        values = record["values"][:, head_start:head_end, :]
+        keys = record["keys"][:, group.slot_head_start:group.slot_head_end, :]
+        values = record["values"][:, group.slot_head_start:group.slot_head_end, :]
+        local_values = values[:, local_head_indices, :]
         with self._timed("host_score_compute_s"):
-            scores = torch.einsum("hd,lhd->hl", local_query, keys.float()) * float(record["score_scale"])
+            score_rows = []
+            for row_idx, local_head_idx in enumerate(local_head_indices):
+                score_rows.append(
+                    torch.einsum(
+                        "d,ld->l",
+                        local_query[row_idx],
+                        keys[:, int(local_head_idx), :].float(),
+                    )
+                )
+            scores = torch.stack(score_rows, dim=0).contiguous() * float(record["score_scale"])
         with self._timed("softmax_av_s"):
             weights = torch.softmax(scores, dim=-1)
         with self._timed("host_context_compute_s"):
-            context = torch.einsum("hl,lhd->hd", weights, values.float()).to(record["query_dtype"])
+            context = torch.einsum("hl,lhd->hd", weights, local_values.float()).to(record["query_dtype"])
         return (head_start, head_end, context)
 
     def prepare_decode_records(self, items: List[Dict[str, object]]) -> List[Dict[str, object]]:
@@ -1197,15 +1227,47 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
     ) -> Dict[str, List[tuple[int, int, torch.Tensor]]]:
         partials_by_request: Dict[str, List[tuple[int, int, torch.Tensor]]] = {}
         request_group_slices = dict(work_item.get("request_group_slices", {}) or {})
+        fused_slot_queries: list[tuple[str, str, list[int], int, torch.Tensor, float]] = []
+        fused_refs: list[tuple[str, int, int, torch.dtype]] = []
         for record in records:
             request_id = str(record["request_id"])
             group_slices = list(request_group_slices.get(request_id, []) or [])
             if not group_slices:
                 continue
-            partials_by_request[request_id] = [
-                self._compute_partial_group_context(record, group_slice)
-                for group_slice in group_slices
-            ]
+            for group_slice in group_slices:
+                group = self._match_record_group(record, group_slice)
+                head_start = int(group.head_start)
+                head_end = int(group.head_end)
+                if record["use_resident_av"] and self.softmax_av_fused_enabled:
+                    layer_state = record["request_state"].layer_states[record["layer_idx"]]
+                    local_head_indices, local_query = self._query_slice_for_group(record, layer_state, group)
+                    window = min(int(group.seq_len), int(record["attention_window"]))
+                    fused_slot_queries.append(
+                        (
+                            group.k_slot,
+                            group.v_slot,
+                            local_head_indices,
+                            int(window),
+                            local_query,
+                            float(record["score_scale"]),
+                        )
+                    )
+                    fused_refs.append((request_id, head_start, head_end, record["query_dtype"]))
+                    continue
+                partials_by_request.setdefault(request_id, []).append(
+                    self._compute_partial_group_context(record, group_slice)
+                )
+
+        if fused_slot_queries:
+            with self._timed("resident_av_s"):
+                fused_contexts = self.resident_store.qk_softmax_weighted_value_sum_batch(fused_slot_queries)
+            self.qk_full_batch_calls += 1
+            self.softmax_av_fused_batch_calls += 1
+            self.softmax_av_fused_ops += len(fused_slot_queries)
+            for (request_id, head_start, head_end, query_dtype), context in zip(fused_refs, fused_contexts):
+                partials_by_request.setdefault(request_id, []).append(
+                    (head_start, head_end, context.to(query_dtype))
+                )
         return partials_by_request
 
     def finalize_rankset_decode_records(

@@ -601,6 +601,8 @@ class DecodeDenseNode:
             "key": prepared["key"],
             "value": prepared["value"],
             "score_scale": float(prepared.get("score_scale", 1.0)),
+            "num_query_heads": int(prepared.get("num_query_heads", prepared["query"].shape[-2])),
+            "num_key_value_heads": int(prepared.get("num_key_value_heads", prepared["key"].shape[-2])),
             "profile": {
                 "compute_s": float(finished_at - started_at),
             },
@@ -631,6 +633,8 @@ class DecodeDenseNode:
                 "key": prepared["key"],
                 "value": prepared["value"],
                 "score_scale": float(prepared.get("score_scale", 1.0)),
+                "num_query_heads": int(prepared.get("num_query_heads", prepared["query"].shape[-2])),
+                "num_key_value_heads": int(prepared.get("num_key_value_heads", prepared["key"].shape[-2])),
                 "profile": {
                     "compute_s": per_item_compute_s,
                     "batch_size": len(prepared_items),

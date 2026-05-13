@@ -42,6 +42,22 @@ def _manual_decode(initial_kv, query, key, value, score_scale, window):
     return torch.einsum("hl,lhd->hd", weights, values.float()).unsqueeze(0)
 
 
+def _manual_gqa_decode(initial_kv, query, key, value, score_scale, window):
+    keys = torch.cat([initial_kv[0]["key"], key.squeeze(0).unsqueeze(0)], dim=0)
+    values = torch.cat([initial_kv[0]["value"], value.squeeze(0).unsqueeze(0)], dim=0)
+    active_window = min(int(window), int(keys.shape[0])) if int(window) > 0 else int(keys.shape[0])
+    keys = keys[-active_window:]
+    values = values[-active_window:]
+    q = query.squeeze(0).float()
+    repeat_factor = int(q.shape[0]) // int(keys.shape[1])
+    head_map = torch.arange(int(q.shape[0]), dtype=torch.long) // repeat_factor
+    keys_for_q = keys[:, head_map, :]
+    values_for_q = values[:, head_map, :]
+    scores = torch.einsum("hd,lhd->hl", q, keys_for_q.float()) * float(score_scale)
+    weights = torch.softmax(scores, dim=-1)
+    return torch.einsum("hl,lhd->hd", weights, values_for_q.float()).unsqueeze(0)
+
+
 def test_cpu_sparse_window_uses_tail_tokens_only():
     initial_kv = _one_layer_kv()
     query = torch.tensor([[[0.2, -0.1, 0.3], [0.4, 0.1, -0.2]]], dtype=torch.float32)
@@ -202,3 +218,72 @@ def test_clover_sparse_resident_init_keeps_only_tail_window_with_full_shadow():
     assert backend.get_context_len("req") == 8
     assert state.context_len == 5
     assert state.logical_context_len == 8
+
+
+def test_pim_host_backend_preserves_compressed_gqa_kv_for_resident_store():
+    num_query_heads = 4
+    num_kv_heads = 2
+    head_dim = 3
+    seq_len = 5
+    initial_kv = [
+        {
+            "key": torch.randn(seq_len, num_kv_heads, head_dim),
+            "value": torch.randn(seq_len, num_kv_heads, head_dim),
+            "num_query_heads": num_query_heads,
+            "num_key_value_heads": num_kv_heads,
+        }
+    ]
+    query = torch.randn(1, num_query_heads, head_dim)
+    key = torch.randn(1, num_kv_heads, head_dim)
+    value = torch.randn(1, num_kv_heads, head_dim)
+
+    backend = _NoSmokePimBackend(
+        resident_store_backend="host",
+        qk_full_enabled=True,
+        softmax_av_fused_enabled=True,
+        attention_sparse_window=3,
+    )
+    backend.init_request("req", initial_kv)
+    state = backend.request_states["req"]
+
+    assert state.layer_states[0].num_heads == num_query_heads
+    assert state.layer_states[0].kv_heads == num_kv_heads
+    assert sum(group.slot_group_heads for group in state.layer_states[0].head_groups) == num_kv_heads
+
+    actual = backend.decode_layer("req", 0, query, key, value, score_scale=0.5)
+    expected = _manual_gqa_decode(initial_kv, query, key, value, score_scale=0.5, window=3)
+
+    assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_clover_host_backend_gqa_fused_path_matches_reference():
+    num_query_heads = 4
+    num_kv_heads = 2
+    head_dim = 3
+    seq_len = 6
+    initial_kv = [
+        {
+            "key": torch.randn(seq_len, num_kv_heads, head_dim),
+            "value": torch.randn(seq_len, num_kv_heads, head_dim),
+            "num_query_heads": num_query_heads,
+            "num_key_value_heads": num_kv_heads,
+        }
+    ]
+    query = torch.randn(1, num_query_heads, head_dim)
+    key = torch.randn(1, num_kv_heads, head_dim)
+    value = torch.randn(1, num_kv_heads, head_dim)
+
+    backend = _NoSmokeCloverBackend(
+        resident_store_backend="host",
+        qk_full_enabled=True,
+        softmax_av_fused_enabled=True,
+        attention_sparse_window=4,
+        shadow_checks_enabled=True,
+        shadow_check_token_interval=1,
+        shadow_check_layer_interval=1,
+    )
+    backend.init_request("req", initial_kv)
+    actual = backend.decode_layer("req", 0, query, key, value, score_scale=0.25)
+    expected = _manual_gqa_decode(initial_kv, query, key, value, score_scale=0.25, window=4)
+
+    assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)

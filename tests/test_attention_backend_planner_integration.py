@@ -1,5 +1,6 @@
 import os
 import sys
+from types import SimpleNamespace
 
 import torch
 
@@ -10,6 +11,7 @@ if REPO_ROOT not in sys.path:
 from src.core.attention_backend import PimNaiveAttentionBackend
 from src.core.clover_attention_backend import CloverInferAttentionBackend
 from src.core.resident_kv_store import HostResidentKVStore
+from src.core.scheduler import GlobalScheduler
 
 
 class _PlannerOnlyBackend(PimNaiveAttentionBackend):
@@ -22,6 +24,14 @@ class _PlannerOnlyCloverBackend(CloverInferAttentionBackend):
     def _run_dot_smoke_test(self) -> None:
         self.smoke_test_ok = True
         self.smoke_test_output = "skipped"
+
+
+class _NoopContext:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
 
 
 def _dummy_initial_kv(seq_len: int, num_heads: int, head_dim: int, num_layers: int = 2):
@@ -152,6 +162,18 @@ class _RecoveringHostStore(HostResidentKVStore):
             "storage": "host_fallback",
             "migrated": True,
         }
+
+
+class _FusedBatchRecordingStore:
+    def __init__(self):
+        self.calls = []
+
+    def qk_softmax_weighted_value_sum_batch(self, payloads):
+        self.calls.append(list(payloads))
+        outputs = []
+        for _k_slot, _v_slot, local_heads, _window, queries, _score_scale in payloads:
+            outputs.append(torch.ones(len(local_heads), int(queries.shape[1]), dtype=torch.float32))
+        return outputs
 
 
 def test_request_state_materializes_planner_token_segments_for_multi_dpu_group():
@@ -317,6 +339,124 @@ def test_request_state_keeps_large_planner_token_segments_when_compaction_enable
     ]
     assert backend.planner_segment_materialized_count == 1
     assert backend.planner_segment_compacted_count == 0
+
+
+def test_rankset_task_graph_keeps_rankset_groups_together_for_batching():
+    scheduler = object.__new__(GlobalScheduler.__ray_actor_class__)
+    scheduler.clover_rankset_overlap_enabled = True
+    scheduler.clover_rankset_overlap_transfer_granularity = "rankset"
+    scheduler.clover_rankset_overlap_max_ranksets_per_batch = 0
+    scheduler.cluster_config = SimpleNamespace(
+        clover_rankset_overlap_async_dispatch_enabled=False,
+    )
+    scheduler.rankset_overlap_task_graph_layers = 0
+    scheduler.rankset_overlap_task_graph_work_items = 0
+    scheduler.rankset_overlap_task_graph_max_work_items = 0
+    scheduler.rankset_overlap_last_task_graph = {}
+
+    batch = [
+        {
+            "request_id": "req0",
+            "packing_rankset_plan": [
+                {
+                    "rankset_id": "rank0",
+                    "rank_index": 0,
+                    "physical_dpus": [0, 1],
+                    "stripe_width": 2,
+                    "transfer_granularity": "rankset",
+                    "layer_group_map": {
+                        "0": [
+                            {
+                                "head_start": 0,
+                                "head_end": 1,
+                                "group_heads": 1,
+                                "physical_dpu": 0,
+                                "k_slot": "k0",
+                                "v_slot": "v0",
+                            },
+                            {
+                                "head_start": 1,
+                                "head_end": 2,
+                                "group_heads": 1,
+                                "physical_dpu": 1,
+                                "k_slot": "k1",
+                                "v_slot": "v1",
+                            },
+                        ]
+                    },
+                }
+            ],
+        }
+    ]
+
+    task_graph = scheduler._build_rankset_task_graph(batch, 0, {"rankset_count": 1})
+
+    assert task_graph["work_item_count"] == 1
+    work_item = task_graph["work_items"][0]
+    assert work_item["rankset_id"] == "rank0"
+    assert work_item["physical_dpus"] == [0, 1]
+    assert work_item["request_ids"] == ["req0"]
+    group_slices = work_item["request_group_slices"]["req0"]
+    assert [(item["head_start"], item["head_end"], item["physical_dpu"]) for item in group_slices] == [
+        (0, 1, 0),
+        (1, 2, 1),
+    ]
+
+
+def test_rankset_partial_contexts_batch_fused_resident_groups_once():
+    backend = _PlannerOnlyCloverBackend(
+        num_dpus=2,
+        resident_store_backend="host",
+        head_grouping_policy="balanced",
+    )
+    state = backend._build_request_state(
+        "req_fused_rankset",
+        _dummy_initial_kv(seq_len=16, num_heads=2, head_dim=4, num_layers=1),
+        decode_reserve_tokens=1,
+    )
+    backend.resident_store = _FusedBatchRecordingStore()
+    backend.pim_attention_enabled = True
+    backend.resident_compute_enabled = True
+    backend.resident_av_enabled = True
+    backend.softmax_av_fused_enabled = True
+    backend.op_profiling_enabled = False
+    backend._timed = lambda _name: _NoopContext()
+
+    record = {
+        "request_id": "req_fused_rankset",
+        "request_state": state,
+        "layer_idx": 0,
+        "query_dtype": torch.float16,
+        "q_fp32": torch.ones(2, 4, dtype=torch.float32),
+        "attention_window": 16,
+        "score_scale": 0.5,
+        "use_resident_av": True,
+    }
+    group_slices = []
+    for group in state.layer_states[0].head_groups:
+        group_slices.append(
+            {
+                "head_start": int(group.head_start),
+                "head_end": int(group.head_end),
+                "group_heads": int(group.group_heads),
+                "physical_dpu": int(group.dpu_id),
+                "k_slot": str(group.k_slot),
+                "v_slot": str(group.v_slot),
+            }
+        )
+    work_item = {
+        "request_group_slices": {
+            "req_fused_rankset": group_slices,
+        }
+    }
+
+    partials = backend.compute_rankset_partial_contexts([record], work_item)
+
+    assert len(backend.resident_store.calls) == 1
+    assert len(backend.resident_store.calls[0]) == len(group_slices)
+    assert "req_fused_rankset" in partials
+    assert len(partials["req_fused_rankset"]) == len(group_slices)
+    assert all(context.dtype == torch.float16 for _start, _end, context in partials["req_fused_rankset"])
 
 
 def test_request_state_does_not_compact_normal_length_segments_by_default():

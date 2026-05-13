@@ -63,6 +63,7 @@ typedef struct {
     size_t context_bytes;
     size_t padded_weight_bytes;
     size_t padded_context_bytes;
+    uint32_t output_heads;
     float *weights;
     float *context;
     int weights_resident_on_dpu;
@@ -2062,7 +2063,7 @@ static int prepare_qk_slot_item_header(
         fprintf(stderr, "QK slot batch on uninitialized slot %u\n", slot_id);
         return 1;
     }
-    if (num_heads == 0 || num_heads > item->slot->group_heads || num_heads > KVSLOT_MAX_HEADS) {
+    if (num_heads == 0 || num_heads > KVSLOT_MAX_HEADS) {
         fprintf(stderr, "Invalid qk slot batch num_heads=%u for slot %u\n", num_heads, slot_id);
         return 1;
     }
@@ -2231,7 +2232,7 @@ static int prepare_grouped_qk_slot_item_header(
         total_window += segment_lengths[seg_idx];
     }
 
-    if (num_heads == 0 || num_heads > first_slot->group_heads || num_heads > KVSLOT_MAX_HEADS) {
+    if (num_heads == 0 || num_heads > KVSLOT_MAX_HEADS) {
         fprintf(stderr, "Invalid grouped qk num_heads=%u for slot %u\n", num_heads, item->slot_id);
         return 1;
     }
@@ -3059,6 +3060,7 @@ static int prepare_av_item_header(kvslot_runner_t *runner, uint32_t slot_id, av_
     item->context_bytes = (size_t)slot->group_heads * slot->head_dim * sizeof(float);
     item->padded_weight_bytes = ((item->weight_bytes + 7u) / 8u) * 8u;
     item->padded_context_bytes = ((item->context_bytes + 7u) / 8u) * 8u;
+    item->output_heads = slot->group_heads;
 
     if (item->weight_bytes > 0) {
         item->weights = calloc(1, item->padded_weight_bytes);
@@ -3142,6 +3144,7 @@ static int prepare_grouped_av_item_header(
             item->physical_dpu_id = physical_dpu_id;
             item->out.capacity = 0;
             item->out.group_heads = slot->group_heads;
+            item->output_heads = slot->group_heads;
             item->out.head_dim = slot->head_dim;
             item->out.dtype_code = slot->dtype_code;
             item->out.k_scale = slot->k_scale;
@@ -3205,6 +3208,7 @@ static int prepare_grouped_av_item_header(
     item->context_bytes = (size_t)first_slot->group_heads * first_slot->head_dim * sizeof(float);
     item->padded_weight_bytes = ((item->weight_bytes + 7u) / 8u) * 8u;
     item->padded_context_bytes = ((item->context_bytes + 7u) / 8u) * 8u;
+    item->output_heads = first_slot->group_heads;
     if (item->weight_bytes > 0) {
         item->weights = calloc(1, item->padded_weight_bytes);
         if (item->weights == NULL) {
@@ -3282,6 +3286,37 @@ static int softmax_av_item_scores_inplace(av_item_t *item)
     return 0;
 }
 
+static int resize_av_item_context_rows(av_item_t *item, uint32_t output_heads)
+{
+    size_t context_bytes;
+    size_t padded_context_bytes;
+    float *context = NULL;
+
+    if (item == NULL || item->slot == NULL || output_heads == 0 || output_heads > KVSLOT_MAX_HEADS) {
+        return 1;
+    }
+
+    context_bytes = (size_t)output_heads * item->slot->head_dim * sizeof(float);
+    padded_context_bytes = ((context_bytes + 7u) / 8u) * 8u;
+    if (padded_context_bytes != item->padded_context_bytes) {
+        context = calloc(1, padded_context_bytes);
+        if (context == NULL) {
+            fprintf(stderr, "Failed to allocate resized av context buffer\n");
+            return 1;
+        }
+        free(item->context);
+        item->context = context;
+    } else if (item->context != NULL && padded_context_bytes > 0) {
+        memset(item->context, 0, padded_context_bytes);
+    }
+
+    item->output_heads = output_heads;
+    item->context_bytes = context_bytes;
+    item->padded_context_bytes = padded_context_bytes;
+    item->out.group_heads = output_heads;
+    return 0;
+}
+
 static int softmax_av_item_from_qk_scores(
     const qk_slot_item_t *qk_item,
     const kvslot_qk_softmax_av_batch_item_args_t *item_args,
@@ -3295,19 +3330,23 @@ static int softmax_av_item_from_qk_scores(
         fprintf(stderr, "Mismatched slot between qk and av items for slot %u\n", qk_item->slot_id);
         return 1;
     }
-    if (av_item->slot->group_heads != qk_item->num_heads) {
-        fprintf(stderr, "QK/AV head count mismatch for slot %u: qk=%u av=%u\n", qk_item->slot_id, qk_item->num_heads, av_item->slot->group_heads);
-        return 1;
-    }
     if (av_item->runtime_args.seq_len != qk_item->window) {
         fprintf(stderr, "QK/AV window mismatch for slot %u: qk=%u av=%u\n", qk_item->slot_id, qk_item->window, av_item->runtime_args.seq_len);
         return 1;
     }
+    if (resize_av_item_context_rows(av_item, qk_item->num_heads) != 0) {
+        return 1;
+    }
     if (qk_item->slot_args.mode == KVSLOT_QK_SLOT_MODE_SOFTMAX_NORMALIZED) {
+        if (av_item->slot->group_heads != qk_item->num_heads) {
+            fprintf(stderr, "QK/AV softmax-normalized head mismatch for slot %u: qk=%u av=%u\n", qk_item->slot_id, qk_item->num_heads, av_item->slot->group_heads);
+            return 1;
+        }
         av_item->weights_resident_on_dpu = 1;
         return 0;
     }
-    if (qk_item->slot_args.mode == KVSLOT_QK_SLOT_MODE_CONTEXT_FUSED) {
+    if (qk_item->slot_args.mode == KVSLOT_QK_SLOT_MODE_CONTEXT_FUSED
+        || qk_item->slot_args.mode == KVSLOT_QK_SLOT_MODE_CONTEXT_FUSED_UNNORMALIZED) {
         av_item->context_from_qk_kernel = 1;
         return 0;
     }
@@ -4444,7 +4483,7 @@ static int handle_qk_softmax_av_batch(kvslot_runner_t *runner)
             rc = 1;
             goto cleanup;
         }
-        if (av_items[idx].slot->seq_len != qk_items[idx].window || av_items[idx].slot->group_heads != qk_items[idx].num_heads) {
+        if (av_items[idx].slot->seq_len != qk_items[idx].window) {
             fprintf(stderr, "QK-softmax-av slot shape mismatch at item %u\n", idx);
             rc = 1;
             goto cleanup;
@@ -4692,7 +4731,7 @@ static int handle_qk_softmax_av_partial_batch(kvslot_runner_t *runner)
             goto cleanup;
         }
         restrict_qk_slot_item_to_tail_window(&qk_items[idx]);
-        qk_items[idx].slot_args.mode = KVSLOT_QK_SLOT_MODE_CONTEXT_FUSED;
+        qk_items[idx].slot_args.mode = KVSLOT_QK_SLOT_MODE_CONTEXT_FUSED_UNNORMALIZED;
         if (read_qk_slot_item_payload(stdin, &qk_items[idx]) != 0) {
             fprintf(stderr, "Failed to read qk-softmax-av partial payload %u\n", idx);
             rc = 1;
@@ -4704,7 +4743,7 @@ static int handle_qk_softmax_av_partial_batch(kvslot_runner_t *runner)
             goto cleanup;
         }
         restrict_av_item_to_qk_tail_window(&av_items[idx], &qk_items[idx]);
-        if (av_items[idx].runtime_args.seq_len != qk_items[idx].window || av_items[idx].slot->group_heads != qk_items[idx].num_heads) {
+        if (av_items[idx].runtime_args.seq_len != qk_items[idx].window) {
             fprintf(stderr, "QK-softmax-av partial slot shape mismatch at item %u\n", idx);
             rc = 1;
             goto cleanup;

@@ -38,6 +38,9 @@ struct KvslotSlotArgs {
     uint32_t group_heads;
     uint32_t head_dim;
     uint32_t dtype_code;
+    float k_scale;
+    float v_scale;
+    uint32_t reserved;
 };
 
 struct KvslotAvBatchArgs {
@@ -226,7 +229,7 @@ bool CloverKvslotHelperClient::allocate_slot(
 
     const size_t elem_count = (size_t)seq_len * (size_t)group_heads * (size_t)head_dim;
     KvslotIoHeader header = {KVSLOT_MAGIC, KVSLOT_CMD_ALLOCATE, slot_id, 0u};
-    KvslotSlotArgs args = {capacity, seq_len, group_heads, head_dim, 0u};
+    KvslotSlotArgs args = {capacity, seq_len, group_heads, head_dim, 0u, 1.0f, 1.0f, 0u};
     if (!write_all(&header, sizeof(header), error) || !write_all(&args, sizeof(args), error)) {
         return false;
     }
@@ -411,13 +414,13 @@ int clover_attention_reduce_fetch_from_kvslot_partial(
              * The kvslot partial helper returns:
              * - row_max: the unscaled maximum raw QK score
              * - row_sum: sum(exp(score * scale - scaled_row_max))
-             * - context: the locally normalized attention context
+             * - context: the local unnormalized numerator
              *
              * The reducer consumes per-DPU partials in "numerator + scaled max"
-             * form, so convert here:
+             * form:
              * - local_max := scaled row max
              * - local_sum := unchanged local denominator
-             * - local_output := local numerator = normalized_context * local_sum
+             * - local_output := unchanged local numerator
              */
             const float scaled_row_max = result.row_max[0] * request.score_scale;
             const float local_row_sum = result.row_sum[0];
@@ -425,7 +428,7 @@ int clover_attention_reduce_fetch_from_kvslot_partial(
             local_sum_out[(size_t)physical_dpu * dpu_request_stride + req_idx] = local_row_sum;
             for (uint32_t dim = 0; dim < d_head; ++dim) {
                 local_output_out[(size_t)physical_dpu * dpu_output_stride + (size_t)req_idx * (size_t)d_head + dim] =
-                    result.context[dim] * local_row_sum;
+                    result.context[dim];
             }
         }
     }
