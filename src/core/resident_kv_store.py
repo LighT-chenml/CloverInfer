@@ -2189,6 +2189,89 @@ class UpmemKVSlotStore(ResidentKVStore):
             int(segment_ordinal),
         )
 
+    def _helper_submit_compat_shape_key(
+        self,
+        shape_key: tuple[int, ...],
+        *,
+        qk_window_compatible: bool = False,
+    ) -> tuple[int, ...]:
+        values = tuple(int(value) for value in shape_key)
+        if qk_window_compatible and len(values) >= 3:
+            # Batched QK rounds can share one launch across different tail
+            # windows; the helper pads transfers to the max window in the round.
+            return (values[0], values[2], *values[3:])
+        return values
+
+    def _helper_order_submit_entries(
+        self,
+        entries: list[Dict[str, object]],
+        *,
+        qk_window_compatible: bool = False,
+    ) -> list[Dict[str, object]]:
+        if not entries:
+            return []
+        round_robin_enabled = os.environ.get("CLOVER_HELPER_ROUND_ROBIN_SUBMIT", "1") != "0"
+        if not round_robin_enabled:
+            return sorted(
+                entries,
+                key=lambda item: self._helper_submit_sort_key(
+                    physical_dpu=int(item["physical_dpu"]),
+                    shape_key=tuple(item["shape_key"]),
+                    slot_id=int(item["slot_id"]),
+                    logical_idx=int(item["logical_idx"]),
+                    segment_ordinal=int(item.get("segment_ordinal", 0)),
+                ),
+            )
+
+        def base_key(item: Dict[str, object]) -> tuple[int, ...]:
+            physical_dpu = int(item["physical_dpu"])
+            shape_key = self._helper_submit_compat_shape_key(
+                tuple(item["shape_key"]),
+                qk_window_compatible=qk_window_compatible,
+            )
+            return (
+                *shape_key,
+                int(item.get("segment_ordinal", 0)),
+                int(item["logical_idx"]),
+                self._helper_rank_sort_value(physical_dpu),
+                physical_dpu,
+                int(item["slot_id"]),
+            )
+
+        grouped: dict[tuple[int, ...], list[Dict[str, object]]] = {}
+        for entry in sorted(entries, key=base_key):
+            compat_shape = self._helper_submit_compat_shape_key(
+                tuple(entry["shape_key"]),
+                qk_window_compatible=qk_window_compatible,
+            )
+            grouped.setdefault(compat_shape, []).append(entry)
+
+        ordered: list[Dict[str, object]] = []
+        for compat_shape in sorted(grouped):
+            buckets: dict[int, list[Dict[str, object]]] = {}
+            for entry in grouped[compat_shape]:
+                buckets.setdefault(int(entry["physical_dpu"]), []).append(entry)
+            dpu_order = sorted(
+                buckets,
+                key=lambda physical_dpu: (
+                    self._helper_rank_sort_value(int(physical_dpu)),
+                    int(physical_dpu),
+                ),
+            )
+            remaining = sum(len(bucket) for bucket in buckets.values())
+            while remaining > 0:
+                progressed = False
+                for physical_dpu in dpu_order:
+                    bucket = buckets.get(int(physical_dpu))
+                    if not bucket:
+                        continue
+                    ordered.append(bucket.pop(0))
+                    remaining -= 1
+                    progressed = True
+                if not progressed:
+                    break
+        return ordered
+
     def _should_rollover_tail_block(
         self,
         slot_info: Dict[str, object],
@@ -4195,15 +4278,9 @@ class UpmemKVSlotStore(ResidentKVStore):
                 outputs[idx] = output
 
         if dpu_entries:
-            ordered_entries = sorted(
+            ordered_entries = self._helper_order_submit_entries(
                 dpu_entries,
-                key=lambda item: self._helper_submit_sort_key(
-                    physical_dpu=int(item["physical_dpu"]),
-                    shape_key=tuple(item["shape_key"]),
-                    slot_id=int(item["slot_id"]),
-                    logical_idx=int(item["logical_idx"]),
-                    segment_ordinal=int(item["segment_ordinal"]),
-                ),
+                qk_window_compatible=True,
             )
             dpu_started_at = time.perf_counter()
             dpu_outputs = self.helper.qk_slot_scores_batch([item["payload"] for item in ordered_entries])
@@ -4360,15 +4437,8 @@ class UpmemKVSlotStore(ResidentKVStore):
                 contexts[idx] = context
 
         if grouped_dpu_entries:
-            ordered_grouped_entries = sorted(
+            ordered_grouped_entries = self._helper_order_submit_entries(
                 grouped_dpu_entries,
-                key=lambda item: self._helper_submit_sort_key(
-                    physical_dpu=int(item["physical_dpu"]),
-                    shape_key=tuple(item["shape_key"]),
-                    slot_id=int(item["slot_id"]),
-                    logical_idx=int(item["logical_idx"]),
-                    segment_ordinal=int(item["segment_ordinal"]),
-                ),
             )
             try:
                 dpu_started_at = time.perf_counter()
@@ -4404,15 +4474,8 @@ class UpmemKVSlotStore(ResidentKVStore):
                         )
 
         if dpu_entries:
-            ordered_entries = sorted(
+            ordered_entries = self._helper_order_submit_entries(
                 dpu_entries,
-                key=lambda item: self._helper_submit_sort_key(
-                    physical_dpu=int(item["physical_dpu"]),
-                    shape_key=tuple(item["shape_key"]),
-                    slot_id=int(item["slot_id"]),
-                    logical_idx=int(item["logical_idx"]),
-                    segment_ordinal=int(item["segment_ordinal"]),
-                ),
             )
             dpu_started_at = time.perf_counter()
             dpu_contexts = self.helper.weighted_value_sum_batch([item["payload"] for item in ordered_entries])
@@ -4499,15 +4562,8 @@ class UpmemKVSlotStore(ResidentKVStore):
                 contexts[idx] = context
 
         if dpu_entries:
-            ordered_entries = sorted(
+            ordered_entries = self._helper_order_submit_entries(
                 dpu_entries,
-                key=lambda item: self._helper_submit_sort_key(
-                    physical_dpu=int(item["physical_dpu"]),
-                    shape_key=tuple(item["shape_key"]),
-                    slot_id=int(item["slot_id"]),
-                    logical_idx=int(item["logical_idx"]),
-                    segment_ordinal=0,
-                ),
             )
             dpu_started_at = time.perf_counter()
             dpu_contexts = self.helper.softmax_weighted_value_sum_batch(
@@ -4660,15 +4716,9 @@ class UpmemKVSlotStore(ResidentKVStore):
                 contexts[idx] = context
 
         if dpu_entries:
-            ordered_entries = sorted(
+            ordered_entries = self._helper_order_submit_entries(
                 dpu_entries,
-                key=lambda item: self._helper_submit_sort_key(
-                    physical_dpu=int(item["physical_dpu"]),
-                    shape_key=tuple(item["shape_key"]),
-                    slot_id=int(item["slot_id"]),
-                    logical_idx=int(item["logical_idx"]),
-                    segment_ordinal=0,
-                ),
+                qk_window_compatible=True,
             )
             dpu_started_at = time.perf_counter()
             dpu_contexts = self.helper.qk_softmax_weighted_value_sum_batch(
@@ -4714,15 +4764,9 @@ class UpmemKVSlotStore(ResidentKVStore):
                     )
 
             if partial_entries:
-                ordered_entries = sorted(
+                ordered_entries = self._helper_order_submit_entries(
                     partial_entries,
-                    key=lambda item: self._helper_submit_sort_key(
-                        physical_dpu=int(item["physical_dpu"]),
-                        shape_key=tuple(item["shape_key"]),
-                        slot_id=int(item["slot_id"]),
-                        logical_idx=int(item["logical_idx"]),
-                        segment_ordinal=int(item["segment_ordinal"]),
-                    ),
+                    qk_window_compatible=True,
                 )
                 dpu_started_at = time.perf_counter()
                 partial_outputs = self.helper.qk_softmax_weighted_value_sum_partial_batch(

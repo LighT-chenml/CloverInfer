@@ -867,6 +867,177 @@ static int same_rank_av_item(kvslot_runner_t *runner, const av_item_t *lhs, cons
         == runner->physical_dpu_rank_indices[rhs->physical_dpu_id];
 }
 
+static int qk_item_can_join_round(
+    kvslot_runner_t *runner,
+    qk_slot_item_t *items,
+    uint32_t seed_idx,
+    uint32_t item_idx,
+    const uint8_t *processed,
+    const uint8_t *used_dpus,
+    uint8_t *rank_used,
+    uint32_t active_rank_count,
+    uint32_t max_active_ranks,
+    int shape_rounds_enabled,
+    int same_rank_only,
+    uint32_t *out_rank_idx,
+    int *out_adds_rank)
+{
+    qk_slot_item_t *seed;
+    qk_slot_item_t *item;
+    uint32_t rank_idx = UINT32_MAX;
+    int adds_rank = 0;
+
+    if (runner == NULL || items == NULL || processed == NULL || used_dpus == NULL) {
+        return 0;
+    }
+    if (seed_idx == item_idx || processed[item_idx]) {
+        return 0;
+    }
+    seed = &items[seed_idx];
+    item = &items[item_idx];
+    if (item->physical_dpu_id >= runner->nr_dpus || used_dpus[item->physical_dpu_id]) {
+        return 0;
+    }
+    if (same_rank_only && !same_rank_qk_item(runner, seed, item)) {
+        return 0;
+    }
+    if (shape_rounds_enabled && !qk_items_round_compatible(seed, item)) {
+        return 0;
+    }
+    if (rank_used != NULL) {
+        if (item->physical_dpu_id >= runner->nr_dpus) {
+            return 0;
+        }
+        rank_idx = runner->physical_dpu_rank_indices[item->physical_dpu_id];
+        adds_rank = rank_idx < runner->nr_ranks && !rank_used[rank_idx];
+        if (adds_rank && active_rank_count >= max_active_ranks) {
+            return 0;
+        }
+    }
+    if (out_rank_idx != NULL) {
+        *out_rank_idx = rank_idx;
+    }
+    if (out_adds_rank != NULL) {
+        *out_adds_rank = adds_rank;
+    }
+    return 1;
+}
+
+static uint32_t estimate_qk_round_size_for_seed(
+    kvslot_runner_t *runner,
+    qk_slot_item_t *items,
+    uint32_t num_items,
+    const uint8_t *processed,
+    uint32_t seed_idx,
+    uint32_t max_round_items,
+    uint32_t max_active_ranks,
+    uint8_t *used_dpus,
+    uint8_t *rank_used,
+    int shape_rounds_enabled,
+    int rank_local_rounds_enabled)
+{
+    uint32_t round_count = 1;
+    uint32_t active_rank_count = 0;
+
+    if (runner == NULL || items == NULL || processed == NULL || used_dpus == NULL
+        || seed_idx >= num_items || processed[seed_idx]
+        || items[seed_idx].physical_dpu_id >= runner->nr_dpus) {
+        return 0;
+    }
+    memset(used_dpus, 0, runner->nr_dpus * sizeof(*used_dpus));
+    if (rank_used != NULL) {
+        memset(rank_used, 0, runner->nr_ranks * sizeof(*rank_used));
+    }
+    used_dpus[items[seed_idx].physical_dpu_id] = 1;
+    if (rank_used != NULL) {
+        uint32_t seed_rank = runner->physical_dpu_rank_indices[items[seed_idx].physical_dpu_id];
+        if (seed_rank < runner->nr_ranks) {
+            rank_used[seed_rank] = 1;
+            active_rank_count = 1;
+        }
+    }
+
+    for (uint32_t pass = 0; pass < 2; ++pass) {
+        int same_rank_only = pass == 0;
+        if (pass == 1 && rank_local_rounds_enabled) {
+            break;
+        }
+        for (uint32_t idx = 0; idx < num_items; ++idx) {
+            uint32_t rank_idx = UINT32_MAX;
+            int adds_rank = 0;
+            if (round_count >= max_round_items) {
+                return round_count;
+            }
+            if (!qk_item_can_join_round(
+                    runner,
+                    items,
+                    seed_idx,
+                    idx,
+                    processed,
+                    used_dpus,
+                    rank_used,
+                    active_rank_count,
+                    max_active_ranks,
+                    shape_rounds_enabled,
+                    same_rank_only,
+                    &rank_idx,
+                    &adds_rank)) {
+                continue;
+            }
+            used_dpus[items[idx].physical_dpu_id] = 1;
+            if (adds_rank) {
+                rank_used[rank_idx] = 1;
+                active_rank_count += 1;
+            }
+            round_count += 1;
+        }
+    }
+    return round_count;
+}
+
+static uint32_t select_qk_round_seed(
+    kvslot_runner_t *runner,
+    qk_slot_item_t *items,
+    uint32_t num_items,
+    const uint8_t *processed,
+    uint32_t max_round_items,
+    uint32_t max_active_ranks,
+    uint8_t *used_dpus,
+    uint8_t *rank_used,
+    int shape_rounds_enabled,
+    int rank_local_rounds_enabled)
+{
+    uint32_t best_idx = UINT32_MAX;
+    uint32_t best_score = 0;
+
+    for (uint32_t idx = 0; idx < num_items; ++idx) {
+        uint32_t score;
+        if (processed[idx]) {
+            continue;
+        }
+        score = estimate_qk_round_size_for_seed(
+            runner,
+            items,
+            num_items,
+            processed,
+            idx,
+            max_round_items,
+            max_active_ranks,
+            used_dpus,
+            rank_used,
+            shape_rounds_enabled,
+            rank_local_rounds_enabled);
+        if (score > best_score) {
+            best_score = score;
+            best_idx = idx;
+            if (best_score >= max_round_items) {
+                break;
+            }
+        }
+    }
+    return best_idx;
+}
+
 static uint32_t build_qk_launch_round(
     kvslot_runner_t *runner,
     qk_slot_item_t *items,
@@ -889,20 +1060,29 @@ static uint32_t build_qk_launch_round(
     }
 
     memset(used_dpus, 0, runner->nr_dpus * sizeof(*used_dpus));
-    for (uint32_t idx = 0; idx < num_items; ++idx) {
-        if (!processed[idx]) {
-            seed_idx = idx;
-            break;
-        }
-    }
-    if (seed_idx == UINT32_MAX) {
-        return 0;
-    }
     if (runner->nr_ranks > 0 && runner->physical_dpu_rank_indices != NULL) {
         if (ensure_round_scratch_rank_used(runner) != 0) {
             return 0;
         }
         rank_used = runner->scratch.rank_used;
+    }
+    seed_idx = select_qk_round_seed(
+        runner,
+        items,
+        num_items,
+        processed,
+        max_round_items,
+        max_active_ranks,
+        used_dpus,
+        rank_used,
+        shape_rounds_enabled,
+        rank_local_rounds_enabled);
+    if (seed_idx == UINT32_MAX) {
+        return 0;
+    }
+    memset(used_dpus, 0, runner->nr_dpus * sizeof(*used_dpus));
+    if (rank_used != NULL) {
+        memset(rank_used, 0, runner->nr_ranks * sizeof(*rank_used));
     }
 
     used_dpus[items[seed_idx].physical_dpu_id] = 1;
@@ -920,24 +1100,21 @@ static uint32_t build_qk_launch_round(
         if (round_count >= max_round_items) {
             break;
         }
-        if (idx == seed_idx || processed[idx]) {
+        if (!qk_item_can_join_round(
+                runner,
+                items,
+                seed_idx,
+                idx,
+                processed,
+                used_dpus,
+                rank_used,
+                active_rank_count,
+                max_active_ranks,
+                shape_rounds_enabled,
+                1,
+                &rank_idx,
+                &adds_rank)) {
             continue;
-        }
-        if (used_dpus[items[idx].physical_dpu_id]) {
-            continue;
-        }
-        if (!same_rank_qk_item(runner, &items[seed_idx], &items[idx])) {
-            continue;
-        }
-        if (shape_rounds_enabled && !qk_items_round_compatible(&items[seed_idx], &items[idx])) {
-            continue;
-        }
-        if (rank_used != NULL && items[idx].physical_dpu_id < runner->nr_dpus) {
-            rank_idx = runner->physical_dpu_rank_indices[items[idx].physical_dpu_id];
-            adds_rank = rank_idx < runner->nr_ranks && !rank_used[rank_idx];
-            if (adds_rank && active_rank_count >= max_active_ranks) {
-                continue;
-            }
         }
         used_dpus[items[idx].physical_dpu_id] = 1;
         if (adds_rank) {
@@ -955,21 +1132,21 @@ static uint32_t build_qk_launch_round(
         if (rank_local_rounds_enabled) {
             break;
         }
-        if (idx == seed_idx || processed[idx]) {
+        if (!qk_item_can_join_round(
+                runner,
+                items,
+                seed_idx,
+                idx,
+                processed,
+                used_dpus,
+                rank_used,
+                active_rank_count,
+                max_active_ranks,
+                shape_rounds_enabled,
+                0,
+                &rank_idx,
+                &adds_rank)) {
             continue;
-        }
-        if (used_dpus[items[idx].physical_dpu_id]) {
-            continue;
-        }
-        if (shape_rounds_enabled && !qk_items_round_compatible(&items[seed_idx], &items[idx])) {
-            continue;
-        }
-        if (rank_used != NULL && items[idx].physical_dpu_id < runner->nr_dpus) {
-            rank_idx = runner->physical_dpu_rank_indices[items[idx].physical_dpu_id];
-            adds_rank = rank_idx < runner->nr_ranks && !rank_used[rank_idx];
-            if (adds_rank && active_rank_count >= max_active_ranks) {
-                continue;
-            }
         }
         used_dpus[items[idx].physical_dpu_id] = 1;
         if (adds_rank) {
