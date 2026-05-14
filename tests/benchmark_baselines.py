@@ -59,11 +59,27 @@ def build_runtime_env() -> Dict[str, object]:
         env_vars["PYTHONPATH"] = pythonpath
 
     for env_name in (
+        "CLOVER_REPO_ROOT",
+        "CLOVER_UPMEM_ENV",
+        "CLOVER_KVSLOT_HELPER",
+        "CLOVER_KVSLOT_DIR",
         "CLOVER_KVSLOT_MAX_CAPACITY",
         "CLOVER_KVSLOT_MAX_HEADS",
+        "CLOVER_KVSLOT_MAX_BATCH_ITEMS",
         "CLOVER_KVSLOT_AUTOBUILD",
         "CLOVER_KVSLOT_AUTOBUILD_TIMEOUT_S",
         "CLOVER_KVSLOT_DPU_PHASE_PROFILE",
+        "CLOVER_KVSLOT_DPU_OPT",
+        "CLOVER_KVSLOT_EXPERIMENTAL_INT8_I16_QK",
+        "CLOVER_KVSLOT_SLIM_QK_SLOT_ONLY",
+        "CLOVER_KVSLOT_BULK_FP16_DOT",
+        "CLOVER_KVSLOT_EXPERIMENTAL_INT16_KV",
+        "CLOVER_KVSLOT_CONTEXT_BULK_ROW",
+        "CLOVER_KVSLOT_CONTEXT_OCTETV",
+        "CLOVER_KVSLOT_QK_MAX_ACTIVE_DPUS",
+        "CLOVER_KVSLOT_QK_MAX_ROUND_ITEMS",
+        "CLOVER_KVSLOT_QK_MAX_ACTIVE_RANKS",
+        "CLOVER_KVSLOT_RANK_LOCAL_ROUNDS",
         "CLOVER_PIM_SPARSE_TAIL_STRIPE_WIDTH",
     ):
         env_value = os.environ.get(env_name)
@@ -211,6 +227,14 @@ def resolve_requested_baselines(value: str) -> List[Dict[str, object]]:
             if raw_item not in grouped[key]["requested_aliases"]:
                 grouped[key]["requested_aliases"].append(raw_item)
     return ordered
+
+
+def should_auto_enable_clover_perf_guard(args) -> bool:
+    if bool(getattr(args, "clover_pim_perf_guard_enabled", False)):
+        return False
+    if bool(getattr(args, "no_clover_pim_perf_guard_enabled", False)):
+        return False
+    return normalize_resident_kv_dtype(getattr(args, "pim_resident_kv_dtype", "fp32")) != "fp32"
 
 
 def summarize_metrics(metric_list: List[Dict[str, float]]) -> Dict[str, float]:
@@ -478,6 +502,9 @@ def make_cluster_config(args, attention_backend: str) -> ClusterConfig:
         ),
         clover_pim_layer_rank_rotation_experimental_enabled=(
             args.clover_pim_layer_rank_rotation_experimental_enabled if attention_backend == "cloverinfer" else False
+        ),
+        clover_pim_disjoint_decode_stripe_packing_enabled=(
+            args.clover_pim_disjoint_decode_stripe_packing_enabled if attention_backend == "cloverinfer" else False
         ),
         clover_pim_slot_spill_alloc_experimental_enabled=(
             args.clover_pim_slot_spill_alloc_experimental_enabled if attention_backend == "cloverinfer" else False
@@ -795,6 +822,8 @@ def main():
     parser.add_argument("--no-clover-pim-rank-spread-multi-rank-batch-experimental-enabled", action="store_true")
     parser.add_argument("--clover-pim-layer-rank-rotation-experimental-enabled", action="store_true")
     parser.add_argument("--no-clover-pim-layer-rank-rotation-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-pim-disjoint-decode-stripe-packing-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-disjoint-decode-stripe-packing-enabled", action="store_true")
     parser.add_argument("--clover-pim-slot-spill-alloc-experimental-enabled", action="store_true")
     parser.add_argument("--no-clover-pim-slot-spill-alloc-experimental-enabled", action="store_true")
     parser.add_argument("--clover-pim-slot-pressure-aware-alloc-experimental-enabled", action="store_true")
@@ -1073,6 +1102,19 @@ def main():
     )
     if args.no_clover_pim_layer_rank_rotation_experimental_enabled:
         args.clover_pim_layer_rank_rotation_experimental_enabled = False
+    if (
+        args.clover_pim_disjoint_decode_stripe_packing_enabled
+        and args.no_clover_pim_disjoint_decode_stripe_packing_enabled
+    ):
+        raise ValueError(
+            "cannot set both --clover-pim-disjoint-decode-stripe-packing-enabled and "
+            "--no-clover-pim-disjoint-decode-stripe-packing-enabled"
+        )
+    args.clover_pim_disjoint_decode_stripe_packing_enabled = bool(
+        args.clover_pim_disjoint_decode_stripe_packing_enabled
+    )
+    if args.no_clover_pim_disjoint_decode_stripe_packing_enabled:
+        args.clover_pim_disjoint_decode_stripe_packing_enabled = False
     args.clover_pim_slot_spill_alloc_experimental_enabled = bool(
         args.clover_pim_slot_spill_alloc_experimental_enabled
     )
@@ -1095,9 +1137,13 @@ def main():
         args.clover_pim_reserve_segment_tail_capacity_experimental_enabled = False
     if args.clover_pim_reserve_segment_tail_capacity_tokens < 0:
         raise ValueError("--clover-pim-reserve-segment-tail-capacity-tokens must be non-negative")
-    args.clover_pim_perf_guard_enabled = bool(args.clover_pim_perf_guard_enabled)
+    args.clover_pim_perf_guard_auto_enabled = should_auto_enable_clover_perf_guard(args)
+    args.clover_pim_perf_guard_enabled = bool(
+        args.clover_pim_perf_guard_enabled or args.clover_pim_perf_guard_auto_enabled
+    )
     if args.no_clover_pim_perf_guard_enabled:
         args.clover_pim_perf_guard_enabled = False
+        args.clover_pim_perf_guard_auto_enabled = False
     args.clover_pim_perf_guard_force_cpu_for_compressed_kv = True
     if args.no_clover_pim_perf_guard_force_cpu_for_compressed_kv:
         args.clover_pim_perf_guard_force_cpu_for_compressed_kv = False
@@ -1208,6 +1254,9 @@ def main():
         "clover_pim_layer_rank_rotation_experimental_enabled": bool(
             args.clover_pim_layer_rank_rotation_experimental_enabled
         ),
+        "clover_pim_disjoint_decode_stripe_packing_enabled": bool(
+            args.clover_pim_disjoint_decode_stripe_packing_enabled
+        ),
         "clover_pim_slot_spill_alloc_experimental_enabled": bool(
             args.clover_pim_slot_spill_alloc_experimental_enabled
         ),
@@ -1224,6 +1273,7 @@ def main():
             args.clover_pim_reserve_segment_tail_capacity_tokens
         ),
         "clover_pim_perf_guard_enabled": bool(args.clover_pim_perf_guard_enabled),
+        "clover_pim_perf_guard_auto_enabled": bool(args.clover_pim_perf_guard_auto_enabled),
         "clover_pim_perf_guard_force_cpu_for_compressed_kv": bool(
             args.clover_pim_perf_guard_force_cpu_for_compressed_kv
         ),

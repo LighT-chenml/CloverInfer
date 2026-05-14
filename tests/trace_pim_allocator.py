@@ -175,7 +175,17 @@ def main():
     parser.add_argument(
         "--pim-resident-kv-dtype",
         default="fp32",
-        choices=["fp32", "fp16", "int8", "mixed_int8_fp16", "int8_fp16", "int8-fp16", "k_int8_v_fp16"],
+        choices=[
+            "fp32",
+            "fp16",
+            "bf16",
+            "int8",
+            "int16",
+            "mixed_int8_fp16",
+            "int8_fp16",
+            "int8-fp16",
+            "k_int8_v_fp16",
+        ],
     )
     parser.add_argument("--pim-resident-store-backend", default="upmem_kvslot", choices=["host", "upmem_kvslot"])
     parser.add_argument("--pim-qk-full-enabled", action="store_true")

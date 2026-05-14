@@ -129,6 +129,14 @@ class GlobalScheduler:
         self.decode_continuous_batch_same_rank_flushes = 0
         self.decode_continuous_batch_mixed_rank_flushes = 0
         self.decode_continuous_batch_total_context_span = 0
+        self.clover_pim_disjoint_decode_stripe_packing_enabled = bool(
+            getattr(cluster_config, "clover_pim_disjoint_decode_stripe_packing_enabled", False)
+        ) and str(cluster_config.attention_backend) == "cloverinfer"
+        self.decode_continuous_batch_disjoint_stripe_decisions = 0
+        self.decode_continuous_batch_stripe_overlap_total = 0
+        self.decode_continuous_batch_stripe_overlap_max = 0
+        self.decode_continuous_batch_stripe_overlap_flushes = 0
+        self.decode_continuous_batch_last_stripe_overlap: Dict[str, object] = {}
         self._decode_pending_queue = deque()
         self._decode_driver_task: asyncio.Task | None = None
         self._background_completion_tasks: set[asyncio.Task] = set()
@@ -367,6 +375,52 @@ class GlobalScheduler:
         if rankset_id in (None, ""):
             return None
         return str(rankset_id)
+
+    def _record_decode_batch_shape(self, batch: List[Dict[str, object]]) -> None:
+        context_lens = [self._decode_state_context_len(state) for state in batch]
+        if context_lens:
+            self.decode_continuous_batch_total_context_span += max(context_lens) - min(context_lens)
+        known_rank_hints = [
+            rank_hint
+            for rank_hint in (self._decode_state_rank_hint(state) for state in batch)
+            if rank_hint is not None
+        ]
+        if len(known_rank_hints) >= 2:
+            if len(set(known_rank_hints)) == 1:
+                self.decode_continuous_batch_same_rank_flushes += 1
+            else:
+                self.decode_continuous_batch_mixed_rank_flushes += 1
+        stripes = [set(self._decode_state_stripe(state)) for state in batch]
+        pair_overlaps: list[int] = []
+        dpu_counts: Dict[int, int] = {}
+        for stripe in stripes:
+            for physical_dpu in stripe:
+                dpu_counts[int(physical_dpu)] = dpu_counts.get(int(physical_dpu), 0) + 1
+        for left_idx, left_stripe in enumerate(stripes):
+            if not left_stripe:
+                continue
+            for right_stripe in stripes[left_idx + 1 :]:
+                if right_stripe:
+                    pair_overlaps.append(len(left_stripe.intersection(right_stripe)))
+        overlap_total = int(sum(pair_overlaps))
+        overlap_max = int(max(pair_overlaps, default=0))
+        if len(batch) >= 2 and pair_overlaps:
+            self.decode_continuous_batch_stripe_overlap_flushes += 1
+            self.decode_continuous_batch_stripe_overlap_total += overlap_total
+            self.decode_continuous_batch_stripe_overlap_max = max(
+                self.decode_continuous_batch_stripe_overlap_max,
+                overlap_max,
+            )
+        max_dpu_multiplicity = int(max(dpu_counts.values(), default=0))
+        self.decode_continuous_batch_last_stripe_overlap = {
+            "enabled": bool(self.clover_pim_disjoint_decode_stripe_packing_enabled),
+            "request_ids": [str(state["request_id"]) for state in batch],
+            "stripe_widths": [len(stripe) for stripe in stripes],
+            "pair_overlap_total": overlap_total,
+            "pair_overlap_max": overlap_max,
+            "max_dpu_multiplicity": max_dpu_multiplicity,
+            "shared_dpu_count": int(sum(1 for count in dpu_counts.values() if count > 1)),
+        }
 
     def _plan_rankset_overlap_batch(self, batch: List[Dict[str, object]]) -> Dict[str, object]:
         rankset_ids = [
@@ -766,6 +820,32 @@ class GlobalScheduler:
         width_gap = abs(int(seed_state.get("packing_stripe_width", 0)) - int(candidate_state.get("packing_stripe_width", 0)))
         return (rank_penalty, stripe_penalty, context_gap, width_gap, int(queue_index))
 
+    def _decode_batch_disjoint_candidate_score(
+        self,
+        seed_state: Dict[str, object],
+        selected_states: List[Dict[str, object]],
+        candidate_state: Dict[str, object],
+        queue_index: int,
+    ) -> tuple[int, int, int, int, int, int]:
+        selected_stripes = [set(self._decode_state_stripe(state)) for state in selected_states]
+        candidate_stripe = set(self._decode_state_stripe(candidate_state))
+        overlap_total = 0
+        overlap_max = 0
+        if candidate_stripe and selected_stripes:
+            overlaps = [len(candidate_stripe.intersection(stripe)) for stripe in selected_stripes if stripe]
+            overlap_total = sum(overlaps)
+            overlap_max = max(overlaps, default=0)
+
+        seed_rank = self._decode_state_rank_hint(seed_state)
+        candidate_rank = self._decode_state_rank_hint(candidate_state)
+        rank_penalty = 1
+        if seed_rank is not None and candidate_rank is not None:
+            rank_penalty = 0 if seed_rank == candidate_rank else 2
+
+        context_gap = abs(self._decode_state_context_len(seed_state) - self._decode_state_context_len(candidate_state))
+        width_gap = abs(int(seed_state.get("packing_stripe_width", 0)) - int(candidate_state.get("packing_stripe_width", 0)))
+        return (int(overlap_total), int(overlap_max), int(rank_penalty), int(context_gap), int(width_gap), int(queue_index))
+
     def _take_decode_batch(self, batch_size: int) -> List[Dict[str, object]]:
         if batch_size <= 0 or not self._decode_pending_queue:
             return []
@@ -796,19 +876,7 @@ class GlobalScheduler:
                         decision.micro_batch.requests,
                         decision.micro_batch.to_dict(),
                     )
-                    context_lens = [self._decode_state_context_len(state) for state in batch]
-                    if context_lens:
-                        self.decode_continuous_batch_total_context_span += max(context_lens) - min(context_lens)
-                    known_rank_hints = [
-                        rank_hint
-                        for rank_hint in (self._decode_state_rank_hint(state) for state in batch)
-                        if rank_hint is not None
-                    ]
-                    if len(known_rank_hints) >= 2:
-                        if len(set(known_rank_hints)) == 1:
-                            self.decode_continuous_batch_same_rank_flushes += 1
-                        else:
-                            self.decode_continuous_batch_mixed_rank_flushes += 1
+                    self._record_decode_batch_shape(batch)
                     return batch
                 except Exception:
                     self.capacity_aware_batch_fallbacks += 1
@@ -816,19 +884,7 @@ class GlobalScheduler:
             batch = list(self._decode_pending_queue)
             self._decode_pending_queue.clear()
             self._record_predictive_batch(batch, predictive_used=False)
-            context_lens = [self._decode_state_context_len(state) for state in batch]
-            if context_lens:
-                self.decode_continuous_batch_total_context_span += max(context_lens) - min(context_lens)
-            known_rank_hints = [
-                rank_hint
-                for rank_hint in (self._decode_state_rank_hint(state) for state in batch)
-                if rank_hint is not None
-            ]
-            if len(known_rank_hints) >= 2:
-                if len(set(known_rank_hints)) == 1:
-                    self.decode_continuous_batch_same_rank_flushes += 1
-                else:
-                    self.decode_continuous_batch_mixed_rank_flushes += 1
+            self._record_decode_batch_shape(batch)
             return batch
 
         queue_items = list(self._decode_pending_queue)
@@ -843,12 +899,16 @@ class GlobalScheduler:
             for queue_index, candidate_state in enumerate(queue_items[1:], start=1):
                 if queue_index in selected_index_set:
                     continue
-                heuristic_candidates.append(
-                    (
-                        self._decode_batch_candidate_score(seed_state, candidate_state, queue_index),
+                if self.clover_pim_disjoint_decode_stripe_packing_enabled:
+                    heuristic_score = self._decode_batch_disjoint_candidate_score(
+                        seed_state,
+                        selected_states,
+                        candidate_state,
                         queue_index,
                     )
-                )
+                else:
+                    heuristic_score = self._decode_batch_candidate_score(seed_state, candidate_state, queue_index)
+                heuristic_candidates.append((heuristic_score, queue_index))
                 if self.clover_predictive_scheduling_enabled:
                     predictive_score = self._predictive_batch_candidate_score(
                         seed_state,
@@ -866,6 +926,8 @@ class GlobalScheduler:
             else:
                 heuristic_candidates.sort(key=lambda item: item[0])
                 chosen_index = int(heuristic_candidates[0][1])
+                if self.clover_pim_disjoint_decode_stripe_packing_enabled:
+                    self.decode_continuous_batch_disjoint_stripe_decisions += 1
             selected_indices.append(chosen_index)
             selected_states.append(queue_items[chosen_index])
 
@@ -884,19 +946,7 @@ class GlobalScheduler:
 
         if any(idx != expected for expected, idx in enumerate(selected_indices)):
             self.decode_continuous_batch_reordered_flushes += 1
-        context_lens = [self._decode_state_context_len(state) for state in batch]
-        if context_lens:
-            self.decode_continuous_batch_total_context_span += max(context_lens) - min(context_lens)
-        known_rank_hints = [
-            rank_hint
-            for rank_hint in (self._decode_state_rank_hint(state) for state in batch)
-            if rank_hint is not None
-        ]
-        if len(known_rank_hints) >= 2:
-            if len(set(known_rank_hints)) == 1:
-                self.decode_continuous_batch_same_rank_flushes += 1
-            else:
-                self.decode_continuous_batch_mixed_rank_flushes += 1
+        self._record_decode_batch_shape(batch)
         return batch
 
     def _ensure_decode_driver(self):
@@ -1486,6 +1536,21 @@ class GlobalScheduler:
                     if self.decode_continuous_batch_flushes > 0
                     else 0.0
                 ),
+                "disjoint_stripe_packing_enabled": bool(
+                    self.clover_pim_disjoint_decode_stripe_packing_enabled
+                ),
+                "disjoint_stripe_decisions": int(
+                    self.decode_continuous_batch_disjoint_stripe_decisions
+                ),
+                "stripe_overlap_flushes": int(self.decode_continuous_batch_stripe_overlap_flushes),
+                "avg_stripe_pair_overlap": (
+                    float(self.decode_continuous_batch_stripe_overlap_total)
+                    / float(self.decode_continuous_batch_stripe_overlap_flushes)
+                    if self.decode_continuous_batch_stripe_overlap_flushes > 0
+                    else 0.0
+                ),
+                "max_stripe_pair_overlap": int(self.decode_continuous_batch_stripe_overlap_max),
+                "last_stripe_overlap": dict(self.decode_continuous_batch_last_stripe_overlap),
                 "target_size": int(self._decode_continuous_batch_target_size()),
                 "pending": len(self._decode_pending_queue),
                 "predictive_enabled": bool(self.clover_predictive_scheduling_enabled),

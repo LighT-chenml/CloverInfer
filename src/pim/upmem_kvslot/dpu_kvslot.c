@@ -11,16 +11,28 @@
 #ifndef NR_TASKLETS
 #define NR_TASKLETS 16
 #endif
+#ifndef KVSLOT_SLIM_QK_CACHE_HEADS
+#define KVSLOT_SLIM_QK_CACHE_HEADS 12
+#endif
+#ifndef KVSLOT_SLIM_QK_CACHE_HEAD_DIM
+#define KVSLOT_SLIM_QK_CACHE_HEAD_DIM 64
+#endif
 
 __host kvslot_slot_args_t slot_args;
+#ifndef KVSLOT_SLIM_QK_SLOT_ONLY
 __host kvslot_qk_dpu_args_t qk_args;
+#endif
 __host kvslot_runtime_slot_args_t runtime_slot_args;
+#ifndef KVSLOT_SLIM_QK_SLOT_ONLY
 __host kvslot_runtime_slot_args_t grouped_runtime_slot_args[KVSLOT_MAX_GROUP_SEGMENTS];
+#endif
 __host kvslot_qk_slot_args_t qk_slot_args;
 __host uint32_t qk_slot_head_indices[KVSLOT_MAX_HEADS];
 __host uint32_t qk_slot_rowmax_bits[KVSLOT_MAX_HEADS];
+#ifndef KVSLOT_SLIM_QK_SLOT_ONLY
 __host uint32_t grouped_segment_lengths[KVSLOT_MAX_GROUP_SEGMENTS];
 __host uint32_t grouped_segment_count;
+#endif
 __host kvslot_meta_t kvslot_meta;
 __host uint32_t kvslot_kernel_command;
 
@@ -29,20 +41,32 @@ __host uint32_t kvslot_kernel_command;
 __mram_noinit int32_t k_cache[KVSLOT_MAX_CAPACITY * KVSLOT_MAX_HEADS * KVSLOT_MAX_HEAD_DIM];
 __mram_noinit int32_t v_cache[KVSLOT_MAX_CAPACITY * KVSLOT_MAX_HEADS * KVSLOT_MAX_HEAD_DIM];
 __mram_noinit int32_t qk_query[KVSLOT_MAX_HEADS * KVSLOT_MAX_HEAD_DIM];
+#ifndef KVSLOT_SLIM_QK_SLOT_ONLY
 __mram_noinit int32_t qk_keys[KVSLOT_MAX_CAPACITY * KVSLOT_MAX_HEAD_DIM];
 __mram_noinit int64_t qk_scores[KVSLOT_MAX_CAPACITY];
 __mram_noinit uint32_t qk_slot_scores_bits[KVSLOT_MAX_HEADS * KVSLOT_MAX_CAPACITY];
 __mram_noinit uint32_t av_weights_bits[KVSLOT_MAX_HEADS * KVSLOT_MAX_CAPACITY];
+#endif
 __mram_noinit uint32_t av_context_bits[KVSLOT_MAX_HEADS * KVSLOT_MAX_HEAD_DIM];
 
 BARRIER_INIT(kvslot_barrier, NR_TASKLETS);
 
+#ifndef KVSLOT_SLIM_QK_SLOT_ONLY
 static int64_t partial_sums[NR_TASKLETS];
-static float partial_float_sums[NR_TASKLETS];
+#endif
 static uint32_t qk_slot_score_local[KVSLOT_MAX_HEADS * KVSLOT_MAX_CAPACITY];
 static float qk_slot_query_row[KVSLOT_MAX_HEAD_DIM];
+#ifdef KVSLOT_SLIM_QK_SLOT_ONLY
+static float qk_slot_query_rows[KVSLOT_SLIM_QK_CACHE_HEADS * KVSLOT_SLIM_QK_CACHE_HEAD_DIM];
+#endif
+#if defined(KVSLOT_EXPERIMENTAL_INT8_I16_QK) && !defined(KVSLOT_SLIM_QK_SLOT_ONLY)
 static int16_t qk_slot_query_i16[KVSLOT_MAX_HEAD_DIM];
 static float qk_slot_query_i16_scale;
+#endif
+#if defined(KVSLOT_SLIM_QK_SLOT_ONLY) && (defined(KVSLOT_EXPERIMENTAL_INT16_KV) || defined(KVSLOT_EXPERIMENTAL_INT8_I16_QK))
+static int16_t qk_slot_query_i16_rows[KVSLOT_SLIM_QK_CACHE_HEADS * KVSLOT_SLIM_QK_CACHE_HEAD_DIM];
+static float qk_slot_query_i16_scales[KVSLOT_SLIM_QK_CACHE_HEADS];
+#endif
 static float qk_slot_row_sums[KVSLOT_MAX_HEADS];
 static uint32_t qk_phase_profile_enabled;
 
@@ -139,6 +163,11 @@ static float fp16_bits_to_float(uint16_t bits)
     return u32_bits_to_float(out_bits);
 }
 
+static float bf16_bits_to_float(uint16_t bits)
+{
+    return u32_bits_to_float(((uint32_t)bits) << 16);
+}
+
 static uint32_t int8_cache_pair_base(uint32_t word_offset, uint32_t logical_idx)
 {
     uint32_t word_idx = word_offset + (logical_idx / 4u);
@@ -175,6 +204,54 @@ static float read_int8_k_value(uint32_t word_offset, uint32_t logical_idx, float
     return unpack_int8_scaled_value(packed64, word_offset, logical_idx, scale);
 }
 
+static uint16_t read_k_packed_u16_value(uint32_t elem_offset, uint32_t logical_idx)
+{
+    uint64_t packed64 = 0;
+    uint32_t packed = 0;
+    uint32_t word_idx = elem_offset + (logical_idx / 2u);
+    uint32_t pair_base = word_idx & ~1u;
+    mram_read(&k_cache[pair_base], &packed64, sizeof(packed64));
+    packed = (word_idx & 1u) == 0 ? (uint32_t)(packed64 & 0xffffffffu) : (uint32_t)(packed64 >> 32);
+    return (logical_idx & 1u) == 0 ? (uint16_t)(packed & 0xffffu) : (uint16_t)(packed >> 16);
+}
+
+static uint16_t read_v_packed_u16_value(uint32_t elem_offset, uint32_t logical_idx)
+{
+    uint64_t packed64 = 0;
+    uint32_t packed = 0;
+    uint32_t word_idx = elem_offset + (logical_idx / 2u);
+    uint32_t pair_base = word_idx & ~1u;
+    mram_read(&v_cache[pair_base], &packed64, sizeof(packed64));
+    packed = (word_idx & 1u) == 0 ? (uint32_t)(packed64 & 0xffffffffu) : (uint32_t)(packed64 >> 32);
+    return (logical_idx & 1u) == 0 ? (uint16_t)(packed & 0xffffu) : (uint16_t)(packed >> 16);
+}
+
+static float u16_cache_bits_to_float(uint16_t bits, uint32_t dtype_code)
+{
+    if (dtype_code == KVSLOT_DTYPE_BF16) {
+        return bf16_bits_to_float(bits);
+    }
+#ifdef KVSLOT_EXPERIMENTAL_INT16_KV
+    if (dtype_code == KVSLOT_DTYPE_INT16) {
+        return ((float)(int16_t)bits);
+    }
+#endif
+    return fp16_bits_to_float(bits);
+}
+
+#ifdef KVSLOT_EXPERIMENTAL_INT16_KV
+static float read_int16_v_value(uint32_t word_offset, uint32_t logical_idx, float scale)
+{
+    return ((float)(int16_t)read_v_packed_u16_value(word_offset, logical_idx)) * scale;
+}
+
+static float read_int16_k_value(uint32_t word_offset, uint32_t logical_idx, float scale)
+{
+    return ((float)(int16_t)read_k_packed_u16_value(word_offset, logical_idx)) * scale;
+}
+#endif
+
+#ifndef KVSLOT_SLIM_QK_SLOT_ONLY
 static float read_av_weight(uint32_t logical_idx)
 {
     uint64_t packed = 0;
@@ -184,6 +261,7 @@ static float read_av_weight(uint32_t logical_idx)
     bits = (logical_idx & 1u) == 0 ? (uint32_t)(packed & 0xffffffffu) : (uint32_t)(packed >> 32);
     return u32_bits_to_float(bits);
 }
+#endif
 
 static void write_av_context_pair(uint32_t pair_idx, uint32_t low_bits, uint32_t high_bits)
 {
@@ -204,6 +282,85 @@ static void write_av_context_quad(
     mram_write(packed, &av_context_bits[out_idx0], sizeof(packed));
 }
 
+#ifdef KVSLOT_CONTEXT_BULK_ROW
+static int run_context_fp16_bulk_row(uint32_t num_heads, uint32_t window, uint32_t group_heads, uint32_t head_dim)
+{
+    uint32_t tasklet_id = me();
+    uint32_t v_dtype_code = runtime_slot_args.v_dtype_code == KVSLOT_UNSET_U32 ? runtime_slot_args.dtype_code : runtime_slot_args.v_dtype_code;
+    float value_scale = 1.0f;
+    uint32_t value_elem_offset = runtime_slot_args.v_elem_offset == KVSLOT_UNSET_U32
+        ? runtime_slot_args.elem_offset
+        : runtime_slot_args.v_elem_offset;
+
+    if ((v_dtype_code != KVSLOT_DTYPE_FP16
+            && v_dtype_code != KVSLOT_DTYPE_BF16
+#ifdef KVSLOT_EXPERIMENTAL_INT16_KV
+            && v_dtype_code != KVSLOT_DTYPE_INT16
+#endif
+        )
+        || num_heads == 0
+        || window == 0
+        || head_dim == 0
+        || head_dim > KVSLOT_SLIM_QK_CACHE_HEAD_DIM
+        || (head_dim & 3u) != 0
+        || (value_elem_offset & 1u) != 0) {
+        return 0;
+    }
+#ifdef KVSLOT_EXPERIMENTAL_INT16_KV
+    if (v_dtype_code == KVSLOT_DTYPE_INT16) {
+        value_scale = runtime_slot_args.v_scale;
+    }
+#endif
+
+    for (uint32_t head_idx = tasklet_id; head_idx < num_heads; head_idx += NR_TASKLETS) {
+        uint32_t kv_head_idx = qk_slot_head_indices[head_idx];
+        float acc[KVSLOT_SLIM_QK_CACHE_HEAD_DIM];
+        if (kv_head_idx >= group_heads) {
+            continue;
+        }
+#pragma clang loop unroll(disable)
+        for (uint32_t dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
+            acc[dim_idx] = 0.0f;
+        }
+
+        for (uint32_t token_idx = 0; token_idx < window; ++token_idx) {
+            __dma_aligned uint32_t packed_words[KVSLOT_SLIM_QK_CACHE_HEAD_DIM / 2u];
+            uint32_t value_word_idx = value_elem_offset
+                + ((((token_idx * group_heads) + kv_head_idx) * head_dim) / 2u);
+            uint32_t packed_word_count = head_dim / 2u;
+            float weight = u32_bits_to_float(qk_slot_score_local[(size_t)head_idx * window + token_idx]);
+            mram_read(&v_cache[value_word_idx], packed_words, packed_word_count * sizeof(packed_words[0]));
+#pragma clang loop unroll(disable)
+            for (uint32_t packed_idx = 0; packed_idx < packed_word_count; ++packed_idx) {
+                uint32_t packed = packed_words[packed_idx];
+                uint32_t dim_idx = packed_idx * 2u;
+#ifdef KVSLOT_EXPERIMENTAL_INT16_KV
+                if (v_dtype_code == KVSLOT_DTYPE_INT16) {
+                    acc[dim_idx] += weight * (float)(int16_t)(packed & 0xffffu);
+                    acc[dim_idx + 1u] += weight * (float)(int16_t)(packed >> 16);
+                } else
+#endif
+                {
+                    acc[dim_idx] += weight * u16_cache_bits_to_float((uint16_t)(packed & 0xffffu), v_dtype_code);
+                    acc[dim_idx + 1u] += weight * u16_cache_bits_to_float((uint16_t)(packed >> 16), v_dtype_code);
+                }
+            }
+        }
+
+        for (uint32_t dim_idx = 0; dim_idx < head_dim; dim_idx += 4u) {
+            uint32_t out_idx0 = head_idx * head_dim + dim_idx;
+            write_av_context_quad(
+                out_idx0,
+                float_to_u32_bits(acc[dim_idx] * value_scale),
+                float_to_u32_bits(acc[dim_idx + 1u] * value_scale),
+                float_to_u32_bits(acc[dim_idx + 2u] * value_scale),
+                float_to_u32_bits(acc[dim_idx + 3u] * value_scale));
+        }
+    }
+    return 1;
+}
+#endif
+
 static float read_v_value(const kvslot_runtime_slot_args_t *slot, uint32_t logical_idx)
 {
     uint32_t elem_offset = slot->v_elem_offset;
@@ -217,16 +374,13 @@ static float read_v_value(const kvslot_runtime_slot_args_t *slot, uint32_t logic
     if (dtype_code == KVSLOT_DTYPE_INT8) {
         return read_int8_v_value(elem_offset, logical_idx, slot->v_scale);
     }
-    if (dtype_code == KVSLOT_DTYPE_FP16) {
-        uint64_t packed64 = 0;
-        uint32_t packed = 0;
-        uint32_t word_idx = elem_offset + (logical_idx / 2u);
-        uint32_t pair_base = word_idx & ~1u;
-        uint16_t fp16_bits;
-        mram_read(&v_cache[pair_base], &packed64, sizeof(packed64));
-        packed = (word_idx & 1u) == 0 ? (uint32_t)(packed64 & 0xffffffffu) : (uint32_t)(packed64 >> 32);
-        fp16_bits = (logical_idx & 1u) == 0 ? (uint16_t)(packed & 0xffffu) : (uint16_t)(packed >> 16);
-        return fp16_bits_to_float(fp16_bits);
+#ifdef KVSLOT_EXPERIMENTAL_INT16_KV
+    if (dtype_code == KVSLOT_DTYPE_INT16) {
+        return read_int16_v_value(elem_offset, logical_idx, slot->v_scale);
+    }
+#endif
+    if (dtype_code == KVSLOT_DTYPE_FP16 || dtype_code == KVSLOT_DTYPE_BF16) {
+        return u16_cache_bits_to_float(read_v_packed_u16_value(elem_offset, logical_idx), dtype_code);
     }
 
     uint64_t packed = 0;
@@ -267,6 +421,67 @@ static void read_fp16_v_pair(const kvslot_runtime_slot_args_t *slot, uint32_t lo
     }
 }
 
+static void read_bf16_v_pair(const kvslot_runtime_slot_args_t *slot, uint32_t logical_idx, float *value0, float *value1)
+{
+    uint64_t packed64 = 0;
+    uint32_t elem_offset = slot->v_elem_offset == KVSLOT_UNSET_U32 ? slot->elem_offset : slot->v_elem_offset;
+    uint32_t word_idx = elem_offset + (logical_idx / 2u);
+    uint32_t pair_base = word_idx & ~1u;
+    uint32_t packed;
+
+    mram_read(&v_cache[pair_base], &packed64, sizeof(packed64));
+    packed = (word_idx & 1u) == 0 ? (uint32_t)(packed64 & 0xffffffffu) : (uint32_t)(packed64 >> 32);
+    if ((logical_idx & 1u) == 0) {
+        *value0 = bf16_bits_to_float((uint16_t)(packed & 0xffffu));
+        *value1 = bf16_bits_to_float((uint16_t)(packed >> 16));
+        return;
+    }
+
+    *value0 = bf16_bits_to_float((uint16_t)(packed >> 16));
+    if (((word_idx + 1u) & ~1u) == pair_base) {
+        uint32_t next_packed = ((word_idx + 1u) & 1u) == 0
+            ? (uint32_t)(packed64 & 0xffffffffu)
+            : (uint32_t)(packed64 >> 32);
+        *value1 = bf16_bits_to_float((uint16_t)(next_packed & 0xffffu));
+    } else {
+        uint64_t next_packed64 = 0;
+        mram_read(&v_cache[pair_base + 2u], &next_packed64, sizeof(next_packed64));
+        *value1 = bf16_bits_to_float((uint16_t)(next_packed64 & 0xffffu));
+    }
+}
+
+#ifdef KVSLOT_EXPERIMENTAL_INT16_KV
+static void read_int16_v_pair(const kvslot_runtime_slot_args_t *slot, uint32_t logical_idx, float *value0, float *value1)
+{
+    uint64_t packed64 = 0;
+    uint32_t elem_offset = slot->v_elem_offset == KVSLOT_UNSET_U32 ? slot->elem_offset : slot->v_elem_offset;
+    uint32_t word_idx = elem_offset + (logical_idx / 2u);
+    uint32_t pair_base = word_idx & ~1u;
+    uint32_t packed;
+    float scale = slot->v_scale;
+
+    mram_read(&v_cache[pair_base], &packed64, sizeof(packed64));
+    packed = (word_idx & 1u) == 0 ? (uint32_t)(packed64 & 0xffffffffu) : (uint32_t)(packed64 >> 32);
+    if ((logical_idx & 1u) == 0) {
+        *value0 = ((float)(int16_t)(packed & 0xffffu)) * scale;
+        *value1 = ((float)(int16_t)(packed >> 16)) * scale;
+        return;
+    }
+
+    *value0 = ((float)(int16_t)(packed >> 16)) * scale;
+    if (((word_idx + 1u) & ~1u) == pair_base) {
+        uint32_t next_packed = ((word_idx + 1u) & 1u) == 0
+            ? (uint32_t)(packed64 & 0xffffffffu)
+            : (uint32_t)(packed64 >> 32);
+        *value1 = ((float)(int16_t)(next_packed & 0xffffu)) * scale;
+    } else {
+        uint64_t next_packed64 = 0;
+        mram_read(&v_cache[pair_base + 2u], &next_packed64, sizeof(next_packed64));
+        *value1 = ((float)(int16_t)(next_packed64 & 0xffffu)) * scale;
+    }
+}
+#endif
+
 static void read_fp16_v_quad_aligned(
     const kvslot_runtime_slot_args_t *slot,
     uint32_t logical_idx,
@@ -290,21 +505,92 @@ static void read_fp16_v_quad_aligned(
     *value3 = fp16_bits_to_float((uint16_t)(high_word >> 16));
 }
 
+static void read_bf16_v_quad_aligned(
+    const kvslot_runtime_slot_args_t *slot,
+    uint32_t logical_idx,
+    float *value0,
+    float *value1,
+    float *value2,
+    float *value3)
+{
+    uint64_t packed64 = 0;
+    uint32_t elem_offset = slot->v_elem_offset == KVSLOT_UNSET_U32 ? slot->elem_offset : slot->v_elem_offset;
+    uint32_t word_idx = elem_offset + (logical_idx / 2u);
+    uint32_t low_word;
+    uint32_t high_word;
+
+    mram_read(&v_cache[word_idx], &packed64, sizeof(packed64));
+    low_word = (uint32_t)(packed64 & 0xffffffffu);
+    high_word = (uint32_t)(packed64 >> 32);
+    *value0 = bf16_bits_to_float((uint16_t)(low_word & 0xffffu));
+    *value1 = bf16_bits_to_float((uint16_t)(low_word >> 16));
+    *value2 = bf16_bits_to_float((uint16_t)(high_word & 0xffffu));
+    *value3 = bf16_bits_to_float((uint16_t)(high_word >> 16));
+}
+
+#ifdef KVSLOT_EXPERIMENTAL_INT16_KV
+static void read_int16_v_quad_raw_aligned(
+    const kvslot_runtime_slot_args_t *slot,
+    uint32_t logical_idx,
+    int16_t *value0,
+    int16_t *value1,
+    int16_t *value2,
+    int16_t *value3)
+{
+    uint64_t packed64 = 0;
+    uint32_t elem_offset = slot->v_elem_offset == KVSLOT_UNSET_U32 ? slot->elem_offset : slot->v_elem_offset;
+    uint32_t word_idx = elem_offset + (logical_idx / 2u);
+    uint32_t low_word;
+    uint32_t high_word;
+
+    mram_read(&v_cache[word_idx], &packed64, sizeof(packed64));
+    low_word = (uint32_t)(packed64 & 0xffffffffu);
+    high_word = (uint32_t)(packed64 >> 32);
+    *value0 = (int16_t)(low_word & 0xffffu);
+    *value1 = (int16_t)(low_word >> 16);
+    *value2 = (int16_t)(high_word & 0xffffu);
+    *value3 = (int16_t)(high_word >> 16);
+}
+
+static void read_int16_v_quad_aligned(
+    const kvslot_runtime_slot_args_t *slot,
+    uint32_t logical_idx,
+    float *value0,
+    float *value1,
+    float *value2,
+    float *value3)
+{
+    uint64_t packed64 = 0;
+    uint32_t elem_offset = slot->v_elem_offset == KVSLOT_UNSET_U32 ? slot->elem_offset : slot->v_elem_offset;
+    uint32_t word_idx = elem_offset + (logical_idx / 2u);
+    uint32_t low_word;
+    uint32_t high_word;
+    float scale = slot->v_scale;
+
+    mram_read(&v_cache[word_idx], &packed64, sizeof(packed64));
+    low_word = (uint32_t)(packed64 & 0xffffffffu);
+    high_word = (uint32_t)(packed64 >> 32);
+    *value0 = ((float)(int16_t)(low_word & 0xffffu)) * scale;
+    *value1 = ((float)(int16_t)(low_word >> 16)) * scale;
+    *value2 = ((float)(int16_t)(high_word & 0xffffu)) * scale;
+    *value3 = ((float)(int16_t)(high_word >> 16)) * scale;
+}
+#endif
+
 static float read_k_value(const kvslot_runtime_slot_args_t *slot, uint32_t logical_idx)
 {
+#ifndef KVSLOT_EXPERIMENTAL_INT8_I16_QK
     if (slot->dtype_code == KVSLOT_DTYPE_INT8) {
         return read_int8_k_value(slot->elem_offset, logical_idx, slot->k_scale);
     }
-    if (slot->dtype_code == KVSLOT_DTYPE_FP16) {
-        uint64_t packed64 = 0;
-        uint32_t packed = 0;
-        uint32_t word_idx = slot->elem_offset + (logical_idx / 2u);
-        uint32_t pair_base = word_idx & ~1u;
-        uint16_t fp16_bits;
-        mram_read(&k_cache[pair_base], &packed64, sizeof(packed64));
-        packed = (word_idx & 1u) == 0 ? (uint32_t)(packed64 & 0xffffffffu) : (uint32_t)(packed64 >> 32);
-        fp16_bits = (logical_idx & 1u) == 0 ? (uint16_t)(packed & 0xffffu) : (uint16_t)(packed >> 16);
-        return fp16_bits_to_float(fp16_bits);
+#endif
+#ifdef KVSLOT_EXPERIMENTAL_INT16_KV
+    if (slot->dtype_code == KVSLOT_DTYPE_INT16) {
+        return read_int16_k_value(slot->elem_offset, logical_idx, slot->k_scale);
+    }
+#endif
+    if (slot->dtype_code == KVSLOT_DTYPE_FP16 || slot->dtype_code == KVSLOT_DTYPE_BF16) {
+        return u16_cache_bits_to_float(read_k_packed_u16_value(slot->elem_offset, logical_idx), slot->dtype_code);
     }
 
     uint64_t packed = 0;
@@ -316,6 +602,8 @@ static float read_k_value(const kvslot_runtime_slot_args_t *slot, uint32_t logic
     return u32_bits_to_float(bits);
 }
 
+#ifdef KVSLOT_EXPERIMENTAL_INT8_I16_QK
+#ifndef KVSLOT_SLIM_QK_SLOT_ONLY
 static float quantize_query_row_i16(uint32_t head_dim)
 {
     float max_abs = 0.0f;
@@ -348,11 +636,14 @@ static float quantize_query_row_i16(uint32_t head_dim)
     }
     return scale;
 }
+#endif
 
-static float dot_query_i16_with_int8_k_row(
+static float dot_query_i16_row_with_int8_k_row(
     const kvslot_runtime_slot_args_t *slot,
     uint32_t key_row_base,
-    uint32_t head_dim)
+    uint32_t head_dim,
+    const int16_t *query_row,
+    float query_scale)
 {
     int64_t acc = 0;
     uint32_t dim_idx = 0;
@@ -362,14 +653,11 @@ static float dot_query_i16_with_int8_k_row(
         for (; dim_idx + 8u <= head_dim; dim_idx += 8u, word_idx += 2u) {
             uint64_t packed64 = 0;
             mram_read(&k_cache[word_idx], &packed64, sizeof(packed64));
-            acc += (int32_t)qk_slot_query_i16[dim_idx] * (int32_t)(int8_t)((packed64 >> 0) & 0xffu);
-            acc += (int32_t)qk_slot_query_i16[dim_idx + 1u] * (int32_t)(int8_t)((packed64 >> 8) & 0xffu);
-            acc += (int32_t)qk_slot_query_i16[dim_idx + 2u] * (int32_t)(int8_t)((packed64 >> 16) & 0xffu);
-            acc += (int32_t)qk_slot_query_i16[dim_idx + 3u] * (int32_t)(int8_t)((packed64 >> 24) & 0xffu);
-            acc += (int32_t)qk_slot_query_i16[dim_idx + 4u] * (int32_t)(int8_t)((packed64 >> 32) & 0xffu);
-            acc += (int32_t)qk_slot_query_i16[dim_idx + 5u] * (int32_t)(int8_t)((packed64 >> 40) & 0xffu);
-            acc += (int32_t)qk_slot_query_i16[dim_idx + 6u] * (int32_t)(int8_t)((packed64 >> 48) & 0xffu);
-            acc += (int32_t)qk_slot_query_i16[dim_idx + 7u] * (int32_t)(int8_t)((packed64 >> 56) & 0xffu);
+#pragma clang loop unroll(disable)
+            for (uint32_t byte_idx = 0; byte_idx < 8u; ++byte_idx) {
+                acc += (int32_t)query_row[dim_idx + byte_idx]
+                    * (int32_t)(int8_t)((packed64 >> (byte_idx * 8u)) & 0xffu);
+            }
         }
     }
 
@@ -378,23 +666,38 @@ static float dot_query_i16_with_int8_k_row(
         uint32_t pair_base = int8_cache_pair_base(slot->elem_offset, logical_idx);
         uint64_t packed64 = 0;
         mram_read(&k_cache[pair_base], &packed64, sizeof(packed64));
-        acc += (int32_t)qk_slot_query_i16[dim_idx] * (int32_t)unpack_int8_value(packed64, slot->elem_offset, logical_idx);
+        acc += (int32_t)query_row[dim_idx] * (int32_t)unpack_int8_value(packed64, slot->elem_offset, logical_idx);
     }
-    return ((float)acc) * qk_slot_query_i16_scale * slot->k_scale;
+    return ((float)acc) * query_scale * slot->k_scale;
 }
+
+#ifndef KVSLOT_SLIM_QK_SLOT_ONLY
+static float dot_query_i16_with_int8_k_row(
+    const kvslot_runtime_slot_args_t *slot,
+    uint32_t key_row_base,
+    uint32_t head_dim)
+{
+    return dot_query_i16_row_with_int8_k_row(
+        slot,
+        key_row_base,
+        head_dim,
+        qk_slot_query_i16,
+        qk_slot_query_i16_scale);
+}
+#endif
+#endif
 
 static float dot_query_with_k_row(const kvslot_runtime_slot_args_t *slot, uint32_t key_row_base, uint32_t head_dim)
 {
     float local_sum = 0.0f;
     uint32_t dim_idx = 0;
-    uint32_t logical_end = key_row_base + head_dim;
 
-#ifdef KVSLOT_EXPERIMENTAL_INT8_I16_QK
+#if defined(KVSLOT_EXPERIMENTAL_INT8_I16_QK) && !defined(KVSLOT_SLIM_QK_SLOT_ONLY)
     if (slot->dtype_code == KVSLOT_DTYPE_INT8) {
         return dot_query_i16_with_int8_k_row(slot, key_row_base, head_dim);
     } else
 #endif
-    if (slot->dtype_code == KVSLOT_DTYPE_FP16) {
+    if (slot->dtype_code == KVSLOT_DTYPE_FP16 || slot->dtype_code == KVSLOT_DTYPE_BF16) {
         uint32_t word_idx = slot->elem_offset + (key_row_base / 2u);
         if ((key_row_base & 1u) == 0 && (word_idx & 1u) == 0) {
             __dma_aligned uint32_t packed_words[4];
@@ -404,8 +707,10 @@ static float dot_query_with_k_row(const kvslot_runtime_slot_args_t *slot, uint32
                 for (uint32_t packed_idx = 0; packed_idx < 4u; ++packed_idx) {
                     uint32_t packed = packed_words[packed_idx];
                     uint32_t packed_dim_idx = dim_idx + (packed_idx * 2u);
-                    local_sum += qk_slot_query_row[packed_dim_idx] * fp16_bits_to_float((uint16_t)(packed & 0xffffu));
-                    local_sum += qk_slot_query_row[packed_dim_idx + 1u] * fp16_bits_to_float((uint16_t)(packed >> 16));
+                    local_sum += qk_slot_query_row[packed_dim_idx]
+                        * u16_cache_bits_to_float((uint16_t)(packed & 0xffffu), slot->dtype_code);
+                    local_sum += qk_slot_query_row[packed_dim_idx + 1u]
+                        * u16_cache_bits_to_float((uint16_t)(packed >> 16), slot->dtype_code);
                 }
             }
             for (; dim_idx + 4u <= head_dim; dim_idx += 4u, word_idx += 2u) {
@@ -415,10 +720,14 @@ static float dot_query_with_k_row(const kvslot_runtime_slot_args_t *slot, uint32
                 mram_read(&k_cache[word_idx], &packed64, sizeof(packed64));
                 low_word = (uint32_t)(packed64 & 0xffffffffu);
                 high_word = (uint32_t)(packed64 >> 32);
-                local_sum += qk_slot_query_row[dim_idx] * fp16_bits_to_float((uint16_t)(low_word & 0xffffu));
-                local_sum += qk_slot_query_row[dim_idx + 1u] * fp16_bits_to_float((uint16_t)(low_word >> 16));
-                local_sum += qk_slot_query_row[dim_idx + 2u] * fp16_bits_to_float((uint16_t)(high_word & 0xffffu));
-                local_sum += qk_slot_query_row[dim_idx + 3u] * fp16_bits_to_float((uint16_t)(high_word >> 16));
+                local_sum += qk_slot_query_row[dim_idx]
+                    * u16_cache_bits_to_float((uint16_t)(low_word & 0xffffu), slot->dtype_code);
+                local_sum += qk_slot_query_row[dim_idx + 1u]
+                    * u16_cache_bits_to_float((uint16_t)(low_word >> 16), slot->dtype_code);
+                local_sum += qk_slot_query_row[dim_idx + 2u]
+                    * u16_cache_bits_to_float((uint16_t)(high_word & 0xffffu), slot->dtype_code);
+                local_sum += qk_slot_query_row[dim_idx + 3u]
+                    * u16_cache_bits_to_float((uint16_t)(high_word >> 16), slot->dtype_code);
             }
         }
     } else if (slot->dtype_code == KVSLOT_DTYPE_FP32) {
@@ -433,12 +742,315 @@ static float dot_query_with_k_row(const kvslot_runtime_slot_args_t *slot, uint32
         }
     }
 
-    for (; dim_idx < head_dim && (key_row_base + dim_idx) < logical_end; ++dim_idx) {
+    for (; dim_idx < head_dim; ++dim_idx) {
         local_sum += qk_slot_query_row[dim_idx] * read_k_value(slot, key_row_base + dim_idx);
     }
     return local_sum;
 }
 
+#ifdef KVSLOT_SLIM_QK_SLOT_ONLY
+static float dot_query_u16_with_query_row(
+    const kvslot_runtime_slot_args_t *slot,
+    uint32_t key_row_base,
+    uint32_t head_dim,
+    const float *query_row)
+{
+    float local_sum = 0.0f;
+    uint32_t dim_idx = 0;
+    uint32_t word_idx = slot->elem_offset + (key_row_base / 2u);
+
+#ifdef KVSLOT_BULK_FP16_DOT
+    if ((key_row_base & 1u) == 0
+        && (word_idx & 1u) == 0
+        && (head_dim & 3u) == 0
+        && head_dim <= KVSLOT_SLIM_QK_CACHE_HEAD_DIM) {
+        __dma_aligned uint32_t packed_words[KVSLOT_SLIM_QK_CACHE_HEAD_DIM / 2u];
+        uint32_t packed_word_count = (head_dim + 1u) / 2u;
+        mram_read(&k_cache[word_idx], packed_words, packed_word_count * sizeof(packed_words[0]));
+        for (; dim_idx + 8u <= head_dim; dim_idx += 8u) {
+            uint32_t packed0 = packed_words[(dim_idx / 2u)];
+            uint32_t packed1 = packed_words[(dim_idx / 2u) + 1u];
+            uint32_t packed2 = packed_words[(dim_idx / 2u) + 2u];
+            uint32_t packed3 = packed_words[(dim_idx / 2u) + 3u];
+            local_sum += query_row[dim_idx] * u16_cache_bits_to_float((uint16_t)(packed0 & 0xffffu), slot->dtype_code);
+            local_sum += query_row[dim_idx + 1u] * u16_cache_bits_to_float((uint16_t)(packed0 >> 16), slot->dtype_code);
+            local_sum += query_row[dim_idx + 2u] * u16_cache_bits_to_float((uint16_t)(packed1 & 0xffffu), slot->dtype_code);
+            local_sum += query_row[dim_idx + 3u] * u16_cache_bits_to_float((uint16_t)(packed1 >> 16), slot->dtype_code);
+            local_sum += query_row[dim_idx + 4u] * u16_cache_bits_to_float((uint16_t)(packed2 & 0xffffu), slot->dtype_code);
+            local_sum += query_row[dim_idx + 5u] * u16_cache_bits_to_float((uint16_t)(packed2 >> 16), slot->dtype_code);
+            local_sum += query_row[dim_idx + 6u] * u16_cache_bits_to_float((uint16_t)(packed3 & 0xffffu), slot->dtype_code);
+            local_sum += query_row[dim_idx + 7u] * u16_cache_bits_to_float((uint16_t)(packed3 >> 16), slot->dtype_code);
+        }
+        for (; dim_idx < head_dim; ++dim_idx) {
+            uint32_t packed = packed_words[dim_idx / 2u];
+            uint16_t fp16_bits = (dim_idx & 1u) == 0
+                ? (uint16_t)(packed & 0xffffu)
+                : (uint16_t)(packed >> 16);
+            local_sum += query_row[dim_idx] * u16_cache_bits_to_float(fp16_bits, slot->dtype_code);
+        }
+        return local_sum;
+    }
+#endif
+
+    if ((key_row_base & 1u) == 0 && (word_idx & 1u) == 0) {
+        __dma_aligned uint32_t packed_words[4];
+        for (; dim_idx + 8u <= head_dim; dim_idx += 8u, word_idx += 4u) {
+            mram_read(&k_cache[word_idx], packed_words, sizeof(packed_words));
+            local_sum += query_row[dim_idx] * u16_cache_bits_to_float((uint16_t)(packed_words[0] & 0xffffu), slot->dtype_code);
+            local_sum += query_row[dim_idx + 1u] * u16_cache_bits_to_float((uint16_t)(packed_words[0] >> 16), slot->dtype_code);
+            local_sum += query_row[dim_idx + 2u] * u16_cache_bits_to_float((uint16_t)(packed_words[1] & 0xffffu), slot->dtype_code);
+            local_sum += query_row[dim_idx + 3u] * u16_cache_bits_to_float((uint16_t)(packed_words[1] >> 16), slot->dtype_code);
+            local_sum += query_row[dim_idx + 4u] * u16_cache_bits_to_float((uint16_t)(packed_words[2] & 0xffffu), slot->dtype_code);
+            local_sum += query_row[dim_idx + 5u] * u16_cache_bits_to_float((uint16_t)(packed_words[2] >> 16), slot->dtype_code);
+            local_sum += query_row[dim_idx + 6u] * u16_cache_bits_to_float((uint16_t)(packed_words[3] & 0xffffu), slot->dtype_code);
+            local_sum += query_row[dim_idx + 7u] * u16_cache_bits_to_float((uint16_t)(packed_words[3] >> 16), slot->dtype_code);
+        }
+        for (; dim_idx + 4u <= head_dim; dim_idx += 4u, word_idx += 2u) {
+            uint64_t packed64 = 0;
+            uint32_t low_word;
+            uint32_t high_word;
+            mram_read(&k_cache[word_idx], &packed64, sizeof(packed64));
+            low_word = (uint32_t)(packed64 & 0xffffffffu);
+            high_word = (uint32_t)(packed64 >> 32);
+            local_sum += query_row[dim_idx] * u16_cache_bits_to_float((uint16_t)(low_word & 0xffffu), slot->dtype_code);
+            local_sum += query_row[dim_idx + 1u] * u16_cache_bits_to_float((uint16_t)(low_word >> 16), slot->dtype_code);
+            local_sum += query_row[dim_idx + 2u] * u16_cache_bits_to_float((uint16_t)(high_word & 0xffffu), slot->dtype_code);
+            local_sum += query_row[dim_idx + 3u] * u16_cache_bits_to_float((uint16_t)(high_word >> 16), slot->dtype_code);
+        }
+    }
+
+    for (; dim_idx < head_dim; ++dim_idx) {
+        local_sum += query_row[dim_idx] * read_k_value(slot, key_row_base + dim_idx);
+    }
+    return local_sum;
+}
+
+#ifdef KVSLOT_EXPERIMENTAL_INT16_KV
+static float dot_query_int16_with_query_row(
+    const kvslot_runtime_slot_args_t *slot,
+    uint32_t key_row_base,
+    uint32_t head_dim,
+    const int16_t *query_row,
+    float query_scale)
+{
+    int64_t acc = 0;
+    uint32_t dim_idx = 0;
+    uint32_t word_idx = slot->elem_offset + (key_row_base / 2u);
+
+#ifdef KVSLOT_BULK_FP16_DOT
+    if ((key_row_base & 1u) == 0
+        && (word_idx & 1u) == 0
+        && (head_dim & 3u) == 0
+        && head_dim <= KVSLOT_SLIM_QK_CACHE_HEAD_DIM) {
+        __dma_aligned uint32_t packed_words[KVSLOT_SLIM_QK_CACHE_HEAD_DIM / 2u];
+        uint32_t packed_word_count = (head_dim + 1u) / 2u;
+        mram_read(&k_cache[word_idx], packed_words, packed_word_count * sizeof(packed_words[0]));
+        for (; dim_idx + 8u <= head_dim; dim_idx += 8u) {
+            uint32_t packed0 = packed_words[(dim_idx / 2u)];
+            uint32_t packed1 = packed_words[(dim_idx / 2u) + 1u];
+            uint32_t packed2 = packed_words[(dim_idx / 2u) + 2u];
+            uint32_t packed3 = packed_words[(dim_idx / 2u) + 3u];
+            acc += (int32_t)query_row[dim_idx] * (int32_t)(int16_t)(packed0 & 0xffffu);
+            acc += (int32_t)query_row[dim_idx + 1u] * (int32_t)(int16_t)(packed0 >> 16);
+            acc += (int32_t)query_row[dim_idx + 2u] * (int32_t)(int16_t)(packed1 & 0xffffu);
+            acc += (int32_t)query_row[dim_idx + 3u] * (int32_t)(int16_t)(packed1 >> 16);
+            acc += (int32_t)query_row[dim_idx + 4u] * (int32_t)(int16_t)(packed2 & 0xffffu);
+            acc += (int32_t)query_row[dim_idx + 5u] * (int32_t)(int16_t)(packed2 >> 16);
+            acc += (int32_t)query_row[dim_idx + 6u] * (int32_t)(int16_t)(packed3 & 0xffffu);
+            acc += (int32_t)query_row[dim_idx + 7u] * (int32_t)(int16_t)(packed3 >> 16);
+        }
+        for (; dim_idx < head_dim; ++dim_idx) {
+            uint32_t packed = packed_words[dim_idx / 2u];
+            int16_t k_value = (dim_idx & 1u) == 0 ? (int16_t)(packed & 0xffffu) : (int16_t)(packed >> 16);
+            acc += (int32_t)query_row[dim_idx] * (int32_t)k_value;
+        }
+        return ((float)acc) * query_scale * slot->k_scale;
+    }
+#endif
+
+    if ((key_row_base & 1u) == 0 && (word_idx & 1u) == 0) {
+        __dma_aligned uint32_t packed_words[4];
+        for (; dim_idx + 8u <= head_dim; dim_idx += 8u, word_idx += 4u) {
+            mram_read(&k_cache[word_idx], packed_words, sizeof(packed_words));
+            acc += (int32_t)query_row[dim_idx] * (int32_t)(int16_t)(packed_words[0] & 0xffffu);
+            acc += (int32_t)query_row[dim_idx + 1u] * (int32_t)(int16_t)(packed_words[0] >> 16);
+            acc += (int32_t)query_row[dim_idx + 2u] * (int32_t)(int16_t)(packed_words[1] & 0xffffu);
+            acc += (int32_t)query_row[dim_idx + 3u] * (int32_t)(int16_t)(packed_words[1] >> 16);
+            acc += (int32_t)query_row[dim_idx + 4u] * (int32_t)(int16_t)(packed_words[2] & 0xffffu);
+            acc += (int32_t)query_row[dim_idx + 5u] * (int32_t)(int16_t)(packed_words[2] >> 16);
+            acc += (int32_t)query_row[dim_idx + 6u] * (int32_t)(int16_t)(packed_words[3] & 0xffffu);
+            acc += (int32_t)query_row[dim_idx + 7u] * (int32_t)(int16_t)(packed_words[3] >> 16);
+        }
+        for (; dim_idx + 4u <= head_dim; dim_idx += 4u, word_idx += 2u) {
+            uint64_t packed64 = 0;
+            uint32_t low_word;
+            uint32_t high_word;
+            mram_read(&k_cache[word_idx], &packed64, sizeof(packed64));
+            low_word = (uint32_t)(packed64 & 0xffffffffu);
+            high_word = (uint32_t)(packed64 >> 32);
+            acc += (int32_t)query_row[dim_idx] * (int32_t)(int16_t)(low_word & 0xffffu);
+            acc += (int32_t)query_row[dim_idx + 1u] * (int32_t)(int16_t)(low_word >> 16);
+            acc += (int32_t)query_row[dim_idx + 2u] * (int32_t)(int16_t)(high_word & 0xffffu);
+            acc += (int32_t)query_row[dim_idx + 3u] * (int32_t)(int16_t)(high_word >> 16);
+        }
+    }
+
+    for (; dim_idx < head_dim; ++dim_idx) {
+        acc += (int32_t)query_row[dim_idx]
+            * (int32_t)(int16_t)read_k_packed_u16_value(slot->elem_offset, key_row_base + dim_idx);
+    }
+    return ((float)acc) * query_scale * slot->k_scale;
+}
+#endif
+
+static int run_qk_slot_slim_all_head_dot(
+    uint32_t tasklet_id,
+    uint32_t seq_len,
+    uint32_t group_heads,
+    uint32_t slot_head_dim,
+    uint32_t num_heads,
+    uint32_t window,
+    uint32_t head_dim,
+    uint32_t mode)
+{
+    uint32_t query_pairs_per_head;
+    uint32_t total_query_pairs;
+    uint32_t total_scores;
+
+    if (runtime_slot_args.dtype_code != KVSLOT_DTYPE_FP16
+        && runtime_slot_args.dtype_code != KVSLOT_DTYPE_BF16
+#ifdef KVSLOT_EXPERIMENTAL_INT8_I16_QK
+        && runtime_slot_args.dtype_code != KVSLOT_DTYPE_INT8
+#endif
+#ifdef KVSLOT_EXPERIMENTAL_INT16_KV
+        && runtime_slot_args.dtype_code != KVSLOT_DTYPE_INT16
+#endif
+    ) {
+        return 0;
+    }
+    if (mode != KVSLOT_QK_SLOT_MODE_CONTEXT_FUSED
+        && mode != KVSLOT_QK_SLOT_MODE_CONTEXT_FUSED_UNNORMALIZED) {
+        return 0;
+    }
+    if (num_heads == 0 || window == 0 || head_dim == 0 || (head_dim & 1u) != 0) {
+        return 0;
+    }
+    if (num_heads > KVSLOT_MAX_HEADS || head_dim > KVSLOT_MAX_HEAD_DIM || window > KVSLOT_MAX_CAPACITY) {
+        return 0;
+    }
+    if (num_heads > KVSLOT_SLIM_QK_CACHE_HEADS || head_dim > KVSLOT_SLIM_QK_CACHE_HEAD_DIM) {
+        return 0;
+    }
+
+    query_pairs_per_head = (head_dim + 1u) / 2u;
+    total_query_pairs = num_heads * query_pairs_per_head;
+    for (uint32_t pair_idx = tasklet_id; pair_idx < total_query_pairs; pair_idx += NR_TASKLETS) {
+        uint32_t head_row = pair_idx / query_pairs_per_head;
+        uint32_t pair_in_head = pair_idx - (head_row * query_pairs_per_head);
+        uint32_t dim_idx0 = pair_in_head * 2u;
+        uint32_t dim_idx1 = dim_idx0 + 1u;
+        uint32_t query_row_base = head_row * head_dim;
+        uint32_t cache_row_base = head_row * KVSLOT_SLIM_QK_CACHE_HEAD_DIM;
+        uint64_t packed_q = 0;
+        mram_read(&qk_query[query_row_base + dim_idx0], &packed_q, sizeof(packed_q));
+        qk_slot_query_rows[cache_row_base + dim_idx0] = u32_bits_to_float((uint32_t)(packed_q & 0xffffffffu));
+        if (dim_idx1 < head_dim) {
+            qk_slot_query_rows[cache_row_base + dim_idx1] = u32_bits_to_float((uint32_t)(packed_q >> 32));
+        }
+    }
+    barrier_wait(&kvslot_barrier);
+
+#if defined(KVSLOT_EXPERIMENTAL_INT16_KV) || defined(KVSLOT_EXPERIMENTAL_INT8_I16_QK)
+    if (0
+#ifdef KVSLOT_EXPERIMENTAL_INT16_KV
+        || runtime_slot_args.dtype_code == KVSLOT_DTYPE_INT16
+#endif
+#ifdef KVSLOT_EXPERIMENTAL_INT8_I16_QK
+        || runtime_slot_args.dtype_code == KVSLOT_DTYPE_INT8
+#endif
+    ) {
+        for (uint32_t head_row = tasklet_id; head_row < num_heads; head_row += NR_TASKLETS) {
+            uint32_t cache_row_base = head_row * KVSLOT_SLIM_QK_CACHE_HEAD_DIM;
+            float max_abs = 0.0f;
+            float scale;
+            for (uint32_t dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
+                float value = qk_slot_query_rows[cache_row_base + dim_idx];
+                float abs_value = value < 0.0f ? -value : value;
+                if (abs_value > max_abs) {
+                    max_abs = abs_value;
+                }
+            }
+            if (max_abs <= 0.0f) {
+                scale = 1.0f;
+                for (uint32_t dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
+                    qk_slot_query_i16_rows[cache_row_base + dim_idx] = 0;
+                }
+            } else {
+                scale = max_abs / 32767.0f;
+                for (uint32_t dim_idx = 0; dim_idx < head_dim; ++dim_idx) {
+                    float scaled = qk_slot_query_rows[cache_row_base + dim_idx] / scale;
+                    int32_t rounded = (int32_t)(scaled >= 0.0f ? scaled + 0.5f : scaled - 0.5f);
+                    if (rounded > 32767) {
+                        rounded = 32767;
+                    } else if (rounded < -32767) {
+                        rounded = -32767;
+                    }
+                    qk_slot_query_i16_rows[cache_row_base + dim_idx] = (int16_t)rounded;
+                }
+            }
+            qk_slot_query_i16_scales[head_row] = scale;
+        }
+        barrier_wait(&kvslot_barrier);
+    }
+#endif
+
+    total_scores = num_heads * window;
+    for (uint32_t score_idx = tasklet_id; score_idx < total_scores; score_idx += NR_TASKLETS) {
+        uint32_t head_row = score_idx / window;
+        uint32_t token_offset = score_idx - (head_row * window);
+        uint32_t local_head_idx = qk_slot_head_indices[head_row];
+        float local_sum = 0.0f;
+        if (local_head_idx < group_heads) {
+            uint32_t token_idx = seq_len - window + token_offset;
+            uint32_t key_row_base = (((token_idx * group_heads) + local_head_idx) * slot_head_dim);
+            uint32_t query_cache_base = head_row * KVSLOT_SLIM_QK_CACHE_HEAD_DIM;
+#ifdef KVSLOT_EXPERIMENTAL_INT8_I16_QK
+            if (runtime_slot_args.dtype_code == KVSLOT_DTYPE_INT8) {
+                local_sum = dot_query_i16_row_with_int8_k_row(
+                    &runtime_slot_args,
+                    key_row_base,
+                    head_dim,
+                    &qk_slot_query_i16_rows[query_cache_base],
+                    qk_slot_query_i16_scales[head_row]);
+            } else
+#endif
+#ifdef KVSLOT_EXPERIMENTAL_INT16_KV
+            if (runtime_slot_args.dtype_code == KVSLOT_DTYPE_INT16) {
+                local_sum = dot_query_int16_with_query_row(
+                    &runtime_slot_args,
+                    key_row_base,
+                    head_dim,
+                    &qk_slot_query_i16_rows[query_cache_base],
+                    qk_slot_query_i16_scales[head_row]);
+            } else {
+#endif
+                local_sum = dot_query_u16_with_query_row(
+                    &runtime_slot_args,
+                    key_row_base,
+                    head_dim,
+                    &qk_slot_query_rows[query_cache_base]);
+#ifdef KVSLOT_EXPERIMENTAL_INT16_KV
+            }
+#endif
+        }
+        qk_slot_score_local[(size_t)head_row * window + token_offset] = float_to_u32_bits(local_sum);
+    }
+    barrier_wait(&kvslot_barrier);
+    return 1;
+}
+#endif
+
+#ifndef KVSLOT_SLIM_QK_SLOT_ONLY
 static void run_qk_kernel(void)
 {
     uint32_t tasklet_id = me();
@@ -485,6 +1097,7 @@ static void run_qk_kernel(void)
         barrier_wait(&kvslot_barrier);
     }
 }
+#endif
 
 static void run_context_from_local_softmax(uint32_t num_heads, uint32_t window, uint32_t group_heads, uint32_t head_dim)
 {
@@ -496,16 +1109,83 @@ static void run_context_from_local_softmax(uint32_t num_heads, uint32_t window, 
         ? runtime_slot_args.elem_offset
         : runtime_slot_args.v_elem_offset;
 
+#ifdef KVSLOT_CONTEXT_BULK_ROW
+    if (run_context_fp16_bulk_row(num_heads, window, group_heads, head_dim)) {
+        return;
+    }
+#endif
+
+#ifdef KVSLOT_CONTEXT_OCTETV
     if (v_dtype_code == KVSLOT_DTYPE_FP16
+        && (head_dim % 8u) == 0
+        && (total_outputs % 8u) == 0
+        && (value_elem_offset & 1u) == 0) {
+        uint32_t total_octets = total_outputs / 8u;
+        uint32_t value_word_stride = (group_heads * head_dim) / 2u;
+        for (uint32_t octet_idx = tasklet_id; octet_idx < total_octets; octet_idx += NR_TASKLETS) {
+            uint32_t out_idx0 = octet_idx * 8u;
+            uint32_t head_idx = out_idx0 / head_dim;
+            uint32_t dim_idx0 = out_idx0 % head_dim;
+            uint32_t kv_head_idx = qk_slot_head_indices[head_idx];
+            uint32_t score_idx = head_idx * window;
+            uint32_t value_word_idx;
+            float acc[8];
+
+            if (kv_head_idx >= group_heads) {
+                continue;
+            }
+            for (uint32_t acc_idx = 0; acc_idx < 8u; ++acc_idx) {
+                acc[acc_idx] = 0.0f;
+            }
+            value_word_idx = value_elem_offset + (((kv_head_idx * head_dim) + dim_idx0) / 2u);
+            for (uint32_t token_idx = 0; token_idx < window; ++token_idx) {
+                __dma_aligned uint32_t packed_words[4];
+                float weight = u32_bits_to_float(qk_slot_score_local[score_idx + token_idx]);
+                mram_read(&v_cache[value_word_idx], packed_words, sizeof(packed_words));
+                value_word_idx += value_word_stride;
+                for (uint32_t packed_idx = 0; packed_idx < 4u; ++packed_idx) {
+                    uint32_t packed = packed_words[packed_idx];
+                    uint32_t acc_idx = packed_idx * 2u;
+                    acc[acc_idx] += weight * fp16_bits_to_float((uint16_t)(packed & 0xffffu));
+                    acc[acc_idx + 1u] += weight * fp16_bits_to_float((uint16_t)(packed >> 16));
+                }
+            }
+            write_av_context_quad(
+                out_idx0,
+                float_to_u32_bits(acc[0]),
+                float_to_u32_bits(acc[1]),
+                float_to_u32_bits(acc[2]),
+                float_to_u32_bits(acc[3]));
+            write_av_context_quad(
+                out_idx0 + 4u,
+                float_to_u32_bits(acc[4]),
+                float_to_u32_bits(acc[5]),
+                float_to_u32_bits(acc[6]),
+                float_to_u32_bits(acc[7]));
+        }
+        return;
+    }
+#endif
+
+#ifndef KVSLOT_CONTEXT_OCTETV
+    if ((v_dtype_code == KVSLOT_DTYPE_FP16
+            || v_dtype_code == KVSLOT_DTYPE_BF16
+#ifdef KVSLOT_EXPERIMENTAL_INT16_KV
+            || v_dtype_code == KVSLOT_DTYPE_INT16
+#endif
+        )
         && (head_dim % 4u) == 0
         && (total_outputs % 4u) == 0
         && (value_elem_offset & 1u) == 0) {
         uint32_t total_quads = total_outputs / 4u;
+        uint32_t value_word_stride = (group_heads * head_dim) / 2u;
         for (uint32_t quad_idx = tasklet_id; quad_idx < total_quads; quad_idx += NR_TASKLETS) {
             uint32_t out_idx0 = quad_idx * 4u;
             uint32_t head_idx = out_idx0 / head_dim;
             uint32_t dim_idx0 = out_idx0 % head_dim;
             uint32_t kv_head_idx = qk_slot_head_indices[head_idx];
+            uint32_t score_idx = head_idx * window;
+            uint32_t value_word_idx;
             float acc0 = 0.0f;
             float acc1 = 0.0f;
             float acc2 = 0.0f;
@@ -514,18 +1194,76 @@ static void run_context_from_local_softmax(uint32_t num_heads, uint32_t window, 
             if (kv_head_idx >= group_heads) {
                 continue;
             }
-            for (uint32_t token_idx = 0; token_idx < window; ++token_idx) {
-                uint32_t value_idx0 = ((token_idx * group_heads) + kv_head_idx) * head_dim + dim_idx0;
-                float weight = u32_bits_to_float(qk_slot_score_local[(size_t)head_idx * window + token_idx]);
-                float value0;
-                float value1;
-                float value2;
-                float value3;
-                read_fp16_v_quad_aligned(&runtime_slot_args, value_idx0, &value0, &value1, &value2, &value3);
-                acc0 += weight * value0;
-                acc1 += weight * value1;
-                acc2 += weight * value2;
-                acc3 += weight * value3;
+            value_word_idx = value_elem_offset + (((kv_head_idx * head_dim) + dim_idx0) / 2u);
+#ifdef KVSLOT_EXPERIMENTAL_INT16_KV
+            if (v_dtype_code == KVSLOT_DTYPE_INT16) {
+                float value_scale = runtime_slot_args.v_scale;
+                for (uint32_t token_idx = 0; token_idx < window; ++token_idx) {
+                    uint64_t packed64 = 0;
+                    uint32_t low_word;
+                    uint32_t high_word;
+                    float weight = u32_bits_to_float(qk_slot_score_local[score_idx + token_idx]);
+                    mram_read(&v_cache[value_word_idx], &packed64, sizeof(packed64));
+                    value_word_idx += value_word_stride;
+                    low_word = (uint32_t)(packed64 & 0xffffffffu);
+                    high_word = (uint32_t)(packed64 >> 32);
+                    acc0 += weight * (float)(int16_t)(low_word & 0xffffu);
+                    acc1 += weight * (float)(int16_t)(low_word >> 16);
+                    acc2 += weight * (float)(int16_t)(high_word & 0xffffu);
+                    acc3 += weight * (float)(int16_t)(high_word >> 16);
+                }
+                acc0 *= value_scale;
+                acc1 *= value_scale;
+                acc2 *= value_scale;
+                acc3 *= value_scale;
+            } else
+#endif
+            if (v_dtype_code == KVSLOT_DTYPE_BF16) {
+                for (uint32_t token_idx = 0; token_idx < window; ++token_idx) {
+                    uint64_t packed64 = 0;
+                    uint32_t low_word;
+                    uint32_t high_word;
+                    float weight = u32_bits_to_float(qk_slot_score_local[score_idx + token_idx]);
+                    float value0;
+                    float value1;
+                    float value2;
+                    float value3;
+                    mram_read(&v_cache[value_word_idx], &packed64, sizeof(packed64));
+                    value_word_idx += value_word_stride;
+                    low_word = (uint32_t)(packed64 & 0xffffffffu);
+                    high_word = (uint32_t)(packed64 >> 32);
+                    value0 = bf16_bits_to_float((uint16_t)(low_word & 0xffffu));
+                    value1 = bf16_bits_to_float((uint16_t)(low_word >> 16));
+                    value2 = bf16_bits_to_float((uint16_t)(high_word & 0xffffu));
+                    value3 = bf16_bits_to_float((uint16_t)(high_word >> 16));
+                    acc0 += weight * value0;
+                    acc1 += weight * value1;
+                    acc2 += weight * value2;
+                    acc3 += weight * value3;
+                }
+            } else {
+                for (uint32_t token_idx = 0; token_idx < window; ++token_idx) {
+                    uint64_t packed64 = 0;
+                    uint32_t low_word;
+                    uint32_t high_word;
+                    float weight = u32_bits_to_float(qk_slot_score_local[score_idx + token_idx]);
+                    float value0;
+                    float value1;
+                    float value2;
+                    float value3;
+                    mram_read(&v_cache[value_word_idx], &packed64, sizeof(packed64));
+                    value_word_idx += value_word_stride;
+                    low_word = (uint32_t)(packed64 & 0xffffffffu);
+                    high_word = (uint32_t)(packed64 >> 32);
+                    value0 = fp16_bits_to_float((uint16_t)(low_word & 0xffffu));
+                    value1 = fp16_bits_to_float((uint16_t)(low_word >> 16));
+                    value2 = fp16_bits_to_float((uint16_t)(high_word & 0xffffu));
+                    value3 = fp16_bits_to_float((uint16_t)(high_word >> 16));
+                    acc0 += weight * value0;
+                    acc1 += weight * value1;
+                    acc2 += weight * value2;
+                    acc3 += weight * value3;
+                }
             }
             write_av_context_quad(
                 out_idx0,
@@ -536,6 +1274,7 @@ static void run_context_from_local_softmax(uint32_t num_heads, uint32_t window, 
         }
         return;
     }
+#endif
 
     for (uint32_t pair_idx = tasklet_id; pair_idx < total_pairs; pair_idx += NR_TASKLETS) {
         uint32_t out_idx0 = pair_idx * 2u;
@@ -591,10 +1330,23 @@ static void run_context_from_local_softmax(uint32_t num_heads, uint32_t window, 
             for (uint32_t token_idx = 0; token_idx < window; ++token_idx) {
                 uint32_t value_idx0 = ((token_idx * group_heads) + kv_head_idx0) * head_dim + dim_idx0;
                 float weight0 = u32_bits_to_float(qk_slot_score_local[(size_t)head_idx0 * window + token_idx]);
-                if (v_dtype_code == KVSLOT_DTYPE_FP16) {
+                if (v_dtype_code == KVSLOT_DTYPE_FP16
+                    || v_dtype_code == KVSLOT_DTYPE_BF16
+#ifdef KVSLOT_EXPERIMENTAL_INT16_KV
+                    || v_dtype_code == KVSLOT_DTYPE_INT16
+#endif
+                ) {
                     float value0;
                     float value1;
-                    read_fp16_v_pair(&runtime_slot_args, value_idx0, &value0, &value1);
+                    if (v_dtype_code == KVSLOT_DTYPE_BF16) {
+                        read_bf16_v_pair(&runtime_slot_args, value_idx0, &value0, &value1);
+#ifdef KVSLOT_EXPERIMENTAL_INT16_KV
+                    } else if (v_dtype_code == KVSLOT_DTYPE_INT16) {
+                        read_int16_v_pair(&runtime_slot_args, value_idx0, &value0, &value1);
+#endif
+                    } else {
+                        read_fp16_v_pair(&runtime_slot_args, value_idx0, &value0, &value1);
+                    }
                     acc0 += weight0 * value0;
                     acc1 += weight0 * value1;
                 } else if (v_dtype_code == KVSLOT_DTYPE_FP32 && (value_idx0 % 2u) == 0) {
@@ -629,6 +1381,7 @@ static void run_context_from_local_softmax(uint32_t num_heads, uint32_t window, 
     }
 }
 
+#ifndef KVSLOT_SLIM_QK_SLOT_ONLY
 static void run_av_kernel(void)
 {
     uint32_t tasklet_id = me();
@@ -888,6 +1641,7 @@ static void run_grouped_av_kernel(void)
         write_av_context_pair(pair_idx, float_to_u32_bits(acc0), float_to_u32_bits(acc1));
     }
 }
+#endif
 
 static void run_qk_slot_kernel(void)
 {
@@ -933,6 +1687,17 @@ static void run_qk_slot_kernel(void)
     if (tasklet_id == 0 && qk_phase_profile_enabled) {
         phase_start = perfcounter_get();
     }
+#ifdef KVSLOT_SLIM_QK_SLOT_ONLY
+    if (!run_qk_slot_slim_all_head_dot(
+            tasklet_id,
+            seq_len,
+            group_heads,
+            slot_head_dim,
+            num_heads,
+            window,
+            head_dim,
+            mode)) {
+#endif
     for (uint32_t head_row = 0; head_row < num_heads; ++head_row) {
         uint32_t local_head_idx = qk_slot_head_indices[head_row];
         if (local_head_idx >= group_heads) {
@@ -953,7 +1718,7 @@ static void run_qk_slot_kernel(void)
             }
         }
         barrier_wait(&kvslot_barrier);
-#ifdef KVSLOT_EXPERIMENTAL_INT8_I16_QK
+#if defined(KVSLOT_EXPERIMENTAL_INT8_I16_QK) && !defined(KVSLOT_SLIM_QK_SLOT_ONLY)
         if (runtime_slot_args.dtype_code == KVSLOT_DTYPE_INT8) {
             if (tasklet_id == 0) {
                 qk_slot_query_i16_scale = quantize_query_row_i16(head_dim);
@@ -969,6 +1734,9 @@ static void run_qk_slot_kernel(void)
         }
         barrier_wait(&kvslot_barrier);
     }
+#ifdef KVSLOT_SLIM_QK_SLOT_ONLY
+    }
+#endif
     if (tasklet_id == 0 && qk_phase_profile_enabled) {
         uint64_t phase_end = perfcounter_get();
         kvslot_meta.qk_dot_cycles += phase_end - phase_start;
@@ -1011,6 +1779,7 @@ static void run_qk_slot_kernel(void)
                 }
             }
         }
+#ifndef KVSLOT_SLIM_QK_SLOT_ONLY
         if (mode == KVSLOT_QK_SLOT_MODE_RAW_SCORES) {
             for (uint32_t pair_idx = 0; pair_idx < total_pairs; ++pair_idx) {
                 uint32_t out_idx0 = pair_idx * 2u;
@@ -1021,8 +1790,10 @@ static void run_qk_slot_kernel(void)
                 mram_write(&packed, &qk_slot_scores_bits[(size_t)head_row * score_stride + out_idx0], sizeof(packed));
             }
         }
+#endif
     }
     barrier_wait(&kvslot_barrier);
+#ifndef KVSLOT_SLIM_QK_SLOT_ONLY
     if (mode == KVSLOT_QK_SLOT_MODE_SOFTMAX_NORMALIZED && window > 0) {
         uint32_t total_weights = num_heads * window;
         uint32_t total_pairs = (total_weights + 1u) / 2u;
@@ -1035,6 +1806,7 @@ static void run_qk_slot_kernel(void)
             mram_write(&packed, &av_weights_bits[idx0], sizeof(packed));
         }
     }
+#endif
     barrier_wait(&kvslot_barrier);
     if (tasklet_id == 0 && qk_phase_profile_enabled) {
         uint64_t phase_end = perfcounter_get();
@@ -1064,6 +1836,7 @@ static void run_qk_slot_kernel(void)
     barrier_wait(&kvslot_barrier);
 }
 
+#ifndef KVSLOT_SLIM_QK_SLOT_ONLY
 static void run_grouped_qk_slot_kernel(void)
 {
     uint32_t tasklet_id = me();
@@ -1117,7 +1890,7 @@ static void run_grouped_qk_slot_kernel(void)
             }
         }
         barrier_wait(&kvslot_barrier);
-#ifdef KVSLOT_EXPERIMENTAL_INT8_I16_QK
+#if defined(KVSLOT_EXPERIMENTAL_INT8_I16_QK) && !defined(KVSLOT_SLIM_QK_SLOT_ONLY)
         if (runtime_slot_args.dtype_code == KVSLOT_DTYPE_INT8) {
             if (tasklet_id == 0) {
                 qk_slot_query_i16_scale = quantize_query_row_i16(head_dim);
@@ -1185,6 +1958,7 @@ static void run_grouped_qk_slot_kernel(void)
     }
     barrier_wait(&kvslot_barrier);
 }
+#endif
 
 int main(void)
 {
@@ -1199,6 +1973,7 @@ int main(void)
         }
     }
     barrier_wait(&kvslot_barrier);
+#ifndef KVSLOT_SLIM_QK_SLOT_ONLY
     if (kernel_command == KVSLOT_KERNEL_QK) {
         run_qk_kernel();
     } else if (kernel_command == KVSLOT_KERNEL_AV) {
@@ -1210,6 +1985,11 @@ int main(void)
     } else if (kernel_command == (KVSLOT_KERNEL_QK_SLOT + 100u)) {
         run_grouped_qk_slot_kernel();
     }
+#else
+    if (kernel_command == KVSLOT_KERNEL_QK_SLOT) {
+        run_qk_slot_kernel();
+    }
+#endif
     barrier_wait(&kvslot_barrier);
     if (tasklet_id == 0 && qk_phase_profile_enabled) {
         kvslot_meta.cycles = perfcounter_get();

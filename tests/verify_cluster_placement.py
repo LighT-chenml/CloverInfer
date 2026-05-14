@@ -120,7 +120,17 @@ def parse_args():
     parser.add_argument(
         "--pim-resident-kv-dtype",
         default="fp32",
-        choices=["fp32", "fp16", "int8", "mixed_int8_fp16", "int8_fp16", "int8-fp16", "k_int8_v_fp16"],
+        choices=[
+            "fp32",
+            "fp16",
+            "bf16",
+            "int8",
+            "int16",
+            "mixed_int8_fp16",
+            "int8_fp16",
+            "int8-fp16",
+            "k_int8_v_fp16",
+        ],
     )
     parser.add_argument("--clover-cpu-shadow-enabled", action="store_true")
     parser.add_argument("--no-clover-cpu-shadow-enabled", action="store_true")

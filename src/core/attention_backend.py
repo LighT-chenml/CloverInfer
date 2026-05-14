@@ -1344,6 +1344,7 @@ class PimNaiveAttentionBackend:
         self,
         initial_kv: List[Dict[str, torch.Tensor]],
         decode_reserve_tokens: int = 0,
+        logical_context_len: int | None = None,
     ) -> tuple[int, int, int]:
         total_live_elems = 0
         total_capacity_elems = 0
@@ -1359,24 +1360,48 @@ class PimNaiveAttentionBackend:
             max_layer_groups = max(max_layer_groups, group_count)
             total_live_elems += int(seq_len) * int(num_heads) * int(head_dim)
             logical_capacity = max(int(self.length), int(seq_len) + reserve_tokens)
-            base_capacity = int(block_tokens * math.ceil(float(logical_capacity) / float(block_tokens)))
-            effective_capacity = base_capacity
-            tail_available = max(0, base_capacity - logical_capacity)
-            # Mirror the blocked-store rollover behavior roughly enough for
-            # stripe sizing: once the request is expected to decode beyond the
-            # base resident length, a nearly-full tail block will spill into an
-            # extra growth block instead of consuming the small remaining tail
-            # in place. Keep shorter prompts below the base resident length on
-            # the compact path so we do not over-widen Qwen/OPT stripes just to
-            # reserve growth blocks they will not actually touch.
-            if (
-                reserve_tokens > 0
-                and growth_block_tokens > 0
-                and logical_capacity > int(self.length)
-                and tail_available <= base_rollover_tokens
-            ):
-                effective_capacity += growth_block_tokens
-            total_capacity_elems += effective_capacity * int(num_heads) * int(head_dim)
+            sparse_tail_resident = (
+                int(self.attention_sparse_window) > 0
+                and logical_context_len is not None
+                and int(logical_context_len) > int(seq_len)
+                and int(seq_len) <= int(self.attention_sparse_window)
+            )
+            if sparse_tail_resident:
+                # Sparse-tail materialization passes the exact resident tail
+                # capacity into the segmented store; rounding it to another
+                # full base block can double the estimated footprint and widen
+                # the DPU stripe unnecessarily.
+                effective_capacity = int(logical_capacity)
+            else:
+                base_capacity = int(block_tokens * math.ceil(float(logical_capacity) / float(block_tokens)))
+                effective_capacity = base_capacity
+                tail_available = max(0, base_capacity - logical_capacity)
+                # Mirror the blocked-store rollover behavior roughly enough for
+                # stripe sizing: once the request is expected to decode beyond the
+                # base resident length, a nearly-full tail block will spill into an
+                # extra growth block instead of consuming the small remaining tail
+                # in place. Keep shorter prompts below the base resident length on
+                # the compact path so we do not over-widen Qwen/OPT stripes just to
+                # reserve growth blocks they will not actually touch.
+                if (
+                    reserve_tokens > 0
+                    and growth_block_tokens > 0
+                    and logical_capacity > int(self.length)
+                    and tail_available <= base_rollover_tokens
+                ):
+                    effective_capacity += growth_block_tokens
+
+            slot_elem_count = getattr(self.resident_store, "_slot_elem_count", None)
+            if callable(slot_elem_count):
+                base_heads_per_group = int(num_heads) // int(group_count)
+                extra_head_groups = int(num_heads) % int(group_count)
+                for group_idx in range(int(group_count)):
+                    group_heads = base_heads_per_group + (1 if group_idx < extra_head_groups else 0)
+                    if group_heads <= 0:
+                        continue
+                    total_capacity_elems += int(slot_elem_count(effective_capacity, group_heads, int(head_dim)))
+            else:
+                total_capacity_elems += effective_capacity * int(num_heads) * int(head_dim)
         # Host-backed resident storage has no per-DPU slot pool, so capacity
         # should not artificially widen the requested stripe there. Fall back to
         # a single logical stripe when the store does not expose DPU pool size.
@@ -1499,6 +1524,16 @@ class PimNaiveAttentionBackend:
             return (group_idx + dpu_rotation) % self.num_dpus
         return group_idx % self.num_dpus
 
+    def _head_group_allowed_dpus(
+        self,
+        *,
+        group_idx: int,
+        num_groups: int,
+        preferred_dpu_stripe: List[int] | None,
+    ) -> List[int]:
+        del group_idx, num_groups
+        return self._normalize_physical_dpu_list(preferred_dpu_stripe)
+
     def _build_head_groups(
         self,
         request_id: str,
@@ -1553,14 +1588,19 @@ class PimNaiveAttentionBackend:
         for group_idx, (kv_head_start, kv_head_end, logical_dpu_ids) in enumerate(group_specs):
             query_head_start = int(kv_head_start) * int(query_heads_per_kv)
             query_head_end = int(kv_head_end) * int(query_heads_per_kv)
+            default_allowed_dpus = self._head_group_allowed_dpus(
+                group_idx=group_idx,
+                num_groups=len(group_specs),
+                preferred_dpu_stripe=preferred_dpu_stripe,
+            )
             allowed_dpus = (
                 self._map_logical_dpus_to_physical(
                     logical_dpu_ids,
-                    preferred_dpu_stripe=preferred_dpu_stripe,
+                    preferred_dpu_stripe=default_allowed_dpus or preferred_dpu_stripe,
                     dpu_rotation=dpu_rotation,
                 )
                 if logical_dpu_ids
-                else self._normalize_physical_dpu_list(preferred_dpu_stripe)
+                else default_allowed_dpus
             )
             segment_plan = self._planner_segment_plan(
                 sharding_plan,
@@ -1661,6 +1701,7 @@ class PimNaiveAttentionBackend:
         _total_live_elems, max_layer_groups, min_dpus_by_capacity = self._request_shape_targets(
             initial_kv,
             decode_reserve_tokens=decode_reserve_tokens,
+            logical_context_len=logical_context_len,
         )
         initial_context_len = int(initial_kv[0]["key"].shape[0]) if initial_kv else 0
         logical_initial_context_len = int(

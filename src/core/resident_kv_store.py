@@ -22,8 +22,10 @@ _HOST_REDUCTION_IMPORT_ATTEMPTED = False
 KVSLOT_DTYPE_FP32 = 0
 KVSLOT_DTYPE_FP16 = 1
 KVSLOT_DTYPE_INT8 = 2
+KVSLOT_DTYPE_BF16 = 3
+KVSLOT_DTYPE_INT16 = 4
 MIXED_INT8_FP16_KV_DTYPE = "mixed_int8_fp16"
-SUPPORTED_RESIDENT_KV_DTYPES = {"fp32", "fp16", "int8", MIXED_INT8_FP16_KV_DTYPE}
+SUPPORTED_RESIDENT_KV_DTYPES = {"fp32", "fp16", "bf16", "int8", "int16", MIXED_INT8_FP16_KV_DTYPE}
 
 
 def normalize_resident_kv_dtype(value: str) -> str:
@@ -41,6 +43,10 @@ def resident_kv_dtype_code(kv_dtype: str, part: str = "k") -> int:
         return KVSLOT_DTYPE_INT8
     if normalized == "fp16":
         return KVSLOT_DTYPE_FP16
+    if normalized == "bf16":
+        return KVSLOT_DTYPE_BF16
+    if normalized == "int16":
+        return KVSLOT_DTYPE_INT16
     return KVSLOT_DTYPE_FP32
 
 
@@ -49,6 +55,10 @@ def kvslot_dtype_elem_bytes(dtype_code: int) -> int:
         return 1
     if int(dtype_code) == KVSLOT_DTYPE_FP16:
         return 2
+    if int(dtype_code) == KVSLOT_DTYPE_BF16:
+        return 2
+    if int(dtype_code) == KVSLOT_DTYPE_INT16:
+        return 2
     return 4
 
 
@@ -56,7 +66,7 @@ def kvslot_packed_word_count(logical_elems: int, dtype_code: int) -> int:
     elems = max(1, int(logical_elems))
     if int(dtype_code) == KVSLOT_DTYPE_INT8:
         words = (elems + 3) // 4
-    elif int(dtype_code) == KVSLOT_DTYPE_FP16:
+    elif int(dtype_code) in {KVSLOT_DTYPE_FP16, KVSLOT_DTYPE_BF16, KVSLOT_DTYPE_INT16}:
         words = (elems + 1) // 2
     else:
         words = elems
@@ -121,13 +131,26 @@ def _iter_candidate_kvslot_dirs(repo_root: str) -> List[str]:
     return kvslot_dirs
 
 
+def _parse_kvslot_bool_build_flag(raw_value: str | None, default_value: str = "0") -> str:
+    if raw_value is None:
+        raw_value = default_value
+    normalized = str(raw_value).strip().lower()
+    if normalized in {"1", "true", "yes", "on", "enable", "enabled"}:
+        return "1"
+    if normalized in {"0", "false", "no", "off", "disable", "disabled"}:
+        return "0"
+    return default_value
+
+
 def _kvslot_limit_config() -> tuple[Dict[str, str], bool]:
-    """Return Makefile limit overrides and whether the user explicitly set one."""
+    """Return Makefile build overrides and whether the user explicitly set one."""
     config: Dict[str, str] = {}
     explicit = False
     for make_name, clover_name, default_value in (
         ("KVSLOT_MAX_CAPACITY", "CLOVER_KVSLOT_MAX_CAPACITY", "256"),
         ("KVSLOT_MAX_HEADS", "CLOVER_KVSLOT_MAX_HEADS", "32"),
+        ("KVSLOT_MAX_BATCH_ITEMS", "CLOVER_KVSLOT_MAX_BATCH_ITEMS", "32"),
+        ("KVSLOT_QK_MAX_ACTIVE_DPUS", "CLOVER_KVSLOT_QK_MAX_ACTIVE_DPUS", "16"),
     ):
         raw_value = os.environ.get(clover_name)
         if raw_value is None:
@@ -143,6 +166,69 @@ def _kvslot_limit_config() -> tuple[Dict[str, str], bool]:
         except Exception:
             value = int(default_value)
         config[make_name] = str(value)
+
+    raw_int8_i16_qk = os.environ.get("CLOVER_KVSLOT_EXPERIMENTAL_INT8_I16_QK")
+    if raw_int8_i16_qk is None:
+        raw_int8_i16_qk = os.environ.get("KVSLOT_EXPERIMENTAL_INT8_I16_QK")
+    else:
+        explicit = True
+    if raw_int8_i16_qk is not None:
+        explicit = True
+    config["KVSLOT_EXPERIMENTAL_INT8_I16_QK"] = _parse_kvslot_bool_build_flag(raw_int8_i16_qk, "0")
+
+    raw_slim_qk_slot_only = os.environ.get("CLOVER_KVSLOT_SLIM_QK_SLOT_ONLY")
+    if raw_slim_qk_slot_only is None:
+        raw_slim_qk_slot_only = os.environ.get("KVSLOT_SLIM_QK_SLOT_ONLY")
+    else:
+        explicit = True
+    if raw_slim_qk_slot_only is not None:
+        explicit = True
+    config["KVSLOT_SLIM_QK_SLOT_ONLY"] = _parse_kvslot_bool_build_flag(raw_slim_qk_slot_only, "0")
+
+    raw_bulk_fp16_dot = os.environ.get("CLOVER_KVSLOT_BULK_FP16_DOT")
+    if raw_bulk_fp16_dot is None:
+        raw_bulk_fp16_dot = os.environ.get("KVSLOT_BULK_FP16_DOT")
+    else:
+        explicit = True
+    if raw_bulk_fp16_dot is not None:
+        explicit = True
+    config["KVSLOT_BULK_FP16_DOT"] = _parse_kvslot_bool_build_flag(raw_bulk_fp16_dot, "0")
+
+    raw_int16_kv = os.environ.get("CLOVER_KVSLOT_EXPERIMENTAL_INT16_KV")
+    if raw_int16_kv is None:
+        raw_int16_kv = os.environ.get("KVSLOT_EXPERIMENTAL_INT16_KV")
+    else:
+        explicit = True
+    if raw_int16_kv is not None:
+        explicit = True
+    config["KVSLOT_EXPERIMENTAL_INT16_KV"] = _parse_kvslot_bool_build_flag(raw_int16_kv, "0")
+
+    raw_context_bulk_row = os.environ.get("CLOVER_KVSLOT_CONTEXT_BULK_ROW")
+    if raw_context_bulk_row is None:
+        raw_context_bulk_row = os.environ.get("KVSLOT_CONTEXT_BULK_ROW")
+    else:
+        explicit = True
+    if raw_context_bulk_row is not None:
+        explicit = True
+    config["KVSLOT_CONTEXT_BULK_ROW"] = _parse_kvslot_bool_build_flag(raw_context_bulk_row, "0")
+
+    raw_context_octetv = os.environ.get("CLOVER_KVSLOT_CONTEXT_OCTETV")
+    if raw_context_octetv is None:
+        raw_context_octetv = os.environ.get("KVSLOT_CONTEXT_OCTETV")
+    else:
+        explicit = True
+    if raw_context_octetv is not None:
+        explicit = True
+    config["KVSLOT_CONTEXT_OCTETV"] = _parse_kvslot_bool_build_flag(raw_context_octetv, "0")
+
+    raw_dpu_opt = os.environ.get("CLOVER_KVSLOT_DPU_OPT")
+    if raw_dpu_opt is None:
+        raw_dpu_opt = os.environ.get("KVSLOT_DPU_OPT")
+    else:
+        explicit = True
+    if raw_dpu_opt is not None:
+        explicit = True
+    config["KVSLOT_DPU_OPT"] = str(raw_dpu_opt).strip() if raw_dpu_opt else "-O2"
     return config, explicit
 
 
@@ -437,6 +523,7 @@ class _KVSlotHelperClient:
     MAX_GROUP_SEGMENTS = 8
     MAX_DPU_CAPACITY = max(1, int(os.environ.get("CLOVER_KVSLOT_MAX_CAPACITY", "256")))
     MAX_HEADS = max(1, int(os.environ.get("CLOVER_KVSLOT_MAX_HEADS", "32")))
+    MAX_BATCH_ITEMS = max(1, int(os.environ.get("CLOVER_KVSLOT_MAX_BATCH_ITEMS", "32")))
     SLOT_ARGS_STRUCT = struct.Struct("<IIIIIffI")
     SLOT_ARGS_SIZE = SLOT_ARGS_STRUCT.size
 
@@ -752,6 +839,19 @@ class _KVSlotHelperClient:
             "qk_dpu_other_cycles_total",
             "qk_dpu_profiled_launches",
             "qk_dpu_profiled_dpus",
+            "qk_round_window_total",
+            "qk_round_item_window_total",
+            "qk_max_window",
+            "qk_segmented_items_total",
+            "qk_max_segment_count",
+            "qk_batched_launch_dpus_total",
+            "qk_batched_dummy_dpus_total",
+            "qk_batched_max_launch_dpus",
+            "qk_batched_max_dummy_dpus",
+            "qk_round_heads_total",
+            "qk_round_head_window_total",
+            "qk_max_heads_per_item",
+            "qk_max_head_window_per_item",
         ]
         out = struct.unpack(f"<{len(keys)}Q", self._read_exact(len(keys) * 8))
         return {key: int(value) for key, value in zip(keys, out)}
@@ -1342,17 +1442,33 @@ class _KVSlotHelperClient:
             )
 
         outputs: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        response_bytes = 0
+        for expected_heads, expected_head_dim in expected_meta:
+            response_bytes += (
+                self.SLOT_ARGS_SIZE
+                + int(expected_heads) * int(expected_head_dim) * 4
+                + int(expected_heads) * 4
+                + int(expected_heads) * 4
+            )
+        response = memoryview(self._read_exact(response_bytes)) if response_bytes > 0 else memoryview(b"")
+        response_offset = 0
         for idx, (expected_heads, expected_head_dim) in enumerate(expected_meta):
-            out = self._read_slot_args()
+            out = self.SLOT_ARGS_STRUCT.unpack_from(response, response_offset)
+            response_offset += self.SLOT_ARGS_SIZE
             _, _, group_heads, head_dim, _ = (int(item) for item in out[:5])
             if group_heads != expected_heads or head_dim != expected_head_dim:
                 raise RuntimeError(
                     "kvslot helper returned invalid qk-softmax-av-partial batch item header: "
                     f"index={idx} expected=({expected_heads}, {expected_head_dim}) actual=({group_heads}, {head_dim})"
                 )
-            raw_context = self._read_exact(group_heads * head_dim * 4)
-            raw_row_max = self._read_exact(group_heads * 4)
-            raw_row_sum = self._read_exact(group_heads * 4)
+            context_bytes = group_heads * head_dim * 4
+            row_bytes = group_heads * 4
+            raw_context = response[response_offset : response_offset + context_bytes]
+            response_offset += context_bytes
+            raw_row_max = response[response_offset : response_offset + row_bytes]
+            response_offset += row_bytes
+            raw_row_sum = response[response_offset : response_offset + row_bytes]
+            response_offset += row_bytes
             context = torch.from_numpy(np.frombuffer(raw_context, dtype="<f4").copy()).view(group_heads, head_dim)
             row_max = torch.from_numpy(np.frombuffer(raw_row_max, dtype="<f4").copy())
             row_sum = torch.from_numpy(np.frombuffer(raw_row_sum, dtype="<f4").copy())
@@ -2617,8 +2733,12 @@ class UpmemKVSlotStore(ResidentKVStore):
     ) -> tuple[torch.Tensor, float]:
         if int(dtype_code) == KVSLOT_DTYPE_INT8:
             return self._encode_tensor_int8(tensor, scale=scale)
+        if int(dtype_code) == KVSLOT_DTYPE_INT16:
+            return self._encode_tensor_int16(tensor, scale=scale)
         if int(dtype_code) == KVSLOT_DTYPE_FP16:
             return tensor.detach().cpu().to(torch.float16).contiguous().view(torch.int16), 1.0
+        if int(dtype_code) == KVSLOT_DTYPE_BF16:
+            return tensor.detach().cpu().to(torch.bfloat16).contiguous().view(torch.int16), 1.0
         return tensor.detach().cpu().float().contiguous().view(torch.int32), 1.0
 
     def _encode_tensor_int8(
@@ -2634,6 +2754,22 @@ class UpmemKVSlotStore(ResidentKVStore):
         else:
             scale = max(float(scale), 1.0e-8)
         encoded = torch.clamp(torch.round(tensor_fp32 / float(scale)), -127, 127).to(torch.int8).contiguous()
+        encoded._clover_quant_scale = float(scale)  # type: ignore[attr-defined]
+        return encoded, float(scale)
+
+    def _encode_tensor_int16(
+        self,
+        tensor: torch.Tensor,
+        *,
+        scale: float | None = None,
+    ) -> tuple[torch.Tensor, float]:
+        tensor_fp32 = tensor.detach().cpu().to(torch.float32).contiguous()
+        if scale is None:
+            max_abs = float(torch.max(torch.abs(tensor_fp32)).item()) if tensor_fp32.numel() > 0 else 0.0
+            scale = max(max_abs / 32767.0, 1.0e-8)
+        else:
+            scale = max(float(scale), 1.0e-8)
+        encoded = torch.clamp(torch.round(tensor_fp32 / float(scale)), -32767, 32767).to(torch.int16).contiguous()
         encoded._clover_quant_scale = float(scale)  # type: ignore[attr-defined]
         return encoded, float(scale)
 
@@ -2678,8 +2814,12 @@ class UpmemKVSlotStore(ResidentKVStore):
     ) -> torch.Tensor:
         if int(dtype_code) == KVSLOT_DTYPE_INT8:
             return (tensor.to(torch.float32) * float(1.0 if scale is None else scale)).contiguous()
+        if int(dtype_code) == KVSLOT_DTYPE_INT16:
+            return (tensor.to(torch.float32) * float(1.0 if scale is None else scale)).contiguous()
         if int(dtype_code) == KVSLOT_DTYPE_FP16:
             return tensor.view(torch.float16).to(torch.float32).contiguous()
+        if int(dtype_code) == KVSLOT_DTYPE_BF16:
+            return tensor.view(torch.bfloat16).to(torch.float32).contiguous()
         return tensor.view(torch.float32).contiguous()
 
     def _slot_elem_count(self, capacity: int, group_heads: int, head_dim: int) -> int:
@@ -2688,12 +2828,26 @@ class UpmemKVSlotStore(ResidentKVStore):
         v_words = kvslot_packed_word_count(elem_count, resident_kv_dtype_code(self.kv_dtype, "v"))
         return max(k_words, v_words)
 
+    def _max_slot_token_capacity(self) -> int:
+        helper = getattr(self, "helper", None)
+        helper_limit = int(getattr(helper, "MAX_DPU_CAPACITY", _KVSlotHelperClient.MAX_DPU_CAPACITY))
+        return max(1, int(getattr(self, "max_dpu_capacity", helper_limit)))
+
+    def _base_block_token_limit(self) -> int:
+        configured_block_tokens = int(getattr(self, "block_tokens", self._max_slot_token_capacity()))
+        return max(1, min(configured_block_tokens, self._max_slot_token_capacity()))
+
+    def _growth_block_token_limit(self) -> int:
+        configured_growth_tokens = int(getattr(self, "growth_block_tokens", self._base_block_token_limit()))
+        return max(1, min(configured_growth_tokens, self._max_slot_token_capacity()))
+
     def _build_block_layout(self, capacity: int, seq_len: int) -> list[tuple[int, int]]:
         remaining_capacity = int(capacity)
         remaining_seq_len = int(seq_len)
         layout: list[tuple[int, int]] = []
+        block_token_limit = self._base_block_token_limit()
         while remaining_capacity > 0:
-            block_capacity = min(self.block_tokens, remaining_capacity)
+            block_capacity = min(block_token_limit, remaining_capacity)
             block_seq_len = min(block_capacity, remaining_seq_len)
             layout.append((block_capacity, block_seq_len))
             remaining_capacity -= block_capacity
@@ -2705,6 +2859,7 @@ class UpmemKVSlotStore(ResidentKVStore):
         live_lengths: list[int],
         total_capacity: int,
         max_reserve_tokens: int | None = None,
+        block_capacity_limit: int | None = None,
     ) -> list[int]:
         capacities = [max(0, int(length)) for length in live_lengths]
         reserve = max(0, int(total_capacity) - sum(capacities))
@@ -2716,8 +2871,13 @@ class UpmemKVSlotStore(ResidentKVStore):
         # Decode appends extend the sequence tail, so place spare capacity in
         # the last token blocks first. This avoids allocating a new growth slot
         # immediately after prefill when seq_len < resident capacity.
+        per_block_limit = (
+            max(1, int(block_capacity_limit))
+            if block_capacity_limit is not None and int(block_capacity_limit) > 0
+            else max(1, int(getattr(self, "block_tokens", 1)))
+        )
         for idx in range(len(capacities) - 1, -1, -1):
-            room = max(0, int(self.block_tokens) - int(capacities[idx]))
+            room = max(0, int(per_block_limit) - int(capacities[idx]))
             if room <= 0:
                 continue
             take = min(room, reserve)
@@ -2894,10 +3054,17 @@ class UpmemKVSlotStore(ResidentKVStore):
         locality_anchor_dpu = int(blocks[-1]["physical_dpu"]) if blocks else base_physical_dpu
         allowed_dpus = slot_info.get("allowed_physical_dpus")
         if block_capacity_override is None:
-            default_capacity = self.block_tokens if block_kind == "base" else self.growth_block_tokens
-            block_capacity = max(int(block_k.shape[0]), int(default_capacity))
+            default_capacity = self._base_block_token_limit() if block_kind == "base" else self._growth_block_token_limit()
+            requested_block_capacity = max(int(block_k.shape[0]), int(default_capacity))
         else:
-            block_capacity = max(int(block_k.shape[0]), int(block_capacity_override))
+            requested_block_capacity = max(int(block_k.shape[0]), int(block_capacity_override))
+        max_slot_capacity = self._max_slot_token_capacity()
+        if int(block_k.shape[0]) > int(max_slot_capacity):
+            raise RuntimeError(
+                "block live token count exceeds helper slot capacity: "
+                f"seq_len={int(block_k.shape[0])} max_capacity={int(max_slot_capacity)}"
+            )
+        block_capacity = min(int(max_slot_capacity), int(requested_block_capacity))
         block_key = self._block_slot_key(key, block_idx)
         block_elem_count = self._slot_elem_count(block_capacity, group_heads, head_dim)
         normalized_allowed = None
@@ -3051,8 +3218,9 @@ class UpmemKVSlotStore(ResidentKVStore):
             else [],
         }
         try:
+            base_block_token_limit = self._base_block_token_limit()
             while seq_offset < seq_len:
-                block_seq_len = min(self.block_tokens, seq_len - seq_offset)
+                block_seq_len = min(base_block_token_limit, seq_len - seq_offset)
                 block_initial_k = initial_k[seq_offset : seq_offset + block_seq_len].contiguous()
                 block_initial_v = initial_v[seq_offset : seq_offset + block_seq_len].contiguous()
                 block = self._allocate_block_append_only(
@@ -3062,7 +3230,7 @@ class UpmemKVSlotStore(ResidentKVStore):
                     head_dim=head_dim,
                     block_k=block_initial_k,
                     block_v=block_initial_v,
-                    block_capacity_override=self.block_tokens,
+                    block_capacity_override=base_block_token_limit,
                     block_kind="base",
                     segment_meta={
                         "logical_segment_index": int(len(allocated_blocks)),
@@ -3135,6 +3303,7 @@ class UpmemKVSlotStore(ResidentKVStore):
             "planner_segment_count": int(len(normalized_segments)),
         }
         try:
+            base_block_token_limit = self._base_block_token_limit()
             block_specs: list[tuple[int, int, int, int]] = []
             for logical_segment_index, segment in enumerate(normalized_segments):
                 segment_start = int(segment.token_start)
@@ -3142,7 +3311,7 @@ class UpmemKVSlotStore(ResidentKVStore):
                 segment_physical_dpu = int(segment.physical_dpu) % max(self.num_dpus, 1)
                 block_cursor = int(segment_start)
                 while block_cursor < segment_end:
-                    block_end = min(segment_end, block_cursor + int(self.block_tokens))
+                    block_end = min(segment_end, block_cursor + int(base_block_token_limit))
                     block_specs.append(
                         (
                             int(logical_segment_index),
@@ -3160,6 +3329,7 @@ class UpmemKVSlotStore(ResidentKVStore):
                     block_live_lengths,
                     int(capacity),
                     max_reserve_tokens=max_reserve_tokens if max_reserve_tokens > 0 else None,
+                    block_capacity_limit=base_block_token_limit,
                 )
             else:
                 block_capacities = list(block_live_lengths)
@@ -3426,12 +3596,13 @@ class UpmemKVSlotStore(ResidentKVStore):
             if self._should_rollover_tail_block(slot_info, tail_block):
                 tail_available = 0
             tail_take_len = min(tail_available, append_total)
+            growth_block_token_limit = self._growth_block_token_limit()
             new_blocks: list[Dict[str, object]] = []
             append_offset = tail_take_len
             try:
                 staged_blocks = list(blocks)
                 while append_offset < append_total:
-                    take_len = min(self.growth_block_tokens, append_total - append_offset)
+                    take_len = min(growth_block_token_limit, append_total - append_offset)
                     block_k = k_new[append_offset : append_offset + take_len].contiguous()
                     block_v = v_new[append_offset : append_offset + take_len].contiguous()
                     staged_slot_info = dict(slot_info)
@@ -3444,7 +3615,7 @@ class UpmemKVSlotStore(ResidentKVStore):
                         head_dim=head_dim,
                         block_k=block_k,
                         block_v=block_v,
-                        block_capacity_override=self.growth_block_tokens,
+                        block_capacity_override=growth_block_token_limit,
                         block_kind="growth",
                         segment_meta={
                             "logical_segment_index": int(len(staged_blocks)),
@@ -3815,6 +3986,22 @@ class UpmemKVSlotStore(ResidentKVStore):
             "placement_policy": self.placement_policy,
             "host_partial_reduce_enabled": bool(self.host_partial_reduce_enabled),
             "helper_env": dict(self.helper.helper_env),
+            "helper_runtime_env": {
+                name: os.environ.get(name)
+                for name in (
+                    "CLOVER_KVSLOT_QK_MAX_ROUND_ITEMS",
+                    "CLOVER_KVSLOT_QK_MAX_ACTIVE_RANKS",
+                    "CLOVER_KVSLOT_QK_MAX_ACTIVE_DPUS",
+                    "CLOVER_KVSLOT_DPU_PHASE_PROFILE",
+                    "CLOVER_KVSLOT_SLIM_QK_SLOT_ONLY",
+                    "CLOVER_KVSLOT_BULK_FP16_DOT",
+                    "CLOVER_KVSLOT_EXPERIMENTAL_INT8_I16_QK",
+                    "CLOVER_KVSLOT_EXPERIMENTAL_INT16_KV",
+                    "CLOVER_KVSLOT_CONTEXT_BULK_ROW",
+                    "CLOVER_KVSLOT_CONTEXT_OCTETV",
+                )
+                if os.environ.get(name) is not None
+            },
             "helper_profile": helper_profile,
             "helper_topology": helper_topology,
             "live_slots": len(self.slot_mapping),

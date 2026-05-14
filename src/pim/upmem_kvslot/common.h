@@ -118,6 +118,8 @@ typedef struct {
 #define KVSLOT_DTYPE_FP32 0U
 #define KVSLOT_DTYPE_FP16 1U
 #define KVSLOT_DTYPE_INT8 2U
+#define KVSLOT_DTYPE_BF16 3U
+#define KVSLOT_DTYPE_INT16 4U
 
 typedef struct {
     uint64_t cycles;
@@ -176,6 +178,19 @@ typedef struct {
     uint64_t qk_dpu_other_cycles_total;
     uint64_t qk_dpu_profiled_launches;
     uint64_t qk_dpu_profiled_dpus;
+    uint64_t qk_round_window_total;
+    uint64_t qk_round_item_window_total;
+    uint64_t qk_max_window;
+    uint64_t qk_segmented_items_total;
+    uint64_t qk_max_segment_count;
+    uint64_t qk_batched_launch_dpus_total;
+    uint64_t qk_batched_dummy_dpus_total;
+    uint64_t qk_batched_max_launch_dpus;
+    uint64_t qk_batched_max_dummy_dpus;
+    uint64_t qk_round_heads_total;
+    uint64_t qk_round_head_window_total;
+    uint64_t qk_max_heads_per_item;
+    uint64_t qk_max_head_window_per_item;
 } kvslot_profile_stats_t;
 
 typedef struct {

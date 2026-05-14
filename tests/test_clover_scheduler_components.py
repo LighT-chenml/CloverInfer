@@ -1,10 +1,12 @@
 import os
 import sys
+from types import SimpleNamespace
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
+from tests.benchmark_baselines import should_auto_enable_clover_perf_guard
 from src.core.clover_planner import plan_sharding
 from src.core.clover_scheduler_components import (
     CapacityAwareMicroBatchScheduler,
@@ -13,6 +15,36 @@ from src.core.clover_scheduler_components import (
     default_predict_host_time,
     default_predict_pim_time,
 )
+
+
+def test_benchmark_auto_enables_clover_perf_guard_for_compressed_kv():
+    args = SimpleNamespace(
+        clover_pim_perf_guard_enabled=False,
+        no_clover_pim_perf_guard_enabled=False,
+        pim_resident_kv_dtype="int16",
+    )
+
+    assert should_auto_enable_clover_perf_guard(args) is True
+
+
+def test_benchmark_auto_perf_guard_respects_explicit_disable():
+    args = SimpleNamespace(
+        clover_pim_perf_guard_enabled=False,
+        no_clover_pim_perf_guard_enabled=True,
+        pim_resident_kv_dtype="int16",
+    )
+
+    assert should_auto_enable_clover_perf_guard(args) is False
+
+
+def test_benchmark_auto_perf_guard_keeps_fp32_pim_only_by_default():
+    args = SimpleNamespace(
+        clover_pim_perf_guard_enabled=False,
+        no_clover_pim_perf_guard_enabled=False,
+        pim_resident_kv_dtype="fp32",
+    )
+
+    assert should_auto_enable_clover_perf_guard(args) is False
 
 
 def test_greedy_micro_batch_stops_before_capacity_overflow():

@@ -620,3 +620,74 @@ def test_segmented_base_capacity_can_limit_tail_reserve_tokens():
     )
 
     assert capacities == [27, 26, 26, 34]
+
+
+def test_segmented_base_allocation_splits_segments_by_helper_capacity_without_upmem():
+    store = object.__new__(UpmemKVSlotStore)
+    store.num_dpus = 4
+    store.block_tokens = 512
+    store.growth_block_tokens = 128
+    store.max_dpu_capacity = 256
+    store.reserve_segment_tail_capacity_enabled = True
+    store.reserve_segment_tail_capacity_tokens = 8
+
+    allocated = []
+
+    def _fake_allocate_block_append_only(**kwargs):
+        block_k = kwargs["block_k"]
+        block_capacity = int(kwargs["block_capacity_override"])
+        segment_meta = dict(kwargs["segment_meta"])
+        assert int(block_k.shape[0]) <= store.max_dpu_capacity
+        assert block_capacity <= store.max_dpu_capacity
+        allocated.append(
+            {
+                "physical_dpu": int(kwargs["physical_dpu_override"]),
+                "seq_len": int(block_k.shape[0]),
+                "capacity": block_capacity,
+                "logical_segment_index": int(segment_meta["logical_segment_index"]),
+                "token_range_start": int(segment_meta["token_range_start"]),
+                "token_range_end": int(segment_meta["token_range_end"]),
+            }
+        )
+        return {
+            "slot_id": len(allocated),
+            "physical_dpu": int(kwargs["physical_dpu_override"]),
+            "seq_len": int(block_k.shape[0]),
+            "capacity": block_capacity,
+            "group_heads": int(kwargs["group_heads"]),
+            "head_dim": int(kwargs["head_dim"]),
+            "token_range_start": int(segment_meta["token_range_start"]),
+            "token_range_end": int(segment_meta["token_range_end"]),
+            "logical_segment_index": int(segment_meta["logical_segment_index"]),
+        }
+
+    store._allocate_block_append_only = _fake_allocate_block_append_only
+
+    initial_k = torch.zeros(515, 1, 8, dtype=torch.float32)
+    initial_v = torch.zeros_like(initial_k)
+    slot_info = UpmemKVSlotStore._allocate_segmented_group(
+        store,
+        key=("k", "v"),
+        initial_k=initial_k,
+        initial_v=initial_v,
+        capacity=520,
+        physical_dpu=0,
+        group_heads=1,
+        head_dim=8,
+        allowed_dpus=[0, 1],
+        segment_plan=[
+            {"physical_dpu": 0, "token_range_start": 0, "token_range_end": 258},
+            {"physical_dpu": 1, "token_range_start": 258, "token_range_end": 515},
+        ],
+    )
+
+    assert [(item["token_range_start"], item["token_range_end"]) for item in allocated] == [
+        (0, 256),
+        (256, 258),
+        (258, 514),
+        (514, 515),
+    ]
+    assert max(item["seq_len"] for item in allocated) == 256
+    assert max(item["capacity"] for item in allocated) == 256
+    assert sum(item["seq_len"] for item in allocated) == 515
+    assert int(slot_info["seq_len"]) == 515

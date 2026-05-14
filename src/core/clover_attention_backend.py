@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from typing import Dict, List
 
@@ -184,7 +185,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
             )
             self.resident_store.set_experimental_flags(
                 context_fused_enabled=self.pim_context_fused_experimental_enabled,
-                shape_rounds_enabled=self.fine_head_grouping_experimental_enabled,
+                shape_rounds_enabled=False,
                 rank_spread_alloc_enabled=self.pim_rank_spread_alloc_experimental_enabled,
                 rank_spread_multi_rank_batch_enabled=(
                     self.pim_rank_spread_multi_rank_batch_experimental_enabled
@@ -195,6 +196,46 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                 reserve_segment_tail_capacity_enabled=reserve_tail_capacity_enabled,
                 reserve_segment_tail_capacity_tokens=self.pim_reserve_segment_tail_capacity_tokens,
             )
+
+    def _effective_head_group_count(self, seq_len: int, num_heads: int, head_dim: int) -> int:
+        if not self.fine_head_grouping_experimental_enabled:
+            return super()._effective_head_group_count(seq_len, num_heads, head_dim)
+        if self.target_heads_per_group_experimental <= 0:
+            return super()._effective_head_group_count(seq_len, num_heads, head_dim)
+
+        target_heads_per_group = max(1, int(self.target_heads_per_group_experimental))
+        target_group_count = max(1, math.ceil(int(num_heads) / target_heads_per_group))
+        max_groups = max(1, min(int(self.num_dpus), int(num_heads)))
+        return max(1, min(max_groups, target_group_count))
+
+    def _head_group_allowed_dpus(
+        self,
+        *,
+        group_idx: int,
+        num_groups: int,
+        preferred_dpu_stripe: List[int] | None,
+    ) -> List[int]:
+        base = self._normalize_physical_dpu_list(preferred_dpu_stripe)
+        if not base:
+            return []
+        if (
+            not self.fine_head_grouping_experimental_enabled
+            or self.target_heads_per_group_experimental <= 0
+            or num_groups <= 1
+        ):
+            return base
+
+        # Fine head grouping only pays off if neighboring head groups do not
+        # immediately serialize on the same physical DPU segments. Partition the
+        # request stripe into non-overlapping sub-stripes so group 0/1/2 split
+        # the DPU budget while still staying inside the request's capacity envelope.
+        partition_count = min(max(1, int(num_groups)), len(base))
+        base_width = len(base) // partition_count
+        extra = len(base) % partition_count
+        partition_idx = int(group_idx) % partition_count
+        start = (base_width * partition_idx) + min(partition_idx, extra)
+        width = base_width + (1 if partition_idx < extra else 0)
+        return [int(base[start + offset]) for offset in range(max(1, width))]
 
     def _timed(self, name: str):
         if not self.op_profiling_enabled:
@@ -1425,6 +1466,12 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         )
         debug["clover_compact_short_segments_enabled"] = self.clover_compact_short_segments_enabled
         debug["clover_compact_short_segment_min_tokens"] = self.clover_compact_short_segment_min_tokens
+        debug["clover_fine_head_grouping_experimental_enabled"] = bool(
+            self.fine_head_grouping_experimental_enabled
+        )
+        debug["clover_target_heads_per_group_experimental"] = int(
+            self.target_heads_per_group_experimental
+        )
         debug["clover_shadow_check_invocations"] = self.shadow_check_invocations
         debug["clover_shadow_check_skips"] = self.shadow_check_skips
         debug["resident_append_fallbacks"] = int(self.resident_append_fallbacks)

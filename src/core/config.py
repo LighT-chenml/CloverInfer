@@ -54,6 +54,7 @@ class ClusterConfig(BaseModel):
     clover_pim_cross_rank_stripe_experimental_enabled: bool = False
     clover_pim_rank_spread_multi_rank_batch_experimental_enabled: bool = False
     clover_pim_layer_rank_rotation_experimental_enabled: bool = False
+    clover_pim_disjoint_decode_stripe_packing_enabled: bool = False
     clover_pim_slot_spill_alloc_experimental_enabled: bool = False
     clover_pim_slot_pressure_aware_alloc_experimental_enabled: bool = False
     clover_pim_emergency_slot_spill_experimental_enabled: bool = False
