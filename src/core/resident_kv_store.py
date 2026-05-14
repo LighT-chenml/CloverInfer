@@ -712,7 +712,6 @@ class _KVSlotHelperClient:
     def get_profile_stats(self) -> Dict[str, int]:
         header = struct.pack("<IIII", self.MAGIC, self.CMD_GET_PROFILE, 0, 0)
         self._write(header)
-        out = struct.unpack("<32Q", self._read_exact(32 * 8))
         keys = [
             "qk_rounds_total",
             "qk_batched_rounds",
@@ -746,7 +745,15 @@ class _KVSlotHelperClient:
             "av_fallback_launch_ns",
             "av_fallback_sync_ns",
             "av_fallback_xfer_from_ns",
+            "qk_dpu_cycles_total",
+            "qk_dpu_dot_cycles_total",
+            "qk_dpu_softmax_cycles_total",
+            "qk_dpu_context_cycles_total",
+            "qk_dpu_other_cycles_total",
+            "qk_dpu_profiled_launches",
+            "qk_dpu_profiled_dpus",
         ]
+        out = struct.unpack(f"<{len(keys)}Q", self._read_exact(len(keys) * 8))
         return {key: int(value) for key, value in zip(keys, out)}
 
     def get_topology(self) -> Dict[str, object]:

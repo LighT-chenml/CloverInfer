@@ -36,6 +36,8 @@
 #define KVSLOT_KERNEL_QK 1U
 #define KVSLOT_KERNEL_AV 2U
 #define KVSLOT_KERNEL_QK_SLOT 3U
+#define KVSLOT_KERNEL_PROFILE_FLAG 0x80000000U
+#define KVSLOT_KERNEL_COMMAND_MASK 0x7fffffffU
 
 #define KVSLOT_QK_SLOT_MODE_RAW_SCORES 0U
 #define KVSLOT_QK_SLOT_MODE_SOFTMAX_NORMALIZED 1U
@@ -119,6 +121,10 @@ typedef struct {
 
 typedef struct {
     uint64_t cycles;
+    uint64_t qk_dot_cycles;
+    uint64_t qk_softmax_cycles;
+    uint64_t qk_context_cycles;
+    uint64_t qk_other_cycles;
 } kvslot_meta_t;
 
 typedef struct {
@@ -163,6 +169,13 @@ typedef struct {
     uint64_t av_fallback_launch_ns;
     uint64_t av_fallback_sync_ns;
     uint64_t av_fallback_xfer_from_ns;
+    uint64_t qk_dpu_cycles_total;
+    uint64_t qk_dpu_dot_cycles_total;
+    uint64_t qk_dpu_softmax_cycles_total;
+    uint64_t qk_dpu_context_cycles_total;
+    uint64_t qk_dpu_other_cycles_total;
+    uint64_t qk_dpu_profiled_launches;
+    uint64_t qk_dpu_profiled_dpus;
 } kvslot_profile_stats_t;
 
 typedef struct {

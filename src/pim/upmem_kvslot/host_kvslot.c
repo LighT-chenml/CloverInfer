@@ -302,6 +302,15 @@ static int rank_spread_multi_rank_batch_experiment_enabled(void)
     return 1;
 }
 
+static int dpu_phase_profile_enabled(void)
+{
+    const char *value = getenv("CLOVER_KVSLOT_DPU_PHASE_PROFILE");
+    if (value == NULL || value[0] == '\0' || strcmp(value, "0") == 0) {
+        return 0;
+    }
+    return 1;
+}
+
 static int init_runner_topology_storage(kvslot_runner_t *runner)
 {
     runner->ranks = calloc(runner->nr_ranks, sizeof(*runner->ranks));
@@ -770,6 +779,19 @@ static void record_qk_round_timing(
         runner->profile.qk_fallback_sync_ns += sync_ns;
         runner->profile.qk_fallback_xfer_from_ns += xfer_from_ns;
     }
+}
+
+static void record_qk_dpu_meta(kvslot_runner_t *runner, const kvslot_meta_t *meta)
+{
+    if (runner == NULL || meta == NULL || meta->cycles == 0) {
+        return;
+    }
+    runner->profile.qk_dpu_cycles_total += meta->cycles;
+    runner->profile.qk_dpu_dot_cycles_total += meta->qk_dot_cycles;
+    runner->profile.qk_dpu_softmax_cycles_total += meta->qk_softmax_cycles;
+    runner->profile.qk_dpu_context_cycles_total += meta->qk_context_cycles;
+    runner->profile.qk_dpu_other_cycles_total += meta->qk_other_cycles;
+    runner->profile.qk_dpu_profiled_dpus += 1;
 }
 
 static void record_av_round_timing(
@@ -2354,11 +2376,15 @@ static void cleanup_qk_slot_item(qk_slot_item_t *item)
 static int launch_qk_slot_item_async(const qk_slot_item_t *item, kvslot_profile_stats_t *profile)
 {
     uint32_t kernel_command = item != NULL && item->segment_count > 1 ? (KVSLOT_KERNEL_QK_SLOT + 100u) : KVSLOT_KERNEL_QK_SLOT;
+    int collect_dpu_phase_profile = dpu_phase_profile_enabled();
     uint64_t start_ns;
     uint64_t launch_start_ns;
 
     if (item == NULL || !item->ready) {
         return 1;
+    }
+    if (collect_dpu_phase_profile) {
+        kernel_command |= KVSLOT_KERNEL_PROFILE_FLAG;
     }
     start_ns = monotonic_time_ns();
     DPU_ASSERT(dpu_copy_to(item->target_dpu, "kvslot_kernel_command", 0, &kernel_command, sizeof(kernel_command)));
@@ -2427,6 +2453,18 @@ static int finish_qk_slot_item(qk_slot_item_t *item, kvslot_profile_stats_t *pro
     DPU_ASSERT(dpu_sync(item->target_dpu));
     if (profile != NULL) {
         profile->qk_fallback_sync_ns += elapsed_ns_since(sync_start_ns);
+    }
+    if (profile != NULL && dpu_phase_profile_enabled()) {
+        kvslot_meta_t meta;
+        memset(&meta, 0, sizeof(meta));
+        DPU_ASSERT(dpu_copy_from(item->target_dpu, "kvslot_meta", 0, &meta, sizeof(meta)));
+        profile->qk_dpu_cycles_total += meta.cycles;
+        profile->qk_dpu_dot_cycles_total += meta.qk_dot_cycles;
+        profile->qk_dpu_softmax_cycles_total += meta.qk_softmax_cycles;
+        profile->qk_dpu_context_cycles_total += meta.qk_context_cycles;
+        profile->qk_dpu_other_cycles_total += meta.qk_other_cycles;
+        profile->qk_dpu_profiled_launches += 1;
+        profile->qk_dpu_profiled_dpus += 1;
     }
     if (item->slot_args.mode != KVSLOT_QK_SLOT_MODE_RAW_SCORES) {
         return 0;
@@ -2659,6 +2697,7 @@ static int execute_batched_qk_round(
     uint64_t xfer_to_ns = 0;
     uint64_t launch_ns = 0;
     uint64_t xfer_from_ns = 0;
+    int collect_dpu_phase_profile = dpu_phase_profile_enabled();
 
     if (!can_use_batched_qk_round(runner, items, round_indices, round_count)) {
         return 1;
@@ -2824,6 +2863,9 @@ static int execute_batched_qk_round(
             return 1;
         }
     }
+    if (collect_dpu_phase_profile) {
+        kernel_command |= KVSLOT_KERNEL_PROFILE_FLAG;
+    }
 
     xfer_to_start_ns = monotonic_time_ns();
     DPU_ASSERT(dpu_broadcast_to(launch_set, "kvslot_kernel_command", 0, &kernel_command, sizeof(kernel_command), DPU_XFER_DEFAULT));
@@ -2928,6 +2970,17 @@ static int execute_batched_qk_round(
     launch_start_ns = monotonic_time_ns();
     DPU_ASSERT(dpu_launch(launch_set, DPU_SYNCHRONOUS));
     launch_ns += elapsed_ns_since(launch_start_ns);
+
+    if (collect_dpu_phase_profile) {
+        kvslot_meta_t meta;
+        for (uint32_t pos = 0; pos < round_count; ++pos) {
+            qk_slot_item_t *item = &items[round_indices[pos]];
+            memset(&meta, 0, sizeof(meta));
+            DPU_ASSERT(dpu_copy_from(item->target_dpu, "kvslot_meta", 0, &meta, sizeof(meta)));
+            record_qk_dpu_meta(runner, &meta);
+        }
+        runner->profile.qk_dpu_profiled_launches += 1;
+    }
 
     xfer_from_start_ns = monotonic_time_ns();
     if (score_bytes > 0 && items[round_indices[0]].slot_args.mode == KVSLOT_QK_SLOT_MODE_RAW_SCORES) {

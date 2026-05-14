@@ -44,6 +44,7 @@ static float qk_slot_query_row[KVSLOT_MAX_HEAD_DIM];
 static int16_t qk_slot_query_i16[KVSLOT_MAX_HEAD_DIM];
 static float qk_slot_query_i16_scale;
 static float qk_slot_row_sums[KVSLOT_MAX_HEADS];
+static uint32_t qk_phase_profile_enabled;
 
 static float u32_bits_to_float(uint32_t bits)
 {
@@ -190,6 +191,19 @@ static void write_av_context_pair(uint32_t pair_idx, uint32_t low_bits, uint32_t
     mram_write(&packed, &av_context_bits[pair_idx * 2u], sizeof(packed));
 }
 
+static void write_av_context_quad(
+    uint32_t out_idx0,
+    uint32_t bits0,
+    uint32_t bits1,
+    uint32_t bits2,
+    uint32_t bits3)
+{
+    __dma_aligned uint64_t packed[2];
+    packed[0] = ((uint64_t)bits1 << 32) | (uint64_t)bits0;
+    packed[1] = ((uint64_t)bits3 << 32) | (uint64_t)bits2;
+    mram_write(packed, &av_context_bits[out_idx0], sizeof(packed));
+}
+
 static float read_v_value(const kvslot_runtime_slot_args_t *slot, uint32_t logical_idx)
 {
     uint32_t elem_offset = slot->v_elem_offset;
@@ -251,6 +265,29 @@ static void read_fp16_v_pair(const kvslot_runtime_slot_args_t *slot, uint32_t lo
         mram_read(&v_cache[pair_base + 2u], &next_packed64, sizeof(next_packed64));
         *value1 = fp16_bits_to_float((uint16_t)(next_packed64 & 0xffffu));
     }
+}
+
+static void read_fp16_v_quad_aligned(
+    const kvslot_runtime_slot_args_t *slot,
+    uint32_t logical_idx,
+    float *value0,
+    float *value1,
+    float *value2,
+    float *value3)
+{
+    uint64_t packed64 = 0;
+    uint32_t elem_offset = slot->v_elem_offset == KVSLOT_UNSET_U32 ? slot->elem_offset : slot->v_elem_offset;
+    uint32_t word_idx = elem_offset + (logical_idx / 2u);
+    uint32_t low_word;
+    uint32_t high_word;
+
+    mram_read(&v_cache[word_idx], &packed64, sizeof(packed64));
+    low_word = (uint32_t)(packed64 & 0xffffffffu);
+    high_word = (uint32_t)(packed64 >> 32);
+    *value0 = fp16_bits_to_float((uint16_t)(low_word & 0xffffu));
+    *value1 = fp16_bits_to_float((uint16_t)(low_word >> 16));
+    *value2 = fp16_bits_to_float((uint16_t)(high_word & 0xffffu));
+    *value3 = fp16_bits_to_float((uint16_t)(high_word >> 16));
 }
 
 static float read_k_value(const kvslot_runtime_slot_args_t *slot, uint32_t logical_idx)
@@ -360,6 +397,17 @@ static float dot_query_with_k_row(const kvslot_runtime_slot_args_t *slot, uint32
     if (slot->dtype_code == KVSLOT_DTYPE_FP16) {
         uint32_t word_idx = slot->elem_offset + (key_row_base / 2u);
         if ((key_row_base & 1u) == 0 && (word_idx & 1u) == 0) {
+            __dma_aligned uint32_t packed_words[4];
+            for (; dim_idx + 8u <= head_dim; dim_idx += 8u, word_idx += 4u) {
+                mram_read(&k_cache[word_idx], packed_words, sizeof(packed_words));
+#pragma clang loop unroll(disable)
+                for (uint32_t packed_idx = 0; packed_idx < 4u; ++packed_idx) {
+                    uint32_t packed = packed_words[packed_idx];
+                    uint32_t packed_dim_idx = dim_idx + (packed_idx * 2u);
+                    local_sum += qk_slot_query_row[packed_dim_idx] * fp16_bits_to_float((uint16_t)(packed & 0xffffu));
+                    local_sum += qk_slot_query_row[packed_dim_idx + 1u] * fp16_bits_to_float((uint16_t)(packed >> 16));
+                }
+            }
             for (; dim_idx + 4u <= head_dim; dim_idx += 4u, word_idx += 2u) {
                 uint64_t packed64 = 0;
                 uint32_t low_word;
@@ -444,6 +492,50 @@ static void run_context_from_local_softmax(uint32_t num_heads, uint32_t window, 
     uint32_t v_dtype_code = runtime_slot_args.v_dtype_code == KVSLOT_UNSET_U32 ? runtime_slot_args.dtype_code : runtime_slot_args.v_dtype_code;
     uint32_t total_outputs = num_heads * head_dim;
     uint32_t total_pairs = (total_outputs + 1u) / 2u;
+    uint32_t value_elem_offset = runtime_slot_args.v_elem_offset == KVSLOT_UNSET_U32
+        ? runtime_slot_args.elem_offset
+        : runtime_slot_args.v_elem_offset;
+
+    if (v_dtype_code == KVSLOT_DTYPE_FP16
+        && (head_dim % 4u) == 0
+        && (total_outputs % 4u) == 0
+        && (value_elem_offset & 1u) == 0) {
+        uint32_t total_quads = total_outputs / 4u;
+        for (uint32_t quad_idx = tasklet_id; quad_idx < total_quads; quad_idx += NR_TASKLETS) {
+            uint32_t out_idx0 = quad_idx * 4u;
+            uint32_t head_idx = out_idx0 / head_dim;
+            uint32_t dim_idx0 = out_idx0 % head_dim;
+            uint32_t kv_head_idx = qk_slot_head_indices[head_idx];
+            float acc0 = 0.0f;
+            float acc1 = 0.0f;
+            float acc2 = 0.0f;
+            float acc3 = 0.0f;
+
+            if (kv_head_idx >= group_heads) {
+                continue;
+            }
+            for (uint32_t token_idx = 0; token_idx < window; ++token_idx) {
+                uint32_t value_idx0 = ((token_idx * group_heads) + kv_head_idx) * head_dim + dim_idx0;
+                float weight = u32_bits_to_float(qk_slot_score_local[(size_t)head_idx * window + token_idx]);
+                float value0;
+                float value1;
+                float value2;
+                float value3;
+                read_fp16_v_quad_aligned(&runtime_slot_args, value_idx0, &value0, &value1, &value2, &value3);
+                acc0 += weight * value0;
+                acc1 += weight * value1;
+                acc2 += weight * value2;
+                acc3 += weight * value3;
+            }
+            write_av_context_quad(
+                out_idx0,
+                float_to_u32_bits(acc0),
+                float_to_u32_bits(acc1),
+                float_to_u32_bits(acc2),
+                float_to_u32_bits(acc3));
+        }
+        return;
+    }
 
     for (uint32_t pair_idx = tasklet_id; pair_idx < total_pairs; pair_idx += NR_TASKLETS) {
         uint32_t out_idx0 = pair_idx * 2u;
@@ -808,6 +900,7 @@ static void run_qk_slot_kernel(void)
     uint32_t head_dim = qk_slot_args.head_dim;
     uint32_t mode = qk_slot_args.mode;
     float score_scale = qk_slot_args.score_scale;
+    uint64_t phase_start = 0;
 
     if (seq_len > KVSLOT_MAX_CAPACITY) {
         seq_len = KVSLOT_MAX_CAPACITY;
@@ -837,6 +930,9 @@ static void run_qk_slot_kernel(void)
     }
     uint32_t score_stride = (window + 1u) & ~1u;
 
+    if (tasklet_id == 0 && qk_phase_profile_enabled) {
+        phase_start = perfcounter_get();
+    }
     for (uint32_t head_row = 0; head_row < num_heads; ++head_row) {
         uint32_t local_head_idx = qk_slot_head_indices[head_row];
         if (local_head_idx >= group_heads) {
@@ -872,6 +968,11 @@ static void run_qk_slot_kernel(void)
             qk_slot_score_local[(size_t)head_row * window + token_offset] = float_to_u32_bits(local_sum);
         }
         barrier_wait(&kvslot_barrier);
+    }
+    if (tasklet_id == 0 && qk_phase_profile_enabled) {
+        uint64_t phase_end = perfcounter_get();
+        kvslot_meta.qk_dot_cycles += phase_end - phase_start;
+        phase_start = phase_end;
     }
 
     for (uint32_t head_row = tasklet_id; head_row < num_heads; head_row += NR_TASKLETS) {
@@ -935,11 +1036,21 @@ static void run_qk_slot_kernel(void)
         }
     }
     barrier_wait(&kvslot_barrier);
+    if (tasklet_id == 0 && qk_phase_profile_enabled) {
+        uint64_t phase_end = perfcounter_get();
+        kvslot_meta.qk_softmax_cycles += phase_end - phase_start;
+        phase_start = phase_end;
+    }
     if (mode == KVSLOT_QK_SLOT_MODE_CONTEXT_FUSED
         || mode == KVSLOT_QK_SLOT_MODE_CONTEXT_FUSED_UNNORMALIZED) {
         run_context_from_local_softmax(num_heads, window, group_heads, head_dim);
     }
     barrier_wait(&kvslot_barrier);
+    if (tasklet_id == 0 && qk_phase_profile_enabled) {
+        uint64_t phase_end = perfcounter_get();
+        kvslot_meta.qk_context_cycles += phase_end - phase_start;
+        phase_start = phase_end;
+    }
     if (tasklet_id == 0) {
         for (uint32_t head_row = num_heads; head_row < KVSLOT_MAX_HEADS; ++head_row) {
             qk_slot_rowmax_bits[head_row] = 0u;
@@ -1078,26 +1189,46 @@ static void run_grouped_qk_slot_kernel(void)
 int main(void)
 {
     uint32_t tasklet_id = me();
+    uint32_t kernel_command = kvslot_kernel_command & KVSLOT_KERNEL_COMMAND_MASK;
     if (tasklet_id == 0) {
         mem_reset();
-        kvslot_meta.cycles = 0;
-        perfcounter_config(COUNT_CYCLES, true);
+        memset(&kvslot_meta, 0, sizeof(kvslot_meta));
+        qk_phase_profile_enabled = (kvslot_kernel_command & KVSLOT_KERNEL_PROFILE_FLAG) != 0;
+        if (qk_phase_profile_enabled) {
+            perfcounter_config(COUNT_CYCLES, true);
+        }
     }
     barrier_wait(&kvslot_barrier);
-    if (kvslot_kernel_command == KVSLOT_KERNEL_QK) {
+    if (kernel_command == KVSLOT_KERNEL_QK) {
         run_qk_kernel();
-    } else if (kvslot_kernel_command == KVSLOT_KERNEL_AV) {
+    } else if (kernel_command == KVSLOT_KERNEL_AV) {
         run_av_kernel();
-    } else if (kvslot_kernel_command == (KVSLOT_KERNEL_AV + 100u)) {
+    } else if (kernel_command == (KVSLOT_KERNEL_AV + 100u)) {
         run_grouped_av_kernel();
-    } else if (kvslot_kernel_command == KVSLOT_KERNEL_QK_SLOT) {
+    } else if (kernel_command == KVSLOT_KERNEL_QK_SLOT) {
         run_qk_slot_kernel();
-    } else if (kvslot_kernel_command == (KVSLOT_KERNEL_QK_SLOT + 100u)) {
+    } else if (kernel_command == (KVSLOT_KERNEL_QK_SLOT + 100u)) {
         run_grouped_qk_slot_kernel();
     }
     barrier_wait(&kvslot_barrier);
-    if (tasklet_id == 0) {
+    if (tasklet_id == 0 && qk_phase_profile_enabled) {
         kvslot_meta.cycles = perfcounter_get();
+        kvslot_meta.qk_other_cycles = kvslot_meta.cycles;
+        if (kvslot_meta.qk_other_cycles >= kvslot_meta.qk_dot_cycles) {
+            kvslot_meta.qk_other_cycles -= kvslot_meta.qk_dot_cycles;
+        } else {
+            kvslot_meta.qk_other_cycles = 0;
+        }
+        if (kvslot_meta.qk_other_cycles >= kvslot_meta.qk_softmax_cycles) {
+            kvslot_meta.qk_other_cycles -= kvslot_meta.qk_softmax_cycles;
+        } else {
+            kvslot_meta.qk_other_cycles = 0;
+        }
+        if (kvslot_meta.qk_other_cycles >= kvslot_meta.qk_context_cycles) {
+            kvslot_meta.qk_other_cycles -= kvslot_meta.qk_context_cycles;
+        } else {
+            kvslot_meta.qk_other_cycles = 0;
+        }
     }
     return 0;
 }

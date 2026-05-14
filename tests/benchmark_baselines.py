@@ -63,6 +63,7 @@ def build_runtime_env() -> Dict[str, object]:
         "CLOVER_KVSLOT_MAX_HEADS",
         "CLOVER_KVSLOT_AUTOBUILD",
         "CLOVER_KVSLOT_AUTOBUILD_TIMEOUT_S",
+        "CLOVER_KVSLOT_DPU_PHASE_PROFILE",
         "CLOVER_PIM_SPARSE_TAIL_STRIPE_WIDTH",
     ):
         env_value = os.environ.get(env_name)
