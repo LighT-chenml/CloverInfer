@@ -576,6 +576,7 @@ def make_cluster_config(args, attention_backend: str) -> ClusterConfig:
         clover_rankset_overlap_transfer_latency_s=args.clover_rankset_overlap_transfer_latency_s,
         decode_continuous_batch_window_s=args.decode_continuous_batch_window_s,
         decode_continuous_batch_max_size=args.decode_continuous_batch_max_size,
+        decode_continuous_batch_inflight_target_enabled=args.decode_continuous_batch_inflight_target_enabled,
         attention_rpc_cross_key_batch_enabled=(attention_backend == "cloverinfer"),
         attention_actor_side_batching_enabled=False,
     )
@@ -874,6 +875,8 @@ def main():
     parser.add_argument("--decode-continuous-batch-window-s", type=float, default=0.0)
     parser.add_argument("--decode-continuous-batch-window-ms", type=float, default=0.0)
     parser.add_argument("--decode-continuous-batch-max-size", type=int, default=8)
+    parser.add_argument("--decode-continuous-batch-inflight-target-enabled", action="store_true")
+    parser.add_argument("--no-decode-continuous-batch-inflight-target-enabled", action="store_true")
     parser.add_argument(
         "--output",
         default=os.path.join(REPO_ROOT, "artifacts", "baseline_comparison.jsonl"),
@@ -1194,6 +1197,11 @@ def main():
         raise ValueError("--decode-continuous-batch-window-ms must be non-negative")
     if args.decode_continuous_batch_max_size <= 0:
         raise ValueError("--decode-continuous-batch-max-size must be positive")
+    args.decode_continuous_batch_inflight_target_enabled = bool(
+        args.decode_continuous_batch_inflight_target_enabled
+    )
+    if args.no_decode_continuous_batch_inflight_target_enabled:
+        args.decode_continuous_batch_inflight_target_enabled = False
     if args.attention_sparse_window < 0:
         raise ValueError("--attention-sparse-window must be non-negative")
     if args.decode_continuous_batch_window_ms > 0.0:
@@ -1298,6 +1306,9 @@ def main():
         "clover_rankset_overlap_transfer_latency_s": float(args.clover_rankset_overlap_transfer_latency_s),
         "decode_continuous_batch_window_s": float(args.decode_continuous_batch_window_s),
         "decode_continuous_batch_max_size": int(args.decode_continuous_batch_max_size),
+        "decode_continuous_batch_inflight_target_enabled": bool(
+            args.decode_continuous_batch_inflight_target_enabled
+        ),
         "resource_layout": {
             "prefill_resource": str(args.prefill_resource),
             "decode_dense_resource": str(args.decode_dense_resource),

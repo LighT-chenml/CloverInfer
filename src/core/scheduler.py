@@ -118,9 +118,13 @@ class GlobalScheduler:
         self.decode_continuous_batch_max_size = max(
             1, int(getattr(cluster_config, "decode_continuous_batch_max_size", 8))
         )
+        self.decode_continuous_batch_inflight_target_enabled = bool(
+            getattr(cluster_config, "decode_continuous_batch_inflight_target_enabled", False)
+        )
         self.decode_continuous_batch_flushes = 0
         self.decode_continuous_batch_total_items = 0
         self.decode_continuous_batch_max_observed = 0
+        self.decode_continuous_batch_size_histogram: Dict[int, int] = {}
         self.decode_continuous_batch_target_flushes = 0
         self.decode_continuous_batch_window_flushes = 0
         self.decode_continuous_batch_immediate_flushes = 0
@@ -277,6 +281,12 @@ class GlobalScheduler:
         return max(1, min(self._active_decode_requests, self.attention_layer_barrier_max_size))
 
     def _decode_continuous_batch_target_size(self) -> int:
+        if self.decode_continuous_batch_inflight_target_enabled:
+            active_or_expected = max(
+                int(self._active_decode_requests),
+                int(self._inflight_request_count),
+            )
+            return max(1, min(active_or_expected, self.decode_continuous_batch_max_size))
         return max(1, min(self._active_decode_requests, self.decode_continuous_batch_max_size))
 
     def _track_background_completion(self, coro):
@@ -964,13 +974,23 @@ class GlobalScheduler:
                 if (
                     self.decode_continuous_batch_window_s > 0
                     and len(self._decode_pending_queue) < target_size
-                    and self._active_decode_requests > 1
+                    and (
+                        self._inflight_request_count
+                        if self.decode_continuous_batch_inflight_target_enabled
+                        else self._active_decode_requests
+                    )
+                    > 1
                 ):
                     wait_started = time.perf_counter()
                     deadline = wait_started + self.decode_continuous_batch_window_s
                     while (
                         len(self._decode_pending_queue) < target_size
-                        and self._active_decode_requests > len(self._decode_pending_queue)
+                        and (
+                            self._inflight_request_count
+                            if self.decode_continuous_batch_inflight_target_enabled
+                            else self._active_decode_requests
+                        )
+                        > len(self._decode_pending_queue)
                     ):
                         remaining = deadline - time.perf_counter()
                         if remaining <= 0:
@@ -992,6 +1012,9 @@ class GlobalScheduler:
                 self.decode_continuous_batch_max_observed = max(
                     self.decode_continuous_batch_max_observed,
                     len(batch),
+                )
+                self.decode_continuous_batch_size_histogram[len(batch)] = (
+                    self.decode_continuous_batch_size_histogram.get(len(batch), 0) + 1
                 )
                 if flush_reason == "target":
                     self.decode_continuous_batch_target_flushes += 1
@@ -1524,6 +1547,10 @@ class GlobalScheduler:
                 "flushes": int(self.decode_continuous_batch_flushes),
                 "total_items": int(self.decode_continuous_batch_total_items),
                 "max_observed_size": int(self.decode_continuous_batch_max_observed),
+                "size_histogram": {
+                    str(size): int(count)
+                    for size, count in sorted(self.decode_continuous_batch_size_histogram.items())
+                },
                 "target_flushes": int(self.decode_continuous_batch_target_flushes),
                 "window_flushes": int(self.decode_continuous_batch_window_flushes),
                 "immediate_flushes": int(self.decode_continuous_batch_immediate_flushes),
@@ -1553,6 +1580,7 @@ class GlobalScheduler:
                 "last_stripe_overlap": dict(self.decode_continuous_batch_last_stripe_overlap),
                 "target_size": int(self._decode_continuous_batch_target_size()),
                 "pending": len(self._decode_pending_queue),
+                "inflight_target_enabled": bool(self.decode_continuous_batch_inflight_target_enabled),
                 "predictive_enabled": bool(self.clover_predictive_scheduling_enabled),
                 "predictive_batch_decisions": int(self.predictive_batch_decisions),
                 "predictive_batch_fallbacks": int(self.predictive_batch_fallbacks),

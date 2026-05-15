@@ -99,6 +99,7 @@ class ClusterConfig(BaseModel):
     attention_actor_batch_max_size: int = 8
     decode_continuous_batch_window_s: float = 0.0
     decode_continuous_batch_max_size: int = 8
+    decode_continuous_batch_inflight_target_enabled: bool = False
 
 class ModelConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
