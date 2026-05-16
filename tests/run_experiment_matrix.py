@@ -168,6 +168,7 @@ def build_case_command(args, case: Dict[str, object], output_path: str) -> List[
     append_key_value(cmd, "--limit", args.limit)
     append_key_value(cmd, "--model", case["model_path"])
     append_key_value(cmd, "--model-name", case["model_label"])
+    append_key_value(cmd, "--max-seq-len", args.max_seq_len)
     append_key_value(cmd, "--max-new-tokens", case["max_new_tokens"])
     append_key_value(cmd, "--prompt-token-length", case["prompt_token_length"])
     append_key_value(cmd, "--concurrency", case["concurrency"])
@@ -188,6 +189,8 @@ def build_case_command(args, case: Dict[str, object], output_path: str) -> List[
     append_key_value(cmd, "--pim-qk-mixed-heads", args.pim_qk_mixed_heads)
     append_key_value(cmd, "--pim-qk-mixed-window", args.pim_qk_mixed_window)
     append_key_value(cmd, "--clover-cpu-fast-path-max-context-tokens", args.clover_cpu_fast_path_max_context_tokens)
+    append_key_value(cmd, "--clover-adaptive-route-sparse-window-max", args.clover_adaptive_route_sparse_window_max)
+    append_key_value(cmd, "--clover-adaptive-route-context-len-max", args.clover_adaptive_route_context_len_max)
     append_key_value(cmd, "--clover-shadow-check-token-interval", args.clover_shadow_check_token_interval)
     append_key_value(cmd, "--clover-shadow-check-layer-interval", args.clover_shadow_check_layer_interval)
     append_key_value(cmd, "--clover-pim-perf-guard-min-decode-items", args.clover_pim_perf_guard_min_decode_items)
@@ -214,6 +217,20 @@ def build_case_command(args, case: Dict[str, object], output_path: str) -> List[
     append_optional_flag(cmd, "--no-clover-shadow-checks-enabled", args.no_clover_shadow_checks_enabled)
     append_optional_flag(cmd, "--clover-op-profiling-enabled", args.clover_op_profiling_enabled)
     append_optional_flag(cmd, "--no-clover-op-profiling-enabled", args.no_clover_op_profiling_enabled)
+    append_optional_flag(cmd, "--clover-adaptive-routing-enabled", args.clover_adaptive_routing_enabled)
+    append_optional_flag(cmd, "--no-clover-adaptive-routing-enabled", args.no_clover_adaptive_routing_enabled)
+    append_optional_flag(
+        cmd,
+        "--clover-adaptive-route-compressed-kv-to-cpu",
+        args.clover_adaptive_route_compressed_kv_to_cpu,
+    )
+    append_optional_flag(
+        cmd,
+        "--no-clover-adaptive-route-compressed-kv-to-cpu",
+        args.no_clover_adaptive_route_compressed_kv_to_cpu,
+    )
+    append_optional_flag(cmd, "--clover-adaptive-probe-enabled", args.clover_adaptive_probe_enabled)
+    append_optional_flag(cmd, "--no-clover-adaptive-probe-enabled", args.no_clover_adaptive_probe_enabled)
     append_optional_flag(cmd, "--clover-host-qk-mixed-enabled", args.clover_host_qk_mixed_enabled)
     append_optional_flag(cmd, "--no-clover-host-qk-mixed-enabled", args.no_clover_host_qk_mixed_enabled)
     append_optional_flag(
@@ -402,6 +419,7 @@ def main():
     parser.add_argument("--concurrency-values", type=parse_int_csv_list, default=[1])
     parser.add_argument("--limit", type=int, default=5)
     parser.add_argument("--dtype", default="float16")
+    parser.add_argument("--max-seq-len", type=int, default=2048)
     parser.add_argument("--baselines", default="PD,AFD,CPU-Attention,Naive PIM,CloverInfer", help=BASELINE_HELP_TEXT)
     parser.add_argument("--address", default="192.168.123.4:26379")
     parser.add_argument("--prefill-resource", default="prefill_gpu")
@@ -418,7 +436,7 @@ def main():
     parser.add_argument(
         "--pim-head-grouping-policy",
         default="auto",
-        choices=["auto", "legacy", "balanced", "coarse", "segment_aware"],
+        choices=["auto", "legacy", "balanced", "coarse", "segment_aware", "adaptive"],
     )
     parser.add_argument(
         "--pim-dpu-placement-policy",
@@ -463,6 +481,14 @@ def main():
     parser.add_argument("--clover-op-profiling-enabled", action="store_true")
     parser.add_argument("--no-clover-op-profiling-enabled", action="store_true")
     parser.add_argument("--clover-cpu-fast-path-max-context-tokens", type=int, default=0)
+    parser.add_argument("--clover-adaptive-routing-enabled", action="store_true")
+    parser.add_argument("--no-clover-adaptive-routing-enabled", action="store_true")
+    parser.add_argument("--clover-adaptive-route-compressed-kv-to-cpu", action="store_true")
+    parser.add_argument("--no-clover-adaptive-route-compressed-kv-to-cpu", action="store_true")
+    parser.add_argument("--clover-adaptive-route-sparse-window-max", type=int, default=0)
+    parser.add_argument("--clover-adaptive-route-context-len-max", type=int, default=0)
+    parser.add_argument("--clover-adaptive-probe-enabled", action="store_true")
+    parser.add_argument("--no-clover-adaptive-probe-enabled", action="store_true")
     parser.add_argument("--clover-shadow-check-token-interval", type=int, default=4)
     parser.add_argument("--clover-shadow-check-layer-interval", type=int, default=4)
     parser.add_argument("--clover-host-qk-mixed-enabled", action="store_true")
@@ -541,6 +567,7 @@ def main():
         "concurrency_values": [int(item) for item in args.concurrency_values],
         "limit": int(args.limit),
         "dtype": args.dtype,
+        "max_seq_len": int(args.max_seq_len),
         "baselines": args.baselines,
         "clover_rankset_overlap_enabled": bool(args.clover_rankset_overlap_enabled),
         "clover_rankset_overlap_max_ranksets_per_batch": int(args.clover_rankset_overlap_max_ranksets_per_batch),

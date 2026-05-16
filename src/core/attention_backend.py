@@ -378,7 +378,7 @@ class PimNaiveAttentionBackend:
         self.resident_kv_dtype = normalize_resident_kv_dtype(resident_kv_dtype)
         self.qk_check_interval = qk_check_interval
         self.qk_check_limit = qk_check_limit
-        if self.head_grouping_policy not in {"legacy", "balanced", "coarse", "segment_aware"}:
+        if self.head_grouping_policy not in {"legacy", "balanced", "coarse", "segment_aware", "adaptive"}:
             raise ValueError(f"Unsupported head_grouping_policy: {self.head_grouping_policy}")
         if self.dpu_placement_policy not in {"identity", "rotated", "rank_spread", "load_aware"}:
             raise ValueError(f"Unsupported dpu_placement_policy: {self.dpu_placement_policy}")
@@ -1477,6 +1477,15 @@ class PimNaiveAttentionBackend:
             # too wide. This policy tries an intermediate grouping that keeps
             # roughly 4 heads together for longer-context decode.
             target_heads_per_group = 4 if int(seq_len) >= 192 else 2
+            min_groups_by_shape = max(1, math.ceil(int(num_heads) / target_heads_per_group))
+            return max(1, min(max_groups, min_groups_by_shape))
+
+        if self.head_grouping_policy == "adaptive":
+            # Context-fused CloverInfer has a launch-count cliff on medium
+            # contexts when every head becomes a tiny group. Keep medium
+            # contexts coarse, then switch to balanced grouping once the per
+            # group token work is large enough to amortize helper launches.
+            target_heads_per_group = 4 if int(seq_len) < 4096 else 1
             min_groups_by_shape = max(1, math.ceil(int(num_heads) / target_heads_per_group))
             return max(1, min(max_groups, min_groups_by_shape))
 

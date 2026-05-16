@@ -238,6 +238,8 @@ def should_auto_enable_clover_perf_guard(args) -> bool:
         return False
     if bool(getattr(args, "no_clover_pim_perf_guard_enabled", False)):
         return False
+    if bool(getattr(args, "clover_adaptive_routing_enabled", False)):
+        return False
     return normalize_resident_kv_dtype(getattr(args, "pim_resident_kv_dtype", "fp32")) != "fp32"
 
 
@@ -488,6 +490,13 @@ def make_cluster_config(args, attention_backend: str) -> ClusterConfig:
         clover_cpu_fast_path_max_context_tokens=(
             args.clover_cpu_fast_path_max_context_tokens if attention_backend == "cloverinfer" else 0
         ),
+        clover_adaptive_routing_enabled=(
+            args.clover_adaptive_routing_enabled if attention_backend == "cloverinfer" else False
+        ),
+        clover_adaptive_route_compressed_kv_to_cpu=args.clover_adaptive_route_compressed_kv_to_cpu,
+        clover_adaptive_route_sparse_window_max=args.clover_adaptive_route_sparse_window_max,
+        clover_adaptive_route_context_len_max=args.clover_adaptive_route_context_len_max,
+        clover_adaptive_probe_enabled=args.clover_adaptive_probe_enabled,
         clover_shadow_check_token_interval=args.clover_shadow_check_token_interval,
         clover_shadow_check_layer_interval=args.clover_shadow_check_layer_interval,
         clover_host_qk_mixed_enabled=args.clover_host_qk_mixed_enabled,
@@ -624,7 +633,7 @@ def run_disaggregated(args, problems: List[Dict[str, object]], attention_backend
     model_conf = ModelConfig(
         model_name=args.model_name,
         model_path=args.model,
-        max_seq_len=2048,
+        max_seq_len=int(args.max_seq_len),
         max_new_tokens=args.max_new_tokens,
         dtype=args.dtype,
     )
@@ -659,7 +668,7 @@ def run_split_gpu(args, problems: List[Dict[str, object]]) -> Dict[str, object]:
     model_conf = ModelConfig(
         model_name=args.model_name,
         model_path=args.model,
-        max_seq_len=2048,
+        max_seq_len=int(args.max_seq_len),
         max_new_tokens=args.max_new_tokens,
         dtype=args.dtype,
     )
@@ -755,6 +764,7 @@ def main():
     parser.add_argument("--limit", type=int, default=5)
     parser.add_argument("--model", default="/home/cml/CloverInfer/model/Qwen-1_8B")
     parser.add_argument("--model-name", default="qwen-1_8b")
+    parser.add_argument("--max-seq-len", type=int, default=2048)
     parser.add_argument("--max-new-tokens", type=int, default=3)
     parser.add_argument("--prompt-token-length", type=int, default=0)
     parser.add_argument("--concurrency", type=int, default=1)
@@ -788,7 +798,7 @@ def main():
     parser.add_argument(
         "--pim-head-grouping-policy",
         default="auto",
-        choices=["auto", "legacy", "balanced", "coarse", "segment_aware"],
+        choices=["auto", "legacy", "balanced", "coarse", "segment_aware", "adaptive"],
     )
     parser.add_argument(
         "--pim-dpu-placement-policy",
@@ -822,6 +832,14 @@ def main():
     parser.add_argument("--clover-op-profiling-enabled", action="store_true")
     parser.add_argument("--no-clover-op-profiling-enabled", action="store_true")
     parser.add_argument("--clover-cpu-fast-path-max-context-tokens", type=int, default=0)
+    parser.add_argument("--clover-adaptive-routing-enabled", action="store_true")
+    parser.add_argument("--no-clover-adaptive-routing-enabled", action="store_true")
+    parser.add_argument("--clover-adaptive-route-compressed-kv-to-cpu", action="store_true")
+    parser.add_argument("--no-clover-adaptive-route-compressed-kv-to-cpu", action="store_true")
+    parser.add_argument("--clover-adaptive-route-sparse-window-max", type=int, default=0)
+    parser.add_argument("--clover-adaptive-route-context-len-max", type=int, default=0)
+    parser.add_argument("--clover-adaptive-probe-enabled", action="store_true")
+    parser.add_argument("--no-clover-adaptive-probe-enabled", action="store_true")
     parser.add_argument("--clover-shadow-check-token-interval", type=int, default=4)
     parser.add_argument("--clover-shadow-check-layer-interval", type=int, default=4)
     parser.add_argument("--clover-host-qk-mixed-enabled", action="store_true")
@@ -924,8 +942,30 @@ def main():
         raise ValueError(
             "cannot set both --clover-op-profiling-enabled and --no-clover-op-profiling-enabled"
         )
+    if args.clover_adaptive_routing_enabled and args.no_clover_adaptive_routing_enabled:
+        raise ValueError(
+            "cannot set both --clover-adaptive-routing-enabled and "
+            "--no-clover-adaptive-routing-enabled"
+        )
+    if (
+        args.clover_adaptive_route_compressed_kv_to_cpu
+        and args.no_clover_adaptive_route_compressed_kv_to_cpu
+    ):
+        raise ValueError(
+            "cannot set both --clover-adaptive-route-compressed-kv-to-cpu and "
+            "--no-clover-adaptive-route-compressed-kv-to-cpu"
+        )
+    if args.clover_adaptive_probe_enabled and args.no_clover_adaptive_probe_enabled:
+        raise ValueError(
+            "cannot set both --clover-adaptive-probe-enabled and "
+            "--no-clover-adaptive-probe-enabled"
+        )
     if args.clover_cpu_fast_path_max_context_tokens < 0:
         raise ValueError("--clover-cpu-fast-path-max-context-tokens must be non-negative")
+    if args.clover_adaptive_route_sparse_window_max < 0:
+        raise ValueError("--clover-adaptive-route-sparse-window-max must be non-negative")
+    if args.clover_adaptive_route_context_len_max < 0:
+        raise ValueError("--clover-adaptive-route-context-len-max must be non-negative")
     if args.clover_host_qk_mixed_enabled and args.no_clover_host_qk_mixed_enabled:
         raise ValueError("cannot set both --clover-host-qk-mixed-enabled and --no-clover-host-qk-mixed-enabled")
     if (
@@ -1102,6 +1142,17 @@ def main():
         args.clover_op_profiling_enabled = False
     elif args.clover_op_profiling_enabled:
         args.clover_op_profiling_enabled = True
+    args.clover_adaptive_routing_enabled = bool(args.clover_adaptive_routing_enabled)
+    if args.no_clover_adaptive_routing_enabled:
+        args.clover_adaptive_routing_enabled = False
+    args.clover_adaptive_route_compressed_kv_to_cpu = True
+    if args.no_clover_adaptive_route_compressed_kv_to_cpu:
+        args.clover_adaptive_route_compressed_kv_to_cpu = False
+    elif args.clover_adaptive_route_compressed_kv_to_cpu:
+        args.clover_adaptive_route_compressed_kv_to_cpu = True
+    args.clover_adaptive_probe_enabled = bool(args.clover_adaptive_probe_enabled)
+    if args.no_clover_adaptive_probe_enabled:
+        args.clover_adaptive_probe_enabled = False
     args.clover_host_qk_mixed_enabled = bool(args.clover_host_qk_mixed_enabled)
     if args.no_clover_host_qk_mixed_enabled:
         args.clover_host_qk_mixed_enabled = False
@@ -1177,6 +1228,9 @@ def main():
     if args.no_clover_pim_perf_guard_enabled:
         args.clover_pim_perf_guard_enabled = False
         args.clover_pim_perf_guard_auto_enabled = False
+    if args.clover_adaptive_routing_enabled and args.clover_adaptive_probe_enabled:
+        args.clover_pim_perf_guard_enabled = True
+        args.clover_pim_perf_guard_auto_enabled = False
     args.clover_pim_perf_guard_force_cpu_for_compressed_kv = True
     if args.no_clover_pim_perf_guard_force_cpu_for_compressed_kv:
         args.clover_pim_perf_guard_force_cpu_for_compressed_kv = False
@@ -1227,6 +1281,8 @@ def main():
         raise ValueError("--decode-continuous-batch-window-ms must be non-negative")
     if args.decode_continuous_batch_max_size <= 0:
         raise ValueError("--decode-continuous-batch-max-size must be positive")
+    if args.max_seq_len <= 0:
+        raise ValueError("--max-seq-len must be positive")
     if args.decode_continuous_batch_startup_grace_s < 0.0:
         raise ValueError("--decode-continuous-batch-startup-grace-s must be non-negative")
     if args.decode_continuous_batch_startup_grace_ms < 0.0:
@@ -1271,6 +1327,7 @@ def main():
         "prompt_token_length_override": int(args.prompt_token_length),
         "concurrency": max(1, int(args.concurrency)),
         "max_new_tokens": int(args.max_new_tokens),
+        "max_seq_len": int(args.max_seq_len),
         "attention_sparse_window": int(args.attention_sparse_window),
         "clover_cpu_shadow_enabled": bool(args.clover_cpu_shadow_enabled),
         "clover_cpu_shadow_auto_disabled": bool(args.clover_cpu_shadow_auto_disabled),
@@ -1283,6 +1340,13 @@ def main():
         "clover_capacity_aware_host_c": float(args.clover_capacity_aware_host_c),
         "clover_capacity_aware_max_tokens_per_dpu": int(args.clover_capacity_aware_max_tokens_per_dpu),
         "clover_cpu_fast_path_max_context_tokens": int(args.clover_cpu_fast_path_max_context_tokens),
+        "clover_adaptive_routing_enabled": bool(args.clover_adaptive_routing_enabled),
+        "clover_adaptive_route_compressed_kv_to_cpu": bool(
+            args.clover_adaptive_route_compressed_kv_to_cpu
+        ),
+        "clover_adaptive_route_sparse_window_max": int(args.clover_adaptive_route_sparse_window_max),
+        "clover_adaptive_route_context_len_max": int(args.clover_adaptive_route_context_len_max),
+        "clover_adaptive_probe_enabled": bool(args.clover_adaptive_probe_enabled),
         "clover_pim_qk_only_host_av_experimental_enabled": bool(
             args.clover_pim_qk_only_host_av_experimental_enabled
         ),

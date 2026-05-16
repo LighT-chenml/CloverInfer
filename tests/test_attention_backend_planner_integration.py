@@ -82,6 +82,17 @@ def test_auto_head_grouping_policy_is_accepted_for_runtime_configs():
     assert backend.dpu_placement_policy == "rotated"
 
 
+def test_adaptive_head_grouping_coarsens_medium_contexts():
+    backend = _PlannerOnlyBackend(
+        num_dpus=32,
+        resident_store_backend="host",
+        head_grouping_policy="adaptive",
+    )
+
+    assert backend._effective_head_group_count(seq_len=2048, num_heads=16, head_dim=128) == 4
+    assert backend._effective_head_group_count(seq_len=4096, num_heads=16, head_dim=128) == 16
+
+
 class _RecordingHostStore(HostResidentKVStore):
     def __init__(self):
         super().__init__()

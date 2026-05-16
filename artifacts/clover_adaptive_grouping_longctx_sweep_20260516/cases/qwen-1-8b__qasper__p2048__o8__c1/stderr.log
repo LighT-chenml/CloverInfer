@@ -1,0 +1,61 @@
+2026-05-16 06:26:16,604	INFO worker.py:1821 -- Connecting to existing Ray cluster at address: 192.168.123.4:26379...
+2026-05-16 06:26:16,627	INFO worker.py:1998 -- Connected to Ray cluster. View the dashboard at [1m[32m192.168.123.4:8265 [39m[22m
+/home/cml/.local/lib/python3.10/site-packages/ray/_private/worker.py:2046: FutureWarning: Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default). To enable this behavior and turn off this error message, set RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  warnings.warn(
+[33m(raylet, ip=192.168.123.7)[0m Python patch version mismatch: The cluster was started with:
+[33m(raylet, ip=192.168.123.7)[0m     Ray: 2.53.0
+[33m(raylet, ip=192.168.123.7)[0m     Python: 3.10.19
+[33m(raylet, ip=192.168.123.7)[0m This process on node 192.168.123.7 was started with:
+[33m(raylet, ip=192.168.123.7)[0m 
+[33m(raylet, ip=192.168.123.3)[0m 
+[33m(raylet, ip=192.168.123.7)[0m 
+[36m(AttentionNode pid=282982, ip=192.168.123.7)[0m Exception raised in creation task: The actor died because of an error raised in its creation task, [36mray::AttentionNode.__init__()[39m (pid=282982, ip=192.168.123.7, actor_id=73c2f1a6442b8bc0c1a1a84d09000000, repr=<src.core.nodes.AttentionNode object at 0x7fa12c903ca0>)
+[36m(AttentionNode pid=282982, ip=192.168.123.7)[0m   File "/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py", line 451, in result
+[36m(AttentionNode pid=282982, ip=192.168.123.7)[0m     return self.__get_result()
+[36m(AttentionNode pid=282982, ip=192.168.123.7)[0m   File "/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py", line 403, in __get_result
+[36m(AttentionNode pid=282982, ip=192.168.123.7)[0m     raise self._exception
+[36m(AttentionNode pid=282982, ip=192.168.123.7)[0m   File "/home/cml/CloverInfer/src/core/nodes.py", line 111, in __init__
+[36m(AttentionNode pid=282982, ip=192.168.123.7)[0m     self.backend = CloverInferAttentionBackend(attention_sparse_window=attention_sparse_window, **backend_kwargs)
+[36m(AttentionNode pid=282982, ip=192.168.123.7)[0m   File "/home/cml/CloverInfer/src/core/clover_attention_backend.py", line 75, in __init__
+[36m(AttentionNode pid=282982, ip=192.168.123.7)[0m     super().__init__(*args, **kwargs)
+[36m(AttentionNode pid=282982, ip=192.168.123.7)[0m   File "/home/cml/CloverInfer/src/core/attention_backend.py", line 382, in __init__
+[36m(AttentionNode pid=282982, ip=192.168.123.7)[0m     raise ValueError(f"Unsupported head_grouping_policy: {self.head_grouping_policy}")
+[36m(AttentionNode pid=282982, ip=192.168.123.7)[0m ValueError: Unsupported head_grouping_policy: adaptive
+[33m(raylet, ip=192.168.123.7)[0m Python patch version mismatch: The cluster was started with:[32m [repeated 2x across cluster] (Ray deduplicates logs by default. Set RAY_DEDUP_LOGS=0 to disable log deduplication, or see https://docs.ray.io/en/master/ray-observability/user-guides/configure-logging.html#log-deduplication for more options.)[0m
+[33m(raylet, ip=192.168.123.7)[0m     Ray: 2.53.0[32m [repeated 5x across cluster][0m
+[33m(raylet, ip=192.168.123.7)[0m     Python: 3.10.20[32m [repeated 5x across cluster][0m
+[33m(raylet, ip=192.168.123.7)[0m This process on node 192.168.123.7 was started with:[32m [repeated 2x across cluster][0m
+Traceback (most recent call last):
+  File "/home/cml/CloverInfer/tests/benchmark_baselines.py", line 1467, in <module>
+    main()
+  File "/home/cml/CloverInfer/tests/benchmark_baselines.py", line 1438, in main
+    result = run_disaggregated(args, problems, "cloverinfer")
+  File "/home/cml/CloverInfer/tests/benchmark_baselines.py", line 644, in run_disaggregated
+    placement = ray.get(scheduler.initialize_cluster.remote())
+  File "/home/cml/.local/lib/python3.10/site-packages/ray/_private/auto_init_hook.py", line 22, in auto_init_wrapper
+    return fn(*args, **kwargs)
+  File "/home/cml/.local/lib/python3.10/site-packages/ray/_private/client_mode_hook.py", line 104, in wrapper
+    return func(*args, **kwargs)
+  File "/home/cml/.local/lib/python3.10/site-packages/ray/_private/worker.py", line 2967, in get
+    values, debugger_breakpoint = worker.get_objects(
+  File "/home/cml/.local/lib/python3.10/site-packages/ray/_private/worker.py", line 1015, in get_objects
+    raise value.as_instanceof_cause()
+ray.exceptions.RayTaskError(ActorDiedError): [36mray::GlobalScheduler.initialize_cluster()[39m (pid=282916, ip=192.168.123.7, actor_id=4e060fccbfbe2070c58928cf09000000, repr=<src.core.scheduler.GlobalScheduler object at 0x7f0f164f13c0>)
+  File "/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py", line 451, in result
+    return self.__get_result()
+  File "/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py", line 403, in __get_result
+    raise self._exception
+  File "/home/cml/CloverInfer/src/core/scheduler.py", line 1922, in initialize_cluster
+    "attention": await self.attention_nodes[0].get_info.remote(),
+ray.exceptions.ActorDiedError: The actor died because of an error raised in its creation task, [36mray::AttentionNode.__init__()[39m (pid=282982, ip=192.168.123.7, actor_id=73c2f1a6442b8bc0c1a1a84d09000000, repr=<src.core.nodes.AttentionNode object at 0x7fa12c903ca0>)
+  File "/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py", line 451, in result
+    return self.__get_result()
+  File "/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py", line 403, in __get_result
+    raise self._exception
+  File "/home/cml/CloverInfer/src/core/nodes.py", line 111, in __init__
+    self.backend = CloverInferAttentionBackend(attention_sparse_window=attention_sparse_window, **backend_kwargs)
+  File "/home/cml/CloverInfer/src/core/clover_attention_backend.py", line 75, in __init__
+    super().__init__(*args, **kwargs)
+  File "/home/cml/CloverInfer/src/core/attention_backend.py", line 382, in __init__
+    raise ValueError(f"Unsupported head_grouping_policy: {self.head_grouping_policy}")
+ValueError: Unsupported head_grouping_policy: adaptive

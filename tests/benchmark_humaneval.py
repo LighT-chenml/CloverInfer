@@ -69,7 +69,7 @@ def main():
         "--pim-head-grouping-policy",
         type=str,
         default="auto",
-        choices=["auto", "legacy", "balanced", "coarse", "segment_aware"],
+        choices=["auto", "legacy", "balanced", "coarse", "segment_aware", "adaptive"],
     )
     parser.add_argument(
         "--pim-resident-store-backend",

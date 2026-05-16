@@ -1786,6 +1786,25 @@ class GlobalScheduler:
                         "cpu_fast_path_max_context_tokens": int(
                             self.cluster_config.clover_cpu_fast_path_max_context_tokens
                         ),
+                        "adaptive_routing_enabled": bool(
+                            getattr(self.cluster_config, "clover_adaptive_routing_enabled", False)
+                        ),
+                        "adaptive_route_compressed_kv_to_cpu": bool(
+                            getattr(
+                                self.cluster_config,
+                                "clover_adaptive_route_compressed_kv_to_cpu",
+                                True,
+                            )
+                        ),
+                        "adaptive_route_sparse_window_max": int(
+                            getattr(self.cluster_config, "clover_adaptive_route_sparse_window_max", 0)
+                        ),
+                        "adaptive_route_context_len_max": int(
+                            getattr(self.cluster_config, "clover_adaptive_route_context_len_max", 0)
+                        ),
+                        "adaptive_probe_enabled": bool(
+                            getattr(self.cluster_config, "clover_adaptive_probe_enabled", False)
+                        ),
                         "shadow_check_token_interval": int(self.cluster_config.clover_shadow_check_token_interval),
                         "shadow_check_layer_interval": int(self.cluster_config.clover_shadow_check_layer_interval),
                         "host_qk_mixed_enabled": bool(self.cluster_config.clover_host_qk_mixed_enabled),

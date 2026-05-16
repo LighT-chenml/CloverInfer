@@ -40,6 +40,11 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         shadow_checks_enabled: bool = True,
         op_profiling_enabled: bool = True,
         cpu_fast_path_max_context_tokens: int = 0,
+        adaptive_routing_enabled: bool = False,
+        adaptive_route_compressed_kv_to_cpu: bool = True,
+        adaptive_route_sparse_window_max: int = 0,
+        adaptive_route_context_len_max: int = 0,
+        adaptive_probe_enabled: bool = False,
         shadow_check_token_interval: int = 1,
         shadow_check_layer_interval: int = 1,
         host_qk_mixed_enabled: bool = False,
@@ -72,6 +77,11 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         self.shadow_checks_enabled = bool(shadow_checks_enabled)
         self.op_profiling_enabled = bool(op_profiling_enabled)
         self.cpu_fast_path_max_context_tokens = max(0, int(cpu_fast_path_max_context_tokens))
+        self.adaptive_routing_enabled = bool(adaptive_routing_enabled)
+        self.adaptive_route_compressed_kv_to_cpu = bool(adaptive_route_compressed_kv_to_cpu)
+        self.adaptive_route_sparse_window_max = max(0, int(adaptive_route_sparse_window_max))
+        self.adaptive_route_context_len_max = max(0, int(adaptive_route_context_len_max))
+        self.adaptive_probe_enabled = bool(adaptive_probe_enabled)
         self.shadow_check_token_interval = max(1, int(shadow_check_token_interval))
         self.shadow_check_layer_interval = max(1, int(shadow_check_layer_interval))
         self.host_qk_mixed_enabled = bool(host_qk_mixed_enabled)
@@ -124,6 +134,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         self.shadow_v_buffers: Dict[str, List[torch.Tensor]] = {}
         self.shadow_layer_lens: Dict[str, List[int]] = {}
         self.cpu_fast_path_request_ids: set[str] = set()
+        self.cpu_fast_path_reasons: Dict[str, str] = {}
         self.cpu_fast_path_decode_calls = 0
         self.cpu_fast_path_decode_items = 0
         self.op_timing_totals: Dict[str, float] = {
@@ -165,8 +176,31 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         self.pim_perf_guard_forced_request_count = 0
         self.pim_qk_only_host_av_decode_calls = 0
         self.pim_qk_only_host_av_decode_items = 0
-        if self.pim_perf_guard_enabled or self.pim_qk_only_host_av_experimental_enabled:
+        if (
+            self.adaptive_routing_enabled
+            and self.adaptive_probe_enabled
+            and self.pim_attention_enabled
+        ):
+            self.pim_perf_guard_enabled = True
+        if (
+            self.pim_perf_guard_enabled
+            or self.pim_qk_only_host_av_experimental_enabled
+        ):
             self.cpu_shadow_enabled = True
+        adaptive_static_cpu_only = bool(
+            self.adaptive_routing_enabled
+            and (
+                (
+                    self.adaptive_route_compressed_kv_to_cpu
+                    and normalize_resident_kv_dtype(self.resident_kv_dtype) != "fp32"
+                )
+                or (
+                    self.adaptive_route_sparse_window_max > 0
+                    and self.attention_sparse_window > 0
+                    and int(self.attention_sparse_window) <= int(self.adaptive_route_sparse_window_max)
+                )
+            )
+        )
         if (
             self.pim_attention_enabled
             and self.pim_perf_guard_enabled
@@ -185,10 +219,12 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                 not self.resident_av_enabled
                 and not self.pim_perf_guard_triggered
                 and not self.pim_qk_only_host_av_experimental_enabled
+                and not adaptive_static_cpu_only
             ):
                 raise ValueError(
                     "CloverInfer PIM attention requires a resident store with PIM AV support; "
-                    "use pim_resident_store_backend='upmem_kvslot'"
+                    "use pim_resident_store_backend='upmem_kvslot' or configure adaptive routing "
+                    "so every request is statically routed to the CPU fast path"
                 )
         if hasattr(self.resident_store, "set_experimental_flags"):
             reserve_tail_capacity_enabled = (
@@ -382,6 +418,37 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
     def _use_cpu_fast_path_for_request(self, request_id: str) -> bool:
         return str(request_id) in self.cpu_fast_path_request_ids
 
+    def _set_cpu_fast_path_reason(self, request_id: str, reason: str) -> None:
+        normalized = str(request_id)
+        self.cpu_fast_path_request_ids.add(normalized)
+        self.cpu_fast_path_reasons[normalized] = str(reason)
+
+    def _get_cpu_fast_path_reason(self, request_id: str) -> str:
+        return str(self.cpu_fast_path_reasons.get(str(request_id), ""))
+
+    def _should_route_request_to_cpu(self, request_id: str, initial_kv: List[Dict[str, torch.Tensor]]) -> tuple[bool, str]:
+        if not self.adaptive_routing_enabled:
+            return (False, "")
+        if not initial_kv:
+            return (False, "")
+
+        initial_seq_len = int(initial_kv[0]["key"].shape[0])
+        if (
+            self.adaptive_route_context_len_max > 0
+            and initial_seq_len <= int(self.adaptive_route_context_len_max)
+        ):
+            return (True, f"adaptive_static_context_len_le_{self.adaptive_route_context_len_max}")
+        if (
+            self.adaptive_route_sparse_window_max > 0
+            and self.attention_sparse_window > 0
+            and int(self.attention_sparse_window) <= int(self.adaptive_route_sparse_window_max)
+        ):
+            return (True, f"adaptive_static_sparse_window_le_{self.adaptive_route_sparse_window_max}")
+
+        if self.adaptive_route_compressed_kv_to_cpu and normalize_resident_kv_dtype(self.resident_kv_dtype) != "fp32":
+            return (True, f"adaptive_static_compressed_kv:{self.resident_kv_dtype}")
+        return (False, "")
+
     def _activate_pim_perf_guard_for_requests(
         self,
         request_ids: List[str],
@@ -398,7 +465,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                 continue
             if normalized not in self.shadow_k_buffers:
                 continue
-            self.cpu_fast_path_request_ids.add(normalized)
+            self._set_cpu_fast_path_reason(normalized, reason)
             newly_forced += 1
         self.pim_perf_guard_forced_request_count += newly_forced
 
@@ -409,6 +476,11 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
             [str(item["request_id"]) for item in items],
             self.pim_perf_guard_reason or "pim_perf_guard_already_triggered",
         )
+
+    def _maybe_route_request_to_cpu(self, request_id: str, initial_kv: List[Dict[str, torch.Tensor]]) -> None:
+        should_route, reason = self._should_route_request_to_cpu(request_id, initial_kv)
+        if should_route:
+            self._set_cpu_fast_path_reason(request_id, reason)
 
     def _probe_cpu_attention_s(self, records: List[Dict[str, object]]) -> float:
         started_at = time.perf_counter()
@@ -448,6 +520,31 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                 "observed_pim_attention_slowdown:"
                 f"pim_s={self.pim_perf_guard_pim_observed_s:.6f},"
                 f"cpu_probe_s={self.pim_perf_guard_cpu_probe_s:.6f},"
+                f"slowdown={slowdown:.3f},"
+                f"threshold={self.pim_perf_guard_slowdown_threshold:.3f}"
+            ),
+        )
+
+    def _maybe_route_records_to_cpu_from_probe(
+        self,
+        records: List[Dict[str, object]],
+        *,
+        cpu_probe_s: float,
+        pim_observed_s: float,
+    ) -> None:
+        if not self.adaptive_routing_enabled or not self.adaptive_probe_enabled:
+            return
+        if not records or cpu_probe_s <= 0.0 or pim_observed_s <= 0.0:
+            return
+        slowdown = pim_observed_s / max(cpu_probe_s, 1e-12)
+        if slowdown < self.pim_perf_guard_slowdown_threshold:
+            return
+        self._activate_pim_perf_guard_for_requests(
+            [str(record["request_id"]) for record in records],
+            (
+                "adaptive_probe_triggered:"
+                f"pim_s={pim_observed_s:.6f},"
+                f"cpu_probe_s={cpu_probe_s:.6f},"
                 f"slowdown={slowdown:.3f},"
                 f"threshold={self.pim_perf_guard_slowdown_threshold:.3f}"
             ),
@@ -784,6 +881,11 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                 cpu_probe_s=cpu_probe_s,
                 pim_observed_s=pim_observed_s,
             )
+            self._maybe_route_records_to_cpu_from_probe(
+                records,
+                cpu_probe_s=cpu_probe_s,
+                pim_observed_s=pim_observed_s,
+            )
             return outputs
         if not self.resident_compute_enabled:
             self.qk_mixed_last_head_diffs = []
@@ -814,6 +916,11 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         if self.qk_full_enabled and self.resident_compute_enabled:
             pim_observed_s = max(0.0, float(time.perf_counter() - pim_started_at))
             self._maybe_trigger_pim_perf_guard(
+                records,
+                cpu_probe_s=cpu_probe_s,
+                pim_observed_s=pim_observed_s,
+            )
+            self._maybe_route_records_to_cpu_from_probe(
                 records,
                 cpu_probe_s=cpu_probe_s,
                 pim_observed_s=pim_observed_s,
@@ -1376,10 +1483,12 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         if not initial_kv:
             raise ValueError("initial_kv must contain at least one layer")
         initial_seq_len = int(initial_kv[0]["key"].shape[0])
-        use_cpu_fast_path = (
+        static_cpu_fast_path = (
             self.cpu_fast_path_max_context_tokens > 0
             and initial_seq_len <= self.cpu_fast_path_max_context_tokens
         )
+        adaptive_cpu_fast_path, adaptive_reason = self._should_route_request_to_cpu(request_id, initial_kv)
+        use_cpu_fast_path = bool(static_cpu_fast_path or adaptive_cpu_fast_path)
         if self.cpu_shadow_enabled or use_cpu_fast_path:
             seq_len = self._init_cpu_shadow_request(
                 request_id,
@@ -1389,10 +1498,18 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         else:
             seq_len = initial_seq_len
             self.cpu_backend.context_lens[request_id] = seq_len
-        if use_cpu_fast_path:
-            self.cpu_fast_path_request_ids.add(str(request_id))
+        if static_cpu_fast_path:
+            self._set_cpu_fast_path_reason(
+                request_id,
+                f"static_context_len_le_{self.cpu_fast_path_max_context_tokens}",
+            )
+        elif adaptive_cpu_fast_path:
+            self._set_cpu_fast_path_reason(request_id, adaptive_reason)
         elif self.pim_perf_guard_enabled and self.pim_perf_guard_triggered:
-            self.cpu_fast_path_request_ids.add(str(request_id))
+            self._set_cpu_fast_path_reason(
+                request_id,
+                self.pim_perf_guard_reason or "pim_perf_guard_already_triggered",
+            )
             self.pim_perf_guard_forced_request_count += 1
         else:
             resident_initial_kv, logical_context_len = self._resident_initial_kv_for_attention(initial_kv)
@@ -1414,6 +1531,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
 
     def free_request(self, request_id: str) -> None:
         self.cpu_fast_path_request_ids.discard(str(request_id))
+        self.cpu_fast_path_reasons.pop(str(request_id), None)
         if self.cpu_shadow_enabled or request_id not in self.request_states:
             self.shadow_k_buffers.pop(request_id, None)
             self.shadow_v_buffers.pop(request_id, None)
@@ -1436,8 +1554,20 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         debug["clover_op_profiling_enabled"] = self.op_profiling_enabled
         debug["clover_cpu_fast_path_max_context_tokens"] = int(self.cpu_fast_path_max_context_tokens)
         debug["clover_cpu_fast_path_request_count"] = int(len(self.cpu_fast_path_request_ids))
+        debug["clover_cpu_fast_path_reasons"] = dict(self.cpu_fast_path_reasons)
         debug["clover_cpu_fast_path_decode_calls"] = int(self.cpu_fast_path_decode_calls)
         debug["clover_cpu_fast_path_decode_items"] = int(self.cpu_fast_path_decode_items)
+        debug["clover_adaptive_routing_enabled"] = bool(self.adaptive_routing_enabled)
+        debug["clover_adaptive_route_compressed_kv_to_cpu"] = bool(
+            self.adaptive_route_compressed_kv_to_cpu
+        )
+        debug["clover_adaptive_route_sparse_window_max"] = int(
+            self.adaptive_route_sparse_window_max
+        )
+        debug["clover_adaptive_route_context_len_max"] = int(
+            self.adaptive_route_context_len_max
+        )
+        debug["clover_adaptive_probe_enabled"] = bool(self.adaptive_probe_enabled)
         debug["clover_shadow_check_token_interval"] = self.shadow_check_token_interval
         debug["clover_shadow_check_layer_interval"] = self.shadow_check_layer_interval
         debug["clover_host_qk_mixed_enabled"] = self.host_qk_mixed_enabled

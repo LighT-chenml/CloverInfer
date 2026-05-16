@@ -1,0 +1,84 @@
+{
+  "created_at": 1778911245.7122087,
+  "output_dir": "artifacts/naive_vs_clover_longctx_sweep_20260516",
+  "address": "192.168.123.4:26379",
+  "cluster_layout": {
+    "prefill_ip": "192.168.123.4",
+    "decode_dense_ip": "192.168.123.3",
+    "attention_ip": "192.168.123.7",
+    "prefill_resource": "prefill_gpu",
+    "decode_dense_resource": "decode_dense_gpu",
+    "attention_resource": "attention_pim"
+  },
+  "models": [
+    {
+      "label": "qwen-1_8b",
+      "slug": "qwen-1-8b",
+      "path": "/home/cml/CloverInfer/model/Qwen-1_8B"
+    }
+  ],
+  "datasets": [
+    {
+      "label": "qasper",
+      "slug": "qasper",
+      "path": "dataset/longbench/qasper.jsonl",
+      "format": "longbench_jsonl"
+    }
+  ],
+  "prompt_token_lengths": [
+    2048,
+    4096
+  ],
+  "output_token_lengths": [
+    8
+  ],
+  "concurrency_values": [
+    1
+  ],
+  "limit": 1,
+  "dtype": "float16",
+  "max_seq_len": 8192,
+  "baselines": "Naive PIM,CloverInfer",
+  "clover_rankset_overlap_enabled": false,
+  "clover_rankset_overlap_max_ranksets_per_batch": 0,
+  "clover_rankset_overlap_transfer_granularity": "stripe",
+  "clover_rankset_overlap_async_dispatch_enabled": false,
+  "clover_rankset_overlap_transfer_latency_s": 0.0,
+  "decode_continuous_batch_window_s": 0.0,
+  "decode_continuous_batch_window_ms": 0.0,
+  "decode_continuous_batch_max_size": 8,
+  "resolved_baselines": [
+    {
+      "canonical_key": "naive_pim",
+      "canonical_name": "Naive PIM",
+      "internal_baseline": "disagg_pim_naive",
+      "alias_note": "Naive PIM resolves to the current disagg_pim_naive implementation.",
+      "requested_aliases": [
+        "Naive PIM"
+      ],
+      "resolved_aliases": [
+        "naive-pim",
+        "naive_pim",
+        "pim-naive",
+        "pim_naive",
+        "disagg_pim_naive"
+      ]
+    },
+    {
+      "canonical_key": "cloverinfer",
+      "canonical_name": "CloverInfer",
+      "internal_baseline": "disagg_cloverinfer",
+      "alias_note": "CloverInfer resolves to the current disagg_cloverinfer implementation.",
+      "requested_aliases": [
+        "CloverInfer"
+      ],
+      "resolved_aliases": [
+        "cloverinfer",
+        "clover-infer",
+        "disagg_cloverinfer"
+      ]
+    }
+  ],
+  "num_cases": 2,
+  "dry_run": false
+}

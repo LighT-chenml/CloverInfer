@@ -213,6 +213,80 @@ def test_clover_qk_only_host_av_path_matches_cpu_sparse_reference():
     assert debug["clover_pim_qk_only_host_av_decode_items"] == 1
 
 
+def test_clover_adaptive_routes_compressed_kv_to_cpu_fast_path():
+    initial_kv = _one_layer_kv(seq_len=6, num_heads=2, head_dim=3)
+    query = torch.randn(1, 2, 3)
+    key = torch.randn(1, 2, 3)
+    value = torch.randn(1, 2, 3)
+
+    backend = _NoSmokeCloverBackend(
+        resident_store_backend="host",
+        resident_kv_dtype="int8",
+        qk_full_enabled=True,
+        softmax_av_fused_enabled=True,
+        attention_sparse_window=4,
+        pim_attention_enabled=True,
+        adaptive_routing_enabled=True,
+        adaptive_probe_enabled=False,
+        shadow_checks_enabled=False,
+    )
+    returned_context_len = backend.init_request("req", initial_kv)
+    actual = backend.decode_layer("req", 0, query, key, value, score_scale=0.25)
+    expected = _manual_decode(initial_kv, query, key, value, score_scale=0.25, window=4)
+    debug = backend.get_debug_info()
+
+    assert returned_context_len == 6
+    assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+    assert backend.request_states == {}
+    assert debug["clover_adaptive_routing_enabled"] is True
+    assert debug["clover_cpu_fast_path_decode_items"] == 1
+    assert debug["clover_cpu_fast_path_reasons"]["req"] == "adaptive_static_compressed_kv:int8"
+
+
+def test_clover_adaptive_sparse_window_threshold_routes_to_cpu_fast_path():
+    initial_kv = _one_layer_kv(seq_len=10, num_heads=2, head_dim=3)
+
+    backend = _NoSmokeCloverBackend(
+        resident_store_backend="host",
+        qk_full_enabled=True,
+        softmax_av_fused_enabled=True,
+        attention_sparse_window=4,
+        pim_attention_enabled=True,
+        adaptive_routing_enabled=True,
+        adaptive_route_compressed_kv_to_cpu=False,
+        adaptive_route_sparse_window_max=8,
+        adaptive_probe_enabled=False,
+        shadow_checks_enabled=False,
+    )
+    backend.init_request("req", initial_kv)
+    debug = backend.get_debug_info()
+
+    assert backend.request_states == {}
+    assert debug["clover_cpu_fast_path_request_count"] == 1
+    assert debug["clover_cpu_fast_path_reasons"]["req"] == "adaptive_static_sparse_window_le_8"
+
+
+def test_clover_adaptive_rejects_non_matching_host_store_pim_path():
+    try:
+        _NoSmokeCloverBackend(
+            resident_store_backend="host",
+            qk_full_enabled=True,
+            softmax_av_fused_enabled=False,
+            attention_sparse_window=16,
+            pim_attention_enabled=True,
+            adaptive_routing_enabled=True,
+            adaptive_route_compressed_kv_to_cpu=False,
+            adaptive_route_sparse_window_max=8,
+            adaptive_probe_enabled=False,
+            cpu_shadow_enabled=False,
+            shadow_checks_enabled=False,
+        )
+    except ValueError as exc:
+        assert "requires a resident store with PIM AV support" in str(exc)
+    else:
+        raise AssertionError("host-store CloverInfer PIM path should require static CPU routing")
+
+
 def test_clover_sparse_resident_init_keeps_only_tail_window_with_full_shadow():
     initial_kv = _one_layer_kv(seq_len=7, num_heads=2, head_dim=3)
     query = torch.randn(1, 2, 3)
