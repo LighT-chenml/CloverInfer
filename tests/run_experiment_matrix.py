@@ -266,6 +266,16 @@ def build_case_command(args, case: Dict[str, object], output_path: str) -> List[
         "--no-clover-pim-context-fused-experimental-enabled",
         args.no_clover_pim_context_fused_experimental_enabled,
     )
+    append_optional_flag(
+        cmd,
+        "--clover-pim-qk-only-host-av-experimental-enabled",
+        args.clover_pim_qk_only_host_av_experimental_enabled,
+    )
+    append_optional_flag(
+        cmd,
+        "--no-clover-pim-qk-only-host-av-experimental-enabled",
+        args.no_clover_pim_qk_only_host_av_experimental_enabled,
+    )
     append_optional_flag(cmd, "--clover-pim-perf-guard-enabled", args.clover_pim_perf_guard_enabled)
     append_optional_flag(cmd, "--no-clover-pim-perf-guard-enabled", args.no_clover_pim_perf_guard_enabled)
     append_optional_flag(
@@ -428,6 +438,10 @@ def main():
             "int8_fp16",
             "int8-fp16",
             "k_int8_v_fp16",
+            "mixed_int8_int16",
+            "int8_int16",
+            "int8-int16",
+            "k_int8_v_int16",
         ],
     )
     parser.add_argument("--pim-qk-full-enabled", action="store_true")
@@ -463,6 +477,8 @@ def main():
     parser.add_argument("--no-clover-pim-layer-rank-rotation-experimental-enabled", action="store_true")
     parser.add_argument("--clover-pim-context-fused-experimental-enabled", action="store_true")
     parser.add_argument("--no-clover-pim-context-fused-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-pim-qk-only-host-av-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-qk-only-host-av-experimental-enabled", action="store_true")
     parser.add_argument("--clover-pim-perf-guard-enabled", action="store_true")
     parser.add_argument("--no-clover-pim-perf-guard-enabled", action="store_true")
     parser.add_argument("--clover-pim-perf-guard-force-cpu-for-compressed-kv", action="store_true")

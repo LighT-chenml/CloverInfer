@@ -1733,10 +1733,28 @@ class PimNaiveAttentionBackend:
         else:
             target_medium_width = 16
         if sparse_tail_resident:
-            target_medium_width = max(
-                target_medium_width,
-                self._sparse_tail_stripe_target_width(initial_context_len),
-            )
+            sparse_tail_width = self._sparse_tail_stripe_target_width(initial_context_len)
+            if os.environ.get("CLOVER_PIM_SPARSE_TAIL_ALLOW_NARROW_STRIPE", "0") != "0":
+                # Experimental long-context sparse path: reduce token-segment
+                # fanout to cut UPMEM launch rounds. Capacity still clamps the
+                # final stripe below via min_dpus_by_capacity.
+                previous_medium_width = int(target_medium_width)
+                target_medium_width = int(sparse_tail_width)
+                self.sparse_tail_last_stripe_policy = {
+                    **dict(self.sparse_tail_last_stripe_policy),
+                    "allow_narrow_stripe": True,
+                    "medium_floor_width": int(previous_medium_width),
+                }
+            else:
+                target_medium_width = max(
+                    target_medium_width,
+                    int(sparse_tail_width),
+                )
+                self.sparse_tail_last_stripe_policy = {
+                    **dict(self.sparse_tail_last_stripe_policy),
+                    "allow_narrow_stripe": False,
+                    "medium_floor_width": int(target_medium_width),
+                }
         # If the prompt is already beyond the base resident length, delaying
         # stripe growth leaves most base groups pinned onto the narrower
         # initial subset. Front-load a moderate width increase so more same-rank

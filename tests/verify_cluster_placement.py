@@ -130,6 +130,10 @@ def parse_args():
             "int8_fp16",
             "int8-fp16",
             "k_int8_v_fp16",
+            "mixed_int8_int16",
+            "int8_int16",
+            "int8-int16",
+            "k_int8_v_int16",
         ],
     )
     parser.add_argument("--clover-cpu-shadow-enabled", action="store_true")

@@ -76,11 +76,15 @@ def build_runtime_env() -> Dict[str, object]:
         "CLOVER_KVSLOT_EXPERIMENTAL_INT16_KV",
         "CLOVER_KVSLOT_CONTEXT_BULK_ROW",
         "CLOVER_KVSLOT_CONTEXT_OCTETV",
+        "CLOVER_KVSLOT_CONTEXT_TILE16",
+        "CLOVER_KVSLOT_CONTEXT_INT8_I16_WEIGHTS",
         "CLOVER_KVSLOT_QK_MAX_ACTIVE_DPUS",
         "CLOVER_KVSLOT_QK_MAX_ROUND_ITEMS",
         "CLOVER_KVSLOT_QK_MAX_ACTIVE_RANKS",
         "CLOVER_KVSLOT_RANK_LOCAL_ROUNDS",
         "CLOVER_PIM_SPARSE_TAIL_STRIPE_WIDTH",
+        "CLOVER_PIM_SPARSE_TAIL_ALLOW_NARROW_STRIPE",
+        "CLOVER_PIM_NARROW_SEGMENT_DPU_SUBSET",
     ):
         env_value = os.environ.get(env_name)
         if env_value is not None:
@@ -489,6 +493,11 @@ def make_cluster_config(args, attention_backend: str) -> ClusterConfig:
         clover_host_qk_mixed_enabled=args.clover_host_qk_mixed_enabled,
         clover_pim_attention_enabled=(attention_backend == "cloverinfer"),
         clover_pim_context_fused_experimental_enabled=args.clover_pim_context_fused_experimental_enabled,
+        clover_pim_qk_only_host_av_experimental_enabled=(
+            args.clover_pim_qk_only_host_av_experimental_enabled
+            if attention_backend == "cloverinfer"
+            else False
+        ),
         clover_pim_rank_spread_alloc_experimental_enabled=(
             args.clover_pim_rank_spread_alloc_experimental_enabled if attention_backend == "cloverinfer" else False
         ),
@@ -577,6 +586,7 @@ def make_cluster_config(args, attention_backend: str) -> ClusterConfig:
         decode_continuous_batch_window_s=args.decode_continuous_batch_window_s,
         decode_continuous_batch_max_size=args.decode_continuous_batch_max_size,
         decode_continuous_batch_inflight_target_enabled=args.decode_continuous_batch_inflight_target_enabled,
+        decode_continuous_batch_startup_grace_s=args.decode_continuous_batch_startup_grace_s,
         attention_rpc_cross_key_batch_enabled=(attention_backend == "cloverinfer"),
         attention_actor_side_batching_enabled=False,
     )
@@ -788,7 +798,10 @@ def main():
     parser.add_argument(
         "--pim-resident-kv-dtype",
         default="fp32",
-        choices=sorted(SUPPORTED_RESIDENT_KV_DTYPES | {"int8_fp16", "int8-fp16", "k_int8_v_fp16"}),
+        choices=sorted(
+            SUPPORTED_RESIDENT_KV_DTYPES
+            | {"int8_fp16", "int8-fp16", "k_int8_v_fp16", "int8_int16", "int8-int16", "k_int8_v_int16"}
+        ),
     )
     parser.add_argument("--pim-qk-full-enabled", action="store_true")
     parser.add_argument("--no-pim-qk-full-enabled", action="store_true")
@@ -815,6 +828,8 @@ def main():
     parser.add_argument("--no-clover-host-qk-mixed-enabled", action="store_true")
     parser.add_argument("--clover-pim-context-fused-experimental-enabled", action="store_true")
     parser.add_argument("--no-clover-pim-context-fused-experimental-enabled", action="store_true")
+    parser.add_argument("--clover-pim-qk-only-host-av-experimental-enabled", action="store_true")
+    parser.add_argument("--no-clover-pim-qk-only-host-av-experimental-enabled", action="store_true")
     parser.add_argument("--clover-pim-rank-spread-alloc-experimental-enabled", action="store_true")
     parser.add_argument("--no-clover-pim-rank-spread-alloc-experimental-enabled", action="store_true")
     parser.add_argument("--clover-pim-cross-rank-stripe-experimental-enabled", action="store_true")
@@ -877,6 +892,8 @@ def main():
     parser.add_argument("--decode-continuous-batch-max-size", type=int, default=8)
     parser.add_argument("--decode-continuous-batch-inflight-target-enabled", action="store_true")
     parser.add_argument("--no-decode-continuous-batch-inflight-target-enabled", action="store_true")
+    parser.add_argument("--decode-continuous-batch-startup-grace-s", type=float, default=0.0)
+    parser.add_argument("--decode-continuous-batch-startup-grace-ms", type=float, default=0.0)
     parser.add_argument(
         "--output",
         default=os.path.join(REPO_ROOT, "artifacts", "baseline_comparison.jsonl"),
@@ -918,6 +935,14 @@ def main():
         raise ValueError(
             "cannot set both --clover-pim-context-fused-experimental-enabled and "
             "--no-clover-pim-context-fused-experimental-enabled"
+        )
+    if (
+        args.clover_pim_qk_only_host_av_experimental_enabled
+        and args.no_clover_pim_qk_only_host_av_experimental_enabled
+    ):
+        raise ValueError(
+            "cannot set both --clover-pim-qk-only-host-av-experimental-enabled and "
+            "--no-clover-pim-qk-only-host-av-experimental-enabled"
         )
     if (
         args.clover_pim_rank_spread_alloc_experimental_enabled
@@ -1085,6 +1110,11 @@ def main():
     )
     if args.no_clover_pim_context_fused_experimental_enabled:
         args.clover_pim_context_fused_experimental_enabled = False
+    args.clover_pim_qk_only_host_av_experimental_enabled = bool(
+        args.clover_pim_qk_only_host_av_experimental_enabled
+    )
+    if args.no_clover_pim_qk_only_host_av_experimental_enabled:
+        args.clover_pim_qk_only_host_av_experimental_enabled = False
     args.clover_pim_rank_spread_alloc_experimental_enabled = bool(
         args.clover_pim_rank_spread_alloc_experimental_enabled
     )
@@ -1197,6 +1227,10 @@ def main():
         raise ValueError("--decode-continuous-batch-window-ms must be non-negative")
     if args.decode_continuous_batch_max_size <= 0:
         raise ValueError("--decode-continuous-batch-max-size must be positive")
+    if args.decode_continuous_batch_startup_grace_s < 0.0:
+        raise ValueError("--decode-continuous-batch-startup-grace-s must be non-negative")
+    if args.decode_continuous_batch_startup_grace_ms < 0.0:
+        raise ValueError("--decode-continuous-batch-startup-grace-ms must be non-negative")
     args.decode_continuous_batch_inflight_target_enabled = bool(
         args.decode_continuous_batch_inflight_target_enabled
     )
@@ -1206,6 +1240,8 @@ def main():
         raise ValueError("--attention-sparse-window must be non-negative")
     if args.decode_continuous_batch_window_ms > 0.0:
         args.decode_continuous_batch_window_s += args.decode_continuous_batch_window_ms / 1000.0
+    if args.decode_continuous_batch_startup_grace_ms > 0.0:
+        args.decode_continuous_batch_startup_grace_s += args.decode_continuous_batch_startup_grace_ms / 1000.0
 
     tokenizer = None
     if int(args.prompt_token_length) > 0:
@@ -1247,6 +1283,9 @@ def main():
         "clover_capacity_aware_host_c": float(args.clover_capacity_aware_host_c),
         "clover_capacity_aware_max_tokens_per_dpu": int(args.clover_capacity_aware_max_tokens_per_dpu),
         "clover_cpu_fast_path_max_context_tokens": int(args.clover_cpu_fast_path_max_context_tokens),
+        "clover_pim_qk_only_host_av_experimental_enabled": bool(
+            args.clover_pim_qk_only_host_av_experimental_enabled
+        ),
         "clover_capacity_aware_require_slot_headroom": bool(
             args.clover_capacity_aware_require_slot_headroom
         ),
@@ -1309,6 +1348,7 @@ def main():
         "decode_continuous_batch_inflight_target_enabled": bool(
             args.decode_continuous_batch_inflight_target_enabled
         ),
+        "decode_continuous_batch_startup_grace_s": float(args.decode_continuous_batch_startup_grace_s),
         "resource_layout": {
             "prefill_resource": str(args.prefill_resource),
             "decode_dense_resource": str(args.decode_dense_resource),

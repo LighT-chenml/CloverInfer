@@ -185,6 +185,10 @@ def main():
             "int8_fp16",
             "int8-fp16",
             "k_int8_v_fp16",
+            "mixed_int8_int16",
+            "int8_int16",
+            "int8-int16",
+            "k_int8_v_int16",
         ],
     )
     parser.add_argument("--pim-resident-store-backend", default="upmem_kvslot", choices=["host", "upmem_kvslot"])

@@ -50,6 +50,7 @@ class ClusterConfig(BaseModel):
     clover_host_qk_mixed_enabled: bool = False
     clover_pim_attention_enabled: bool = False
     clover_pim_context_fused_experimental_enabled: bool = False
+    clover_pim_qk_only_host_av_experimental_enabled: bool = False
     clover_pim_rank_spread_alloc_experimental_enabled: bool = False
     clover_pim_cross_rank_stripe_experimental_enabled: bool = False
     clover_pim_rank_spread_multi_rank_batch_experimental_enabled: bool = False
@@ -100,6 +101,7 @@ class ClusterConfig(BaseModel):
     decode_continuous_batch_window_s: float = 0.0
     decode_continuous_batch_max_size: int = 8
     decode_continuous_batch_inflight_target_enabled: bool = False
+    decode_continuous_batch_startup_grace_s: float = 0.0
 
 class ModelConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")

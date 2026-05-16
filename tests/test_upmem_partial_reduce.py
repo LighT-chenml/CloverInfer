@@ -206,6 +206,44 @@ def test_mixed_int8_fp16_slot_elem_count_reserves_larger_kv_packing_without_upme
     assert UpmemKVSlotStore._slot_elem_count(store, capacity=1, group_heads=1, head_dim=9) == 6
 
 
+def test_mixed_int8_int16_kv_encodes_k_and_v_separately_without_upmem():
+    store = object.__new__(UpmemKVSlotStore)
+    store.kv_dtype = "mixed_int8_int16"
+
+    keys = torch.tensor(
+        [[[0.0, 0.25, -0.5, 1.0], [1.5, -2.0, 0.75, -1.25]]],
+        dtype=torch.float32,
+    )
+    values = keys * 0.5
+
+    encoded_k, encoded_v, k_scale, v_scale = UpmemKVSlotStore._encode_kv_pair(store, keys, values)
+    assert encoded_k.dtype == torch.int8
+    assert encoded_v.dtype == torch.int16
+    assert k_scale > 0.0
+    assert v_scale > 0.0
+
+    decoded_k = UpmemKVSlotStore._decode_tensor_for_dtype(
+        store,
+        encoded_k,
+        resident_kv_store.KVSLOT_DTYPE_INT8,
+        scale=k_scale,
+    )
+    decoded_v = UpmemKVSlotStore._decode_tensor_for_dtype(
+        store,
+        encoded_v,
+        resident_kv_store.KVSLOT_DTYPE_INT16,
+        scale=v_scale,
+    )
+    assert torch.allclose(decoded_k, keys, atol=max(k_scale, 1e-6), rtol=0.0)
+    assert torch.allclose(decoded_v, values, atol=max(v_scale, 1e-6), rtol=0.0)
+
+
+def test_mixed_int8_int16_aliases_normalize_without_upmem():
+    assert resident_kv_store.normalize_resident_kv_dtype("int8_int16") == "mixed_int8_int16"
+    assert resident_kv_store.normalize_resident_kv_dtype("int8-int16") == "mixed_int8_int16"
+    assert resident_kv_store.normalize_resident_kv_dtype("k_int8_v_int16") == "mixed_int8_int16"
+
+
 def test_partial_reduce_flag_can_be_toggled_without_helper():
     store = object.__new__(UpmemKVSlotStore)
     store.host_partial_reduce_enabled = True

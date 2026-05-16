@@ -25,13 +25,24 @@ KVSLOT_DTYPE_INT8 = 2
 KVSLOT_DTYPE_BF16 = 3
 KVSLOT_DTYPE_INT16 = 4
 MIXED_INT8_FP16_KV_DTYPE = "mixed_int8_fp16"
-SUPPORTED_RESIDENT_KV_DTYPES = {"fp32", "fp16", "bf16", "int8", "int16", MIXED_INT8_FP16_KV_DTYPE}
+MIXED_INT8_INT16_KV_DTYPE = "mixed_int8_int16"
+SUPPORTED_RESIDENT_KV_DTYPES = {
+    "fp32",
+    "fp16",
+    "bf16",
+    "int8",
+    "int16",
+    MIXED_INT8_FP16_KV_DTYPE,
+    MIXED_INT8_INT16_KV_DTYPE,
+}
 
 
 def normalize_resident_kv_dtype(value: str) -> str:
     normalized = str(value).strip().lower().replace("-", "_")
     if normalized in {"int8_fp16", "k_int8_v_fp16", "int8k_fp16v"}:
         return MIXED_INT8_FP16_KV_DTYPE
+    if normalized in {"int8_int16", "k_int8_v_int16", "int8k_int16v"}:
+        return MIXED_INT8_INT16_KV_DTYPE
     return normalized
 
 
@@ -39,6 +50,8 @@ def resident_kv_dtype_code(kv_dtype: str, part: str = "k") -> int:
     normalized = normalize_resident_kv_dtype(kv_dtype)
     if normalized == MIXED_INT8_FP16_KV_DTYPE:
         return KVSLOT_DTYPE_INT8 if str(part).lower().startswith("k") else KVSLOT_DTYPE_FP16
+    if normalized == MIXED_INT8_INT16_KV_DTYPE:
+        return KVSLOT_DTYPE_INT8 if str(part).lower().startswith("k") else KVSLOT_DTYPE_INT16
     if normalized == "int8":
         return KVSLOT_DTYPE_INT8
     if normalized == "fp16":
@@ -220,6 +233,27 @@ def _kvslot_limit_config() -> tuple[Dict[str, str], bool]:
     if raw_context_octetv is not None:
         explicit = True
     config["KVSLOT_CONTEXT_OCTETV"] = _parse_kvslot_bool_build_flag(raw_context_octetv, "0")
+
+    raw_context_tile16 = os.environ.get("CLOVER_KVSLOT_CONTEXT_TILE16")
+    if raw_context_tile16 is None:
+        raw_context_tile16 = os.environ.get("KVSLOT_CONTEXT_TILE16")
+    else:
+        explicit = True
+    if raw_context_tile16 is not None:
+        explicit = True
+    config["KVSLOT_CONTEXT_TILE16"] = _parse_kvslot_bool_build_flag(raw_context_tile16, "0")
+
+    raw_context_int8_i16_weights = os.environ.get("CLOVER_KVSLOT_CONTEXT_INT8_I16_WEIGHTS")
+    if raw_context_int8_i16_weights is None:
+        raw_context_int8_i16_weights = os.environ.get("KVSLOT_CONTEXT_INT8_I16_WEIGHTS")
+    else:
+        explicit = True
+    if raw_context_int8_i16_weights is not None:
+        explicit = True
+    config["KVSLOT_CONTEXT_INT8_I16_WEIGHTS"] = _parse_kvslot_bool_build_flag(
+        raw_context_int8_i16_weights,
+        "0",
+    )
 
     raw_dpu_opt = os.environ.get("CLOVER_KVSLOT_DPU_OPT")
     if raw_dpu_opt is None:
@@ -3713,12 +3747,12 @@ class UpmemKVSlotStore(ResidentKVStore):
                 if tail_take_len > 0 and tail_block is not None:
                     tail_k_scale = (
                         float(tail_block.get("k_scale", 1.0))
-                        if resident_kv_dtype_code(self.kv_dtype, "k") == KVSLOT_DTYPE_INT8
+                        if resident_kv_dtype_code(self.kv_dtype, "k") in {KVSLOT_DTYPE_INT8, KVSLOT_DTYPE_INT16}
                         else None
                     )
                     tail_v_scale = (
                         float(tail_block.get("v_scale", 1.0))
-                        if resident_kv_dtype_code(self.kv_dtype, "v") == KVSLOT_DTYPE_INT8
+                        if resident_kv_dtype_code(self.kv_dtype, "v") in {KVSLOT_DTYPE_INT8, KVSLOT_DTYPE_INT16}
                         else None
                     )
                     encoded_k, encoded_v, k_scale, v_scale = self._encode_kv_pair(
@@ -3762,12 +3796,12 @@ class UpmemKVSlotStore(ResidentKVStore):
         if slot_info["backend"] == "dpu":
             slot_k_scale = (
                 float(slot_info.get("k_scale", 1.0))
-                if resident_kv_dtype_code(self.kv_dtype, "k") == KVSLOT_DTYPE_INT8
+                if resident_kv_dtype_code(self.kv_dtype, "k") in {KVSLOT_DTYPE_INT8, KVSLOT_DTYPE_INT16}
                 else None
             )
             slot_v_scale = (
                 float(slot_info.get("v_scale", 1.0))
-                if resident_kv_dtype_code(self.kv_dtype, "v") == KVSLOT_DTYPE_INT8
+                if resident_kv_dtype_code(self.kv_dtype, "v") in {KVSLOT_DTYPE_INT8, KVSLOT_DTYPE_INT16}
                 else None
             )
             encoded_k, encoded_v, k_scale, v_scale = self._encode_kv_pair(
@@ -4082,6 +4116,8 @@ class UpmemKVSlotStore(ResidentKVStore):
                     "CLOVER_KVSLOT_EXPERIMENTAL_INT16_KV",
                     "CLOVER_KVSLOT_CONTEXT_BULK_ROW",
                     "CLOVER_KVSLOT_CONTEXT_OCTETV",
+                    "CLOVER_KVSLOT_CONTEXT_TILE16",
+                    "CLOVER_KVSLOT_CONTEXT_INT8_I16_WEIGHTS",
                 )
                 if os.environ.get(name) is not None
             },

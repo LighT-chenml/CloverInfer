@@ -45,6 +45,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         host_qk_mixed_enabled: bool = False,
         pim_attention_enabled: bool = False,
         pim_context_fused_experimental_enabled: bool = False,
+        pim_qk_only_host_av_experimental_enabled: bool = False,
         pim_rank_spread_alloc_experimental_enabled: bool = False,
         pim_cross_rank_stripe_experimental_enabled: bool = False,
         pim_rank_spread_multi_rank_batch_experimental_enabled: bool = False,
@@ -76,6 +77,9 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         self.host_qk_mixed_enabled = bool(host_qk_mixed_enabled)
         self.pim_attention_enabled = bool(pim_attention_enabled)
         self.pim_context_fused_experimental_enabled = bool(pim_context_fused_experimental_enabled)
+        self.pim_qk_only_host_av_experimental_enabled = bool(
+            pim_qk_only_host_av_experimental_enabled
+        )
         self.pim_rank_spread_alloc_experimental_enabled = bool(pim_rank_spread_alloc_experimental_enabled)
         self.pim_cross_rank_stripe_experimental_enabled = bool(
             pim_cross_rank_stripe_experimental_enabled
@@ -151,13 +155,17 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         self.resident_context_fallback_reason = ""
         self.resident_runtime_fallbacks = 0
         self.resident_runtime_fallback_reason = ""
+        self.resident_qk_fallbacks = 0
+        self.resident_qk_fallback_reason = ""
         self.pim_perf_guard_triggered = False
         self.pim_perf_guard_reason = ""
         self.pim_perf_guard_decode_observations = 0
         self.pim_perf_guard_cpu_probe_s = 0.0
         self.pim_perf_guard_pim_observed_s = 0.0
         self.pim_perf_guard_forced_request_count = 0
-        if self.pim_perf_guard_enabled:
+        self.pim_qk_only_host_av_decode_calls = 0
+        self.pim_qk_only_host_av_decode_items = 0
+        if self.pim_perf_guard_enabled or self.pim_qk_only_host_av_experimental_enabled:
             self.cpu_shadow_enabled = True
         if (
             self.pim_attention_enabled
@@ -171,8 +179,13 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
             )
         if self.pim_attention_enabled:
             self.qk_full_enabled = True
-            self.softmax_av_fused_enabled = True
-            if not self.resident_av_enabled and not self.pim_perf_guard_triggered:
+            if not self.pim_qk_only_host_av_experimental_enabled:
+                self.softmax_av_fused_enabled = True
+            if (
+                not self.resident_av_enabled
+                and not self.pim_perf_guard_triggered
+                and not self.pim_qk_only_host_av_experimental_enabled
+            ):
                 raise ValueError(
                     "CloverInfer PIM attention requires a resident store with PIM AV support; "
                     "use pim_resident_store_backend='upmem_kvslot'"
@@ -550,7 +563,11 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                         v_new.unsqueeze(0),
                     )
 
-            use_resident_av = self.resident_compute_enabled and self.resident_av_enabled
+            use_resident_av = (
+                self.resident_compute_enabled
+                and self.resident_av_enabled
+                and not self.pim_qk_only_host_av_experimental_enabled
+            )
             cpu_keys = None
             cpu_values = None
             if self.cpu_shadow_enabled:
@@ -746,6 +763,7 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         use_qk_context_fused = (
             self.pim_attention_enabled
             and self.pim_context_fused_experimental_enabled
+            and not self.pim_qk_only_host_av_experimental_enabled
             and self.qk_full_enabled
             and self.resident_compute_enabled
             and self.resident_av_enabled
@@ -777,6 +795,9 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
             self.qk_mixed_last_diag_path = ""
             return self._finalize_decode_records(records)
         if self.qk_full_enabled and self.resident_compute_enabled:
+            if self.pim_qk_only_host_av_experimental_enabled:
+                self.pim_qk_only_host_av_decode_calls += 1
+                self.pim_qk_only_host_av_decode_items += len(records)
             self.qk_mixed_last_head_diffs = []
             self.qk_mixed_last_max_abs_diff = 0.0
             self.qk_mixed_last_diag = {}
@@ -844,7 +865,9 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
                     for (record, k_slot, v_slot), score_mat in zip(slot_query_refs, slot_score_mats):
                         scaled_scores = score_mat.to(torch.float32) * float(record["score_scale"])
                         record["resident_slot_scores"].append((k_slot, v_slot, scaled_scores))
-                except RuntimeError:
+                except RuntimeError as exc:
+                    self.resident_qk_fallbacks += 1
+                    self.resident_qk_fallback_reason = str(exc)
                     for record in records:
                         if record["keys"] is None or record["values"] is None:
                             with self._timed("resident_materialize_s"):
@@ -1420,6 +1443,15 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         debug["clover_host_qk_mixed_enabled"] = self.host_qk_mixed_enabled
         debug["clover_pim_attention_enabled"] = self.pim_attention_enabled
         debug["clover_pim_context_fused_experimental_enabled"] = self.pim_context_fused_experimental_enabled
+        debug["clover_pim_qk_only_host_av_experimental_enabled"] = bool(
+            self.pim_qk_only_host_av_experimental_enabled
+        )
+        debug["clover_pim_qk_only_host_av_decode_calls"] = int(
+            self.pim_qk_only_host_av_decode_calls
+        )
+        debug["clover_pim_qk_only_host_av_decode_items"] = int(
+            self.pim_qk_only_host_av_decode_items
+        )
         debug["clover_pim_rank_spread_alloc_experimental_enabled"] = (
             self.pim_rank_spread_alloc_experimental_enabled
         )
@@ -1478,6 +1510,8 @@ class CloverInferAttentionBackend(PimNaiveAttentionBackend):
         debug["resident_append_fallback_reason"] = str(self.resident_append_fallback_reason)
         debug["resident_context_fallbacks"] = int(self.resident_context_fallbacks)
         debug["resident_context_fallback_reason"] = str(self.resident_context_fallback_reason)
+        debug["resident_qk_fallbacks"] = int(self.resident_qk_fallbacks)
+        debug["resident_qk_fallback_reason"] = str(self.resident_qk_fallback_reason)
         debug["resident_runtime_fallbacks"] = int(self.resident_runtime_fallbacks)
         debug["resident_runtime_fallback_reason"] = str(self.resident_runtime_fallback_reason)
         debug["clover_op_timing_totals_s"] = dict(self.op_timing_totals)

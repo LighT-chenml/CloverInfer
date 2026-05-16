@@ -121,6 +121,9 @@ class GlobalScheduler:
         self.decode_continuous_batch_inflight_target_enabled = bool(
             getattr(cluster_config, "decode_continuous_batch_inflight_target_enabled", False)
         )
+        self.decode_continuous_batch_startup_grace_s = max(
+            0.0, float(getattr(cluster_config, "decode_continuous_batch_startup_grace_s", 0.0))
+        )
         self.decode_continuous_batch_flushes = 0
         self.decode_continuous_batch_total_items = 0
         self.decode_continuous_batch_max_observed = 0
@@ -1005,6 +1008,30 @@ class GlobalScheduler:
                 elif len(self._decode_pending_queue) >= target_size:
                     flush_reason = "target"
 
+                if (
+                    self.decode_continuous_batch_startup_grace_s > 0
+                    and self.decode_continuous_batch_total_items == 0
+                    and len(self._decode_pending_queue) < self.decode_continuous_batch_max_size
+                    and self._inflight_request_count > len(self._decode_pending_queue)
+                ):
+                    grace_started = time.perf_counter()
+                    grace_deadline = grace_started + self.decode_continuous_batch_startup_grace_s
+                    while (
+                        len(self._decode_pending_queue) < self.decode_continuous_batch_max_size
+                        and self._inflight_request_count > len(self._decode_pending_queue)
+                    ):
+                        remaining = grace_deadline - time.perf_counter()
+                        if remaining <= 0:
+                            break
+                        await asyncio.sleep(min(remaining, 0.001))
+                    grace_waited_s = time.perf_counter() - grace_started
+                    waited_s += grace_waited_s
+                    self.decode_continuous_batch_wait_s += grace_waited_s
+                    if len(self._decode_pending_queue) >= self.decode_continuous_batch_max_size:
+                        flush_reason = "target"
+                    elif grace_waited_s > 0 and flush_reason == "immediate":
+                        flush_reason = "window"
+
                 batch_size = min(len(self._decode_pending_queue), self.decode_continuous_batch_max_size)
                 batch = self._take_decode_batch(batch_size)
                 self.decode_continuous_batch_flushes += 1
@@ -1543,6 +1570,7 @@ class GlobalScheduler:
             }
             metrics["scheduler_dense_continuous_batching"] = {
                 "window_s": float(self.decode_continuous_batch_window_s),
+                "startup_grace_s": float(self.decode_continuous_batch_startup_grace_s),
                 "max_size": int(self.decode_continuous_batch_max_size),
                 "flushes": int(self.decode_continuous_batch_flushes),
                 "total_items": int(self.decode_continuous_batch_total_items),
@@ -1764,6 +1792,13 @@ class GlobalScheduler:
                         "pim_attention_enabled": bool(self.cluster_config.clover_pim_attention_enabled),
                         "pim_context_fused_experimental_enabled": bool(
                             self.cluster_config.clover_pim_context_fused_experimental_enabled
+                        ),
+                        "pim_qk_only_host_av_experimental_enabled": bool(
+                            getattr(
+                                self.cluster_config,
+                                "clover_pim_qk_only_host_av_experimental_enabled",
+                                False,
+                            )
                         ),
                         "pim_rank_spread_alloc_experimental_enabled": bool(
                             self.cluster_config.clover_pim_rank_spread_alloc_experimental_enabled

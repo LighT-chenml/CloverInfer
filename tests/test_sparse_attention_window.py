@@ -186,6 +186,33 @@ def test_clover_host_backend_sparse_matches_cpu_sparse_reference():
     assert backend.get_debug_info()["attention_sparse_window"] == 4
 
 
+def test_clover_qk_only_host_av_path_matches_cpu_sparse_reference():
+    initial_kv = _one_layer_kv(seq_len=6, num_heads=2, head_dim=3)
+    query = torch.randn(1, 2, 3)
+    key = torch.randn(1, 2, 3)
+    value = torch.randn(1, 2, 3)
+
+    backend = _NoSmokeCloverBackend(
+        resident_store_backend="host",
+        qk_full_enabled=True,
+        softmax_av_fused_enabled=True,
+        attention_sparse_window=4,
+        pim_attention_enabled=True,
+        pim_qk_only_host_av_experimental_enabled=True,
+        shadow_checks_enabled=True,
+        shadow_check_token_interval=1,
+        shadow_check_layer_interval=1,
+    )
+    backend.init_request("req", initial_kv)
+    actual = backend.decode_layer("req", 0, query, key, value, score_scale=0.25)
+    expected = _manual_decode(initial_kv, query, key, value, score_scale=0.25, window=4)
+    debug = backend.get_debug_info()
+
+    assert torch.allclose(actual, expected, atol=1e-5, rtol=1e-5)
+    assert debug["clover_pim_qk_only_host_av_experimental_enabled"] is True
+    assert debug["clover_pim_qk_only_host_av_decode_items"] == 1
+
+
 def test_clover_sparse_resident_init_keeps_only_tail_window_with_full_shadow():
     initial_kv = _one_layer_kv(seq_len=7, num_heads=2, head_dim=3)
     query = torch.randn(1, 2, 3)
