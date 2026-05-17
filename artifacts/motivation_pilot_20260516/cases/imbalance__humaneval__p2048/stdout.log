@@ -1,0 +1,3 @@
+[36m(DecodeDenseNode pid=196567, ip=192.168.123.3)[0m DecodeDenseNode 0 loading model from /home/cml/CloverInfer/model/Qwen-1_8B on cuda
+[36m(AttentionNode pid=313596, ip=192.168.123.7)[0m AttentionNode 0 initialized with pim_naive backend
+[36m(PrefillNode pid=429670)[0m PrefillNode 0 loading model from /home/cml/CloverInfer/model/Qwen-1_8B on cuda

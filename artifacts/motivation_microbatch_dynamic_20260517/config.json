@@ -1,0 +1,17 @@
+{
+  "output_dir": "artifacts/motivation_microbatch_dynamic_20260517",
+  "scenarios": "short,medium,long,very_long,mixed,bursty,capacity_pressure",
+  "plot_scenarios": "",
+  "batch_sizes": "1,2,4,8,16,32",
+  "plot_x_scale": "log2",
+  "request_count": 64,
+  "num_dpus": 16,
+  "num_heads": 4,
+  "capacity_tokens_per_dpu": 4096,
+  "pim_fixed_s": 0.005,
+  "pim_per_token_s": 3.5e-05,
+  "pim_per_request_s": 0.0004,
+  "host_fixed_s": 0.018,
+  "host_per_request_s": 0.004,
+  "host_alpha": 0.72
+}

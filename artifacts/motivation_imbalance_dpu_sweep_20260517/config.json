@@ -1,0 +1,10 @@
+{
+  "output_dir": "artifacts/motivation_imbalance_dpu_sweep_20260517",
+  "dpu_counts": "16,32,64,128",
+  "num_heads": 4,
+  "request_count": 128,
+  "short_len": 128,
+  "long_len": 8192,
+  "long_period": 32,
+  "long_offset": 0
+}

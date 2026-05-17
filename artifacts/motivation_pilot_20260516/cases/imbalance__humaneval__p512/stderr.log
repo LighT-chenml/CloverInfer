@@ -1,0 +1,89 @@
+2026-05-16 14:45:19,011	INFO worker.py:1821 -- Connecting to existing Ray cluster at address: 192.168.123.4:26379...
+2026-05-16 14:45:19,032	INFO worker.py:1998 -- Connected to Ray cluster. View the dashboard at [1m[32m192.168.123.4:8265 [39m[22m
+/home/cml/.local/lib/python3.10/site-packages/ray/_private/worker.py:2046: FutureWarning: Tip: In future versions of Ray, Ray will no longer override accelerator visible devices env var if num_gpus=0 or num_gpus=None (default). To enable this behavior and turn off this error message, set RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+  warnings.warn(
+[33m(raylet, ip=192.168.123.7)[0m Python patch version mismatch: The cluster was started with:
+[33m(raylet, ip=192.168.123.7)[0m     Ray: 2.53.0
+[33m(raylet, ip=192.168.123.7)[0m     Python: 3.10.19
+[33m(raylet, ip=192.168.123.7)[0m This process on node 192.168.123.7 was started with:
+[33m(raylet, ip=192.168.123.7)[0m 
+[33m(raylet, ip=192.168.123.3)[0m 
+[33m(raylet, ip=192.168.123.7)[0m 
+[33m(raylet, ip=192.168.123.7)[0m 
+[33m(raylet, ip=192.168.123.7)[0m Python patch version mismatch: The cluster was started with:[32m [repeated 3x across cluster] (Ray deduplicates logs by default. Set RAY_DEDUP_LOGS=0 to disable log deduplication, or see https://docs.ray.io/en/master/ray-observability/user-guides/configure-logging.html#log-deduplication for more options.)[0m
+[33m(raylet, ip=192.168.123.7)[0m     Ray: 2.53.0[32m [repeated 7x across cluster][0m
+[33m(raylet, ip=192.168.123.7)[0m     Python: 3.10.20[32m [repeated 7x across cluster][0m
+[33m(raylet, ip=192.168.123.7)[0m This process on node 192.168.123.7 was started with:[32m [repeated 3x across cluster][0m
+[33m(raylet, ip=192.168.123.3)[0m 
+[33m(raylet, ip=192.168.123.7)[0m 
+Traceback (most recent call last):
+  File "/home/cml/CloverInfer/tests/benchmark_baselines.py", line 1465, in <module>
+    main()
+  File "/home/cml/CloverInfer/tests/benchmark_baselines.py", line 1436, in main
+    result = run_disaggregated(args, problems, "cloverinfer")
+  File "/home/cml/CloverInfer/tests/benchmark_baselines.py", line 643, in run_disaggregated
+    records, wall_time_s = run_scheduler_requests(
+  File "/home/cml/CloverInfer/tests/benchmark_baselines.py", line 396, in run_scheduler_requests
+    completion, metrics = ray.get(future)
+  File "/home/cml/.local/lib/python3.10/site-packages/ray/_private/auto_init_hook.py", line 22, in auto_init_wrapper
+    return fn(*args, **kwargs)
+  File "/home/cml/.local/lib/python3.10/site-packages/ray/_private/client_mode_hook.py", line 104, in wrapper
+    return func(*args, **kwargs)
+  File "/home/cml/.local/lib/python3.10/site-packages/ray/_private/worker.py", line 2967, in get
+    values, debugger_breakpoint = worker.get_objects(
+  File "/home/cml/.local/lib/python3.10/site-packages/ray/_private/worker.py", line 1015, in get_objects
+    raise value.as_instanceof_cause()
+ray.exceptions.RayTaskError(RuntimeError): [36mray::GlobalScheduler.submit_request()[39m (pid=308398, ip=192.168.123.7, actor_id=d2896f0ef2649b520f25b30f02000000, repr=<src.core.scheduler.GlobalScheduler object at 0x7f07fb3c52d0>)
+  File "/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py", line 451, in result
+    return self.__get_result()
+  File "/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py", line 403, in __get_result
+    raise self._exception
+  File "/home/cml/CloverInfer/src/core/scheduler.py", line 1986, in submit_request
+    return await completion_future
+  File "/home/cml/CloverInfer/src/core/scheduler.py", line 1053, in _decode_driver_loop
+    await self._run_decode_wave(batch)
+  File "/home/cml/CloverInfer/src/core/scheduler.py", line 1368, in _run_decode_wave
+    attention_results = await attention.decode_layer_batch.remote(prepared_items)
+ray.exceptions.RayTaskError(RuntimeError): [36mray::AttentionNode.decode_layer_batch()[39m (pid=308465, ip=192.168.123.7, actor_id=e0fe137d0905f67733a623a602000000, repr=<src.core.nodes.AttentionNode object at 0x7f162b397cd0>)
+  File "/home/cml/CloverInfer/src/core/resident_kv_store.py", line 4322, in qk_slot_scores_batch
+    dpu_outputs = self.helper.qk_slot_scores_batch([item["payload"] for item in ordered_entries])
+  File "/home/cml/CloverInfer/src/core/resident_kv_store.py", line 990, in qk_slot_scores_batch
+    out_args = struct.unpack("<IIII", self._read_exact(16))
+  File "/home/cml/CloverInfer/src/core/resident_kv_store.py", line 703, in _read_exact
+    raise RuntimeError(f"kvslot helper returned incomplete output: {stderr_text.strip()}")
+RuntimeError: kvslot helper returned incomplete output: kvslot slim QK slot helper does not support command 9; rebuild without KVSLOT_SLIM_QK_SLOT_ONLY for standalone QK/AV or grouped legacy paths
+
+During handling of the above exception, another exception occurred:
+
+[36mray::AttentionNode.decode_layer_batch()[39m (pid=308465, ip=192.168.123.7, actor_id=e0fe137d0905f67733a623a602000000, repr=<src.core.nodes.AttentionNode object at 0x7f162b397cd0>)
+  File "/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py", line 451, in result
+    return self.__get_result()
+  File "/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py", line 403, in __get_result
+    raise self._exception
+  File "/home/cml/CloverInfer/src/core/nodes.py", line 540, in decode_layer_batch
+    return await self._execute_rankset_task_graph_batch(payloads)
+  File "/home/cml/CloverInfer/src/core/nodes.py", line 223, in _execute_rankset_task_graph_batch
+    return self._fallback_rankset_execution(
+  File "/home/cml/CloverInfer/src/core/nodes.py", line 186, in _fallback_rankset_execution
+    contexts = self.backend.decode_layer_batch(payloads)
+  File "/home/cml/CloverInfer/src/core/clover_attention_backend.py", line 909, in decode_layer_batch
+    self._apply_qk_full_batch(records)
+  File "/home/cml/CloverInfer/src/core/clover_attention_backend.py", line 981, in _apply_qk_full_batch
+    keys, values = self._materialize_layer_kv(
+  File "/home/cml/CloverInfer/src/core/attention_backend.py", line 2424, in _materialize_layer_kv
+    materialized_groups = [
+  File "/home/cml/CloverInfer/src/core/attention_backend.py", line 2425, in <listcomp>
+    self.resident_store.materialize_group(group.k_slot, group.v_slot)
+  File "/home/cml/CloverInfer/src/core/resident_kv_store.py", line 3843, in materialize_group
+    k, v, info = self.helper.materialize_group(int(block["slot_id"]))
+  File "/home/cml/CloverInfer/src/core/resident_kv_store.py", line 770, in materialize_group
+    self._write(header)
+  File "/home/cml/CloverInfer/src/core/resident_kv_store.py", line 680, in _write
+    proc = self._ensure_proc()
+  File "/home/cml/CloverInfer/src/core/resident_kv_store.py", line 597, in _ensure_proc
+    raise RuntimeError(
+RuntimeError: kvslot helper exited while persistent DPU state was active:
+[33m(raylet, ip=192.168.123.7)[0m Python patch version mismatch: The cluster was started with:[32m [repeated 2x across cluster][0m
+[33m(raylet, ip=192.168.123.7)[0m     Ray: 2.53.0[32m [repeated 4x across cluster][0m
+[33m(raylet, ip=192.168.123.7)[0m     Python: 3.10.20[32m [repeated 4x across cluster][0m
+[33m(raylet, ip=192.168.123.7)[0m This process on node 192.168.123.7 was started with:[32m [repeated 2x across cluster][0m
