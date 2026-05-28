@@ -811,6 +811,24 @@ class GlobalScheduler:
             "allocator_stats_refreshes": int(self._capacity_aware_allocator_stats_refreshes),
         }
 
+    def _capacity_aware_effective_max_tokens_per_dpu(self) -> int:
+        configured = int(self.clover_capacity_aware_max_tokens_per_dpu)
+        if configured > 0:
+            return configured
+        if not self._capacity_aware_allocator_stats_cache:
+            return 0
+        free_values = [
+            int(item.get("total_free_elems", item.get("largest_free_range", 0)) or 0)
+            for item in self._capacity_aware_allocator_stats_cache
+            if int(item.get("dpu_id", -1)) >= 0
+        ]
+        positive_free = [value for value in free_values if value > 0]
+        if not positive_free:
+            return 0
+        head_dim = max(1, int(getattr(self.model_config, "hidden_size", 0)) // max(1, int(self.model_config.num_heads)))
+        elems_per_token = max(1, 2 * int(head_dim))
+        return max(1, min(positive_free) // elems_per_token)
+
     def _decode_batch_candidate_score(
         self,
         seed_state: Dict[str, object],
@@ -865,7 +883,7 @@ class GlobalScheduler:
         if self.clover_capacity_aware_batching_enabled and self._capacity_aware_scheduler is not None:
             queue_items = list(self._decode_pending_queue)
             request_views = [self._capacity_aware_request_view(state) for state in queue_items]
-            max_capacity = self.clover_capacity_aware_max_tokens_per_dpu
+            max_capacity = self._capacity_aware_effective_max_tokens_per_dpu()
             if max_capacity > 0:
                 try:
                     decision = self._capacity_aware_scheduler.build_micro_batch(
@@ -1625,6 +1643,7 @@ class GlobalScheduler:
                 "capacity_aware_time_gap_threshold": float(self.clover_capacity_aware_time_gap_threshold),
                 "capacity_aware_lookahead_window": int(self.clover_capacity_aware_lookahead_window),
                 "capacity_aware_max_tokens_per_dpu": int(self.clover_capacity_aware_max_tokens_per_dpu),
+                "capacity_aware_effective_max_tokens_per_dpu": int(self._capacity_aware_effective_max_tokens_per_dpu()),
                 "capacity_aware_require_slot_headroom": bool(self.clover_capacity_aware_require_slot_headroom),
                 "capacity_aware_allocator_stats_cached": int(len(self._capacity_aware_allocator_stats_cache)),
                 "capacity_aware_allocator_stats_refreshes": int(self._capacity_aware_allocator_stats_refreshes),

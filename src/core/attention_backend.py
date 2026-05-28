@@ -10,7 +10,7 @@ from typing import Dict, List, Sequence, Tuple
 
 import torch
 
-from .clover_planner import plan_sharding
+from .clover_planner import DynamicTokenMetadata, HeadRange, RequestShard, TokenRange, plan_sharding
 from .resident_kv_store import (
     HostResidentKVStore,
     SUPPORTED_RESIDENT_KV_DTYPES,
@@ -79,6 +79,7 @@ class HeadGroupState:
     k_slot: str
     v_slot: str
     physical_dpus: List[int] | None = None
+    allowed_physical_dpus: List[int] | None = None
     token_segments: List[Dict[str, int]] | None = None
     kv_head_start: int | None = None
     kv_head_end: int | None = None
@@ -134,6 +135,7 @@ class RequestState:
     last_stripe_update_reason: str = ""
     last_stripe_width: int = 0
     logical_context_len: int = 0
+    dynamic_metadata: DynamicTokenMetadata | None = None
 
 
 class CpuAttentionBackend:
@@ -446,6 +448,7 @@ class PimNaiveAttentionBackend:
         else:
             raise ValueError(f"Unsupported resident store backend: {resident_store_backend}")
         self.request_states: Dict[str, RequestState] = {}
+        self.dynamic_sharding_tables: Dict[str, DynamicTokenMetadata] = {}
         self.last_freed_request_id = ""
         self.resident_append_ops = 0
         self.resident_materialize_ops = 0
@@ -631,6 +634,10 @@ class PimNaiveAttentionBackend:
         return {
             "dpu_id": int(group.dpu_id),
             "physical_dpus": [int(physical_dpu) for physical_dpu in list(group.physical_dpus or [group.dpu_id])],
+            "allowed_physical_dpus": [
+                int(physical_dpu)
+                for physical_dpu in list(group.allowed_physical_dpus or group.physical_dpus or [group.dpu_id])
+            ],
             "heads": [int(group.head_start), int(group.head_end)],
             "group_heads": int(group.group_heads),
             "kv_heads": [int(group.slot_head_start), int(group.slot_head_end)],
@@ -650,6 +657,116 @@ class PimNaiveAttentionBackend:
             ],
             "resident_slot": self.resident_store.slot_debug(group.k_slot, group.v_slot),
         }
+
+    def _refresh_group_metadata_from_store(self, group: HeadGroupState) -> None:
+        slot_debug = self.resident_store.slot_debug(group.k_slot, group.v_slot)
+        slot_segments = list(slot_debug.get("segments", []) or [])
+        group.seq_len = int(slot_debug.get("seq_len", group.seq_len))
+        group.capacity = int(slot_debug.get("capacity", group.capacity))
+        if slot_segments:
+            allowed_dpus = list(slot_debug.get("allowed_physical_dpus", []) or [])
+            group.allowed_physical_dpus = [int(dpu) for dpu in allowed_dpus] if allowed_dpus else None
+            group.physical_dpus = sorted(
+                {
+                    int(segment.get("physical_dpu", group.dpu_id))
+                    for segment in slot_segments
+                }
+            )
+            group.token_segments = [
+                {
+                    "physical_dpu": int(segment.get("physical_dpu", group.dpu_id)),
+                    "token_range_start": int(segment.get("token_range_start", segment.get("token_start", 0))),
+                    "token_range_end": int(segment.get("token_range_end", segment.get("token_end", 0))),
+                }
+                for segment in slot_segments
+            ]
+
+    def _refresh_dynamic_metadata_from_layers(self, request_state: RequestState) -> None:
+        metadata = request_state.dynamic_metadata
+        if metadata is None:
+            return
+        tracked_request_id = str(request_state.request_id)
+        for request_map in metadata.range_table.values():
+            request_map.pop(tracked_request_id, None)
+        for layer_state in request_state.layer_states[:1]:
+            for head_id, group in enumerate(layer_state.head_groups):
+                shards = []
+                placement_pool = list(group.allowed_physical_dpus or group.physical_dpus or [group.dpu_id])
+                metadata.dpu_groups[int(head_id)] = [int(dpu) for dpu in placement_pool]
+                metadata.head_group_ranges[int(head_id)] = HeadRange(
+                    start=int(group.head_start),
+                    end=int(group.head_end),
+                )
+                for segment in list(group.token_segments or []):
+                    start = int(segment.get("token_range_start", 0))
+                    end = int(segment.get("token_range_end", 0))
+                    if end <= start:
+                        continue
+                    head_range = metadata.head_group_ranges.get(int(head_id))
+                    if head_range is None:
+                        continue
+                    shards.append(
+                        RequestShard(
+                            request_id=str(request_state.request_id),
+                            head_id=int(head_id),
+                            head_range=head_range,
+                            dpu_id=int(segment.get("physical_dpu", group.dpu_id)),
+                            token_range=TokenRange(start, end),
+                        )
+                    )
+                request_map = metadata.range_table.setdefault(int(head_id), {})
+                if shards:
+                    request_map[tracked_request_id] = shards
+                else:
+                    request_map.pop(tracked_request_id, None)
+        metadata.recompute_counts()
+
+    def _maybe_rebalance_dynamic_metadata(self, request_state: RequestState) -> None:
+        metadata = request_state.dynamic_metadata
+        if metadata is None:
+            return
+        migrations = []
+        if not request_state.layer_states:
+            return
+        layer0 = request_state.layer_states[0]
+        for head_id, layer0_group in enumerate(layer0.head_groups):
+            head_migrations = []
+            for layer_state in request_state.layer_states:
+                if head_id >= len(layer_state.head_groups):
+                    continue
+                group = layer_state.head_groups[head_id]
+                allowed_dpus = list(
+                    group.allowed_physical_dpus
+                    or layer0_group.allowed_physical_dpus
+                    or group.physical_dpus
+                    or layer0_group.physical_dpus
+                    or request_state.preferred_dpu_stripe
+                )
+                migration = self.resident_store.rebalance_group_if_needed(
+                    group.k_slot,
+                    group.v_slot,
+                    threshold=float(metadata.rebalance_threshold),
+                    allowed_dpus=allowed_dpus or None,
+                )
+                if bool(migration.get("migrated", False)):
+                    migration = dict(migration)
+                    migration["head_id"] = int(head_id)
+                    migration["layer_idx"] = int(layer_state.layer_idx)
+                    head_migrations.append(migration)
+                    self._refresh_group_metadata_from_store(group)
+            if head_migrations:
+                head_summary = dict(head_migrations[0])
+                head_summary["layer_migrations"] = head_migrations
+                migrations.append(head_summary)
+        if not migrations:
+            self._refresh_dynamic_metadata_from_layers(request_state)
+            return
+        self._refresh_dynamic_metadata_from_layers(request_state)
+        for migration in migrations:
+            metadata.migrations.append(dict(migration))
+        request_state.sharding_plan = dict(request_state.sharding_plan or {})
+        request_state.sharding_plan["dynamic_metadata"] = metadata.to_dict()
+        request_state.sharding_plan["last_rebalance"] = migrations[-1]
 
     def _layer_footprint_summary(self, layer_state: LayerState) -> Dict[str, object]:
         live_elems = sum(group.live_elems for group in layer_state.head_groups)
@@ -697,6 +814,11 @@ class PimNaiveAttentionBackend:
             "per_dpu_live_elems": per_dpu_live_elems,
             "per_dpu_capacity_elems": per_dpu_capacity_elems,
             "layers": layer_summaries,
+            "dynamic_sharding_metadata": (
+                request_state.dynamic_metadata.to_dict()
+                if request_state.dynamic_metadata is not None
+                else None
+            ),
         }
 
     def _request_packing_hint(self, request_state: RequestState) -> Dict[str, object]:
@@ -744,6 +866,10 @@ class PimNaiveAttentionBackend:
                         "slot_group_heads": int(group.slot_group_heads),
                         "physical_dpu": int(group.dpu_id),
                         "physical_dpus": [int(physical_dpu) for physical_dpu in group_physical_dpus],
+                        "allowed_physical_dpus": [
+                            int(physical_dpu)
+                            for physical_dpu in list(group.allowed_physical_dpus or group_physical_dpus)
+                        ],
                         "token_segments": [
                             {
                                 "physical_dpu": int(segment.get("physical_dpu", group.dpu_id)),
@@ -785,6 +911,10 @@ class PimNaiveAttentionBackend:
                             ),
                             "physical_dpu": int(group["physical_dpu"]),
                             "physical_dpus": [int(physical_dpu) for physical_dpu in list(group.get("physical_dpus", []) or [])],
+                            "allowed_physical_dpus": [
+                                int(physical_dpu)
+                                for physical_dpu in list(group.get("allowed_physical_dpus", group.get("physical_dpus", [])) or [])
+                            ],
                             "token_segments": [
                                 {
                                     "physical_dpu": int(segment.get("physical_dpu", group["physical_dpu"])),
@@ -833,6 +963,8 @@ class PimNaiveAttentionBackend:
         }
         if request_state.sharding_plan:
             hint["sharding_plan"] = dict(request_state.sharding_plan)
+            if request_state.dynamic_metadata is not None:
+                hint["dynamic_sharding_metadata"] = request_state.dynamic_metadata.to_dict()
             hint["planner_mode"] = str(
                 dict(request_state.sharding_plan.get("metadata", {}) or {}).get("planner_mode", "")
             )
@@ -886,6 +1018,16 @@ class PimNaiveAttentionBackend:
 
     def _planner_metadata(self, sharding_plan: Dict[str, object] | None) -> Dict[str, object]:
         return dict((sharding_plan or {}).get("metadata", {}) or {})
+
+    def _current_dpu_free_capacity_hint(self) -> Dict[int, int]:
+        live_elems = getattr(self.resident_store, "dpu_live_elems_by_dpu", None)
+        pool_capacity = int(getattr(self.resident_store, "POOL_CAPACITY_ELEMS", 0) or 0)
+        if not isinstance(live_elems, list) or pool_capacity <= 0:
+            return {}
+        return {
+            int(dpu_id): max(0, pool_capacity - int(value))
+            for dpu_id, value in enumerate(live_elems)
+        }
 
     def _normalize_physical_dpu_list(self, physical_dpus: Sequence[int] | None) -> List[int]:
         if self.num_dpus <= 0:
@@ -1679,6 +1821,7 @@ class PimNaiveAttentionBackend:
                     k_slot=k_slot,
                     v_slot=v_slot,
                     physical_dpus=group_physical_dpus,
+                    allowed_physical_dpus=[int(dpu) for dpu in list(allowed_dpus or preferred_dpu_stripe)],
                     token_segments=[
                         {
                             "physical_dpu": int(segment.get("physical_dpu", group_physical_dpus[0])),
@@ -2265,7 +2408,9 @@ class PimNaiveAttentionBackend:
             [{"request_id": str(request_id), "seq_len": int(context_len)}],
             D=max(1, int(self.num_dpus)),
             H=max(1, first_num_kv_heads),
+            dpu_free_capacity=self._current_dpu_free_capacity_hint(),
         )
+        dynamic_metadata = DynamicTokenMetadata.from_plan(sharding_plan)
         preferred_dpu_stripe = self._preferred_dpu_stripe_for_request(
             request_id,
             initial_kv,
@@ -2273,6 +2418,7 @@ class PimNaiveAttentionBackend:
             sharding_plan=sharding_plan,
             logical_context_len=logical_len,
         )
+        self.dynamic_sharding_tables[str(request_id)] = dynamic_metadata
         for layer_idx, layer in enumerate(initial_kv):
             layer_key = layer["key"].detach().cpu().contiguous()
             if layer_key.dim() != 3:
@@ -2314,7 +2460,7 @@ class PimNaiveAttentionBackend:
                 )
             )
 
-        return RequestState(
+        request_state = RequestState(
             request_id=request_id,
             context_len=context_len,
             num_layers=len(layer_states),
@@ -2326,7 +2472,10 @@ class PimNaiveAttentionBackend:
             last_stripe_update_reason="init",
             last_stripe_width=len(preferred_dpu_stripe),
             logical_context_len=logical_len,
+            dynamic_metadata=dynamic_metadata,
         )
+        self._refresh_dynamic_metadata_from_layers(request_state)
+        return request_state
 
     def _append_resident_kv(
         self,
@@ -2339,27 +2488,6 @@ class PimNaiveAttentionBackend:
             self._maybe_expand_request_stripe(request_state)
         layer_state = request_state.layer_states[layer_idx]
         expected_seq_len = request_state.context_len + 1
-
-        def _refresh_group_metadata(group: HeadGroupState, append_info: Dict[str, int]) -> None:
-            group.seq_len = int(append_info["seq_len"])
-            group.capacity = int(append_info["capacity"])
-            slot_debug = self.resident_store.slot_debug(group.k_slot, group.v_slot)
-            slot_segments = list(slot_debug.get("segments", []) or [])
-            if slot_segments:
-                group.physical_dpus = sorted(
-                    {
-                        int(segment.get("physical_dpu", group.dpu_id))
-                        for segment in slot_segments
-                    }
-                )
-                group.token_segments = [
-                    {
-                        "physical_dpu": int(segment.get("physical_dpu", group.dpu_id)),
-                        "token_range_start": int(segment.get("token_range_start", 0)),
-                        "token_range_end": int(segment.get("token_range_end", 0)),
-                    }
-                    for segment in slot_segments
-                ]
 
         for group in layer_state.head_groups:
             if group.seq_len != request_state.context_len:
@@ -2394,7 +2522,9 @@ class PimNaiveAttentionBackend:
                     group_k_new,
                     group_v_new,
                 )
-            _refresh_group_metadata(group, append_info)
+            group.seq_len = int(append_info["seq_len"])
+            group.capacity = int(append_info["capacity"])
+            self._refresh_group_metadata_from_store(group)
             if group.seq_len != expected_seq_len:
                 raise RuntimeError(
                     f"resident store seq_len mismatch after append for request={request_state.request_id} "
@@ -2408,6 +2538,9 @@ class PimNaiveAttentionBackend:
                 request_state.logical_context_len = int(request_state.context_len)
             request_state.logical_context_len = int(request_state.logical_context_len) + 1
             request_state.context_len = expected_seq_len
+        if layer_idx == request_state.num_layers - 1:
+            self._refresh_dynamic_metadata_from_layers(request_state)
+            self._maybe_rebalance_dynamic_metadata(request_state)
 
     def _materialize_layer_kv(self, request_state: RequestState, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         layer_state = request_state.layer_states[layer_idx]
@@ -3180,7 +3313,12 @@ class PimNaiveAttentionBackend:
     def free_request(self, request_id: str) -> None:
         self.cpu_backend.free_request(request_id)
         request_state = self.request_states.pop(request_id, None)
+        metadata = self.dynamic_sharding_tables.pop(str(request_id), None)
+        if metadata is not None:
+            metadata.release_request(str(request_id))
         if request_state is not None:
+            if request_state.dynamic_metadata is not None:
+                request_state.dynamic_metadata.release_request(str(request_id))
             for layer_state in request_state.layer_states:
                 for group in layer_state.head_groups:
                     self.resident_store.free_group(group.k_slot, group.v_slot)
@@ -3285,6 +3423,11 @@ class PimNaiveAttentionBackend:
             "expected_decode_batch_max_size": int(self.expected_decode_batch_max_size),
             "sparse_tail_last_stripe_policy": dict(self.sparse_tail_last_stripe_policy),
             "resident_request_count": len(self.request_states),
+            "dynamic_sharding_table_count": len(self.dynamic_sharding_tables),
+            "dynamic_sharding_tables": {
+                str(request_id): metadata.to_dict()
+                for request_id, metadata in self.dynamic_sharding_tables.items()
+            },
             "resident_last_freed_request_id": self.last_freed_request_id,
             "resident_append_ops": self.resident_append_ops,
             "resident_materialize_ops": self.resident_materialize_ops,

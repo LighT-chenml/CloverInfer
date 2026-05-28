@@ -5,7 +5,7 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from src.core.clover_planner import plan_sharding, update_sharding
+from src.core.clover_planner import DynamicTokenMetadata, plan_sharding, update_sharding
 
 
 def test_plan_sharding_balances_loads():
@@ -57,3 +57,40 @@ def test_plan_sharding_supports_fewer_dpus_than_heads():
         assert len(shards) == 1
         assert shards[0]["group_heads"] == head_range["group_heads"]
     assert total_group_heads == 12
+
+
+def test_plan_sharding_prefill_uses_capacity_hints():
+    plan = plan_sharding(
+        [{"request_id": "r0", "seq_len": 12}],
+        D=4,
+        H=1,
+        dpu_free_capacity={0: 1, 1: 1, 2: 20, 3: 2},
+    )
+    shards = plan["per_head_shards"][0]["r0"]
+    widest = max(shards, key=lambda item: int(item["token_count"]))
+    assert plan["metadata"]["capacity_aware_prefill"] is True
+    assert widest["dpu_id"] == 2
+
+
+def test_dynamic_metadata_tracks_decode_release_and_rebalance():
+    plan = plan_sharding([{"request_id": "r0", "seq_len": 8}], D=4, H=1)
+    metadata = DynamicTokenMetadata.from_plan(plan)
+    assert metadata.group_counts(0) == {0: 2, 1: 2, 2: 2, 3: 2}
+
+    appended = metadata.append_decode_token("r0", 0, token_idx=8)
+    assert appended.token_range.end == 9
+    assert sum(metadata.group_counts(0).values()) == 9
+
+    metadata.range_table[0]["r0"] = [
+        shard
+        for shard in metadata.range_table[0]["r0"]
+        if int(shard.dpu_id) == 0
+    ]
+    metadata.recompute_counts()
+    before = metadata.imbalance_cv(0)
+    migration = metadata.rebalance_once(0, threshold=0.1)
+    assert migration["migrated"] is True
+    assert metadata.imbalance_cv(0) < before
+
+    metadata.release_request("r0")
+    assert sum(metadata.group_counts(0).values()) == 0

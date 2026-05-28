@@ -223,6 +223,73 @@ def test_request_state_materializes_planner_token_segments_for_multi_dpu_group()
         (6, 8),
         (8, 10),
     ]
+    assert state.dynamic_metadata is not None
+    assert sorted(state.dynamic_metadata.group_counts(0).values()) == [2, 2, 3, 3]
+
+
+def test_host_store_rebalances_skewed_token_segments():
+    store = HostResidentKVStore()
+    keys = torch.randn(16, 1, 4)
+    values = torch.randn(16, 1, 4)
+    store.allocate_group(
+        "k",
+        "v",
+        keys,
+        values,
+        capacity=16,
+        preferred_dpu=0,
+        allowed_dpus=[0, 1, 2, 3],
+        segment_plan=[
+            {"dpu_id": 0, "token_range_start": 0, "token_range_end": 16},
+        ],
+    )
+
+    result = store.rebalance_group_if_needed(
+        "k",
+        "v",
+        threshold=0.1,
+        allowed_dpus=[0, 1, 2, 3],
+    )
+
+    assert result["migrated"] is True
+    assert result["from_dpu"] == 0
+    assert result["to_dpu"] in {1, 2, 3}
+    assert result["cv_after"] < result["cv_before"]
+    debug = store.slot_debug("k", "v")
+    assert sum(item["seq_len"] for item in debug["segments"]) == 16
+    assert len({item["physical_dpu"] for item in debug["segments"]}) == 2
+
+
+def test_append_rebalance_updates_dynamic_metadata_and_store_segments():
+    backend = _PlannerOnlyBackend(
+        num_dpus=4,
+        resident_store_backend="host",
+        head_grouping_policy="balanced",
+    )
+    state = backend._build_request_state(
+        "req_rebalance",
+        _dummy_initial_kv(seq_len=8, num_heads=2, head_dim=4, num_layers=1),
+        decode_reserve_tokens=2,
+    )
+    group = state.layer_states[0].head_groups[0]
+    slot = backend.resident_store.groups[(group.k_slot, group.v_slot)]
+    slot.segments = [type(slot.segments[0])(physical_dpu=0, token_start=0, token_end=8)]
+    backend._refresh_group_metadata_from_store(group)
+    backend._refresh_dynamic_metadata_from_layers(state)
+
+    backend._append_resident_kv(
+        state,
+        0,
+        torch.randn(2, 4),
+        torch.randn(2, 4),
+    )
+
+    assert state.dynamic_metadata is not None
+    assert state.dynamic_metadata.migrations
+    debug = backend.resident_store.slot_debug(group.k_slot, group.v_slot)
+    assert sum(item["seq_len"] for item in debug["segments"]) == 9
+    assert len({item["physical_dpu"] for item in debug["segments"]}) >= 2
+    assert max(state.dynamic_metadata.group_counts(0).values()) < 9
 
 
 def test_resident_append_recovers_group_failure_without_seq_len_skew():

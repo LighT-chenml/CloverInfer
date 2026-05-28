@@ -11,7 +11,7 @@ import struct
 import subprocess
 import sys
 import time
-from typing import Dict, List
+from typing import Dict, List, Mapping, Sequence
 
 import torch
 
@@ -434,6 +434,7 @@ class _HostKVSlot:
     group_heads: int
     head_dim: int
     segments: List[_TokenSegmentSpec]
+    allowed_dpus: List[int] | None = None
 
 
 @dataclass(frozen=True)
@@ -530,6 +531,21 @@ class ResidentKVStore:
     ) -> Dict[str, object]:
         return {
             "updated": False,
+            "allowed_dpus": [] if allowed_dpus is None else [int(dpu) for dpu in allowed_dpus],
+        }
+
+    def rebalance_group_if_needed(
+        self,
+        k_slot: str,
+        v_slot: str,
+        *,
+        threshold: float = 0.3,
+        allowed_dpus: list[int] | None = None,
+    ) -> Dict[str, object]:
+        return {
+            "migrated": False,
+            "reason": "unsupported",
+            "threshold": float(threshold),
             "allowed_dpus": [] if allowed_dpus is None else [int(dpu) for dpu in allowed_dpus],
         }
 
@@ -1646,6 +1662,7 @@ class HostResidentKVStore(ResidentKVStore):
             group_heads=group_heads,
             head_dim=head_dim,
             segments=list(segment_specs),
+            allowed_dpus=None if allowed_dpus is None else [int(dpu) for dpu in allowed_dpus],
         )
         self.groups[key] = slot
         self.total_allocations += 1
@@ -1763,6 +1780,7 @@ class HostResidentKVStore(ResidentKVStore):
                 }
                 for spec in slot.segments
             ],
+            "allowed_physical_dpus": [] if slot.allowed_dpus is None else [int(dpu) for dpu in slot.allowed_dpus],
         }
 
     def free_group(self, k_slot: str, v_slot: str) -> None:
@@ -1796,10 +1814,167 @@ class HostResidentKVStore(ResidentKVStore):
         v_slot: str,
         allowed_dpus: list[int] | None,
     ) -> Dict[str, object]:
-        del k_slot, v_slot
+        key = self._slot_key(k_slot, v_slot)
+        if key in self.groups:
+            self.groups[key].allowed_dpus = None if allowed_dpus is None else [int(dpu) for dpu in allowed_dpus]
+            return {
+                "updated": True,
+                "allowed_dpus": [] if allowed_dpus is None else [int(dpu) for dpu in allowed_dpus],
+            }
         return {
             "updated": False,
             "allowed_dpus": [] if allowed_dpus is None else [int(dpu) for dpu in allowed_dpus],
+        }
+
+    @staticmethod
+    def _segment_counts_by_dpu(
+        segments: Sequence[_TokenSegmentSpec],
+        allowed_dpus: list[int] | None = None,
+    ) -> Dict[int, int]:
+        if allowed_dpus:
+            counts = {int(dpu): 0 for dpu in allowed_dpus}
+        else:
+            counts = {int(segment.physical_dpu): 0 for segment in segments}
+        for segment in segments:
+            physical_dpu = int(segment.physical_dpu)
+            if physical_dpu not in counts:
+                continue
+            counts[physical_dpu] += int(segment.token_count)
+        return counts
+
+    @staticmethod
+    def _coalesce_segments(segments: Sequence[_TokenSegmentSpec]) -> List[_TokenSegmentSpec]:
+        ordered = sorted(
+            [segment for segment in segments if segment.token_count > 0],
+            key=lambda segment: (int(segment.token_start), int(segment.token_end), int(segment.physical_dpu)),
+        )
+        coalesced: List[_TokenSegmentSpec] = []
+        for segment in ordered:
+            if (
+                coalesced
+                and int(coalesced[-1].physical_dpu) == int(segment.physical_dpu)
+                and int(coalesced[-1].token_end) == int(segment.token_start)
+            ):
+                previous = coalesced[-1]
+                coalesced[-1] = _TokenSegmentSpec(
+                    physical_dpu=int(previous.physical_dpu),
+                    token_start=int(previous.token_start),
+                    token_end=int(segment.token_end),
+                )
+                continue
+            coalesced.append(segment)
+        return coalesced
+
+    def rebalance_group_if_needed(
+        self,
+        k_slot: str,
+        v_slot: str,
+        *,
+        threshold: float = 0.3,
+        allowed_dpus: list[int] | None = None,
+    ) -> Dict[str, object]:
+        key = self._slot_key(k_slot, v_slot)
+        if key not in self.groups:
+            return {
+                "migrated": False,
+                "reason": "unknown_slot",
+                "threshold": float(threshold),
+                "allowed_dpus": [] if allowed_dpus is None else [int(dpu) for dpu in allowed_dpus],
+            }
+
+        slot = self.groups[key]
+        if not slot.segments:
+            return {"migrated": False, "reason": "empty_segments", "threshold": float(threshold)}
+
+        if allowed_dpus is None and slot.allowed_dpus:
+            allowed_dpus = list(slot.allowed_dpus)
+        normalized_allowed = None
+        if allowed_dpus:
+            normalized_allowed = sorted({int(dpu) for dpu in allowed_dpus})
+        counts = self._segment_counts_by_dpu(slot.segments, normalized_allowed)
+        if len(counts) <= 1:
+            return {
+                "migrated": False,
+                "reason": "single_dpu_group",
+                "threshold": float(threshold),
+                "counts": {int(dpu): int(count) for dpu, count in counts.items()},
+            }
+        mean = sum(counts.values()) / float(len(counts))
+        if mean <= 0.0:
+            return {
+                "migrated": False,
+                "reason": "empty_group",
+                "threshold": float(threshold),
+                "counts": {int(dpu): int(count) for dpu, count in counts.items()},
+            }
+        variance = sum((float(value) - mean) ** 2.0 for value in counts.values()) / float(len(counts))
+        cv_before = math.sqrt(variance) / mean
+        if cv_before <= float(threshold):
+            return {
+                "migrated": False,
+                "reason": "below_threshold",
+                "threshold": float(threshold),
+                "cv": float(cv_before),
+                "counts": {int(dpu): int(count) for dpu, count in counts.items()},
+            }
+
+        src_dpu = max(counts, key=lambda dpu: (int(counts[dpu]), -int(dpu)))
+        dst_dpu = min(counts, key=lambda dpu: (int(counts[dpu]), int(dpu)))
+        move_tokens = max(1, (int(counts[src_dpu]) - int(counts[dst_dpu])) // 2)
+        source_candidates = [
+            (idx, segment)
+            for idx, segment in enumerate(slot.segments)
+            if int(segment.physical_dpu) == int(src_dpu) and int(segment.token_count) > 1
+        ]
+        if not source_candidates:
+            return {
+                "migrated": False,
+                "reason": "no_splittable_range",
+                "threshold": float(threshold),
+                "cv": float(cv_before),
+                "counts": {int(dpu): int(count) for dpu, count in counts.items()},
+            }
+
+        source_idx, source_segment = max(
+            source_candidates,
+            key=lambda item: (int(item[1].token_count), int(item[1].token_end)),
+        )
+        take = min(int(move_tokens), int(source_segment.token_count) - 1)
+        moved_start = int(source_segment.token_end) - int(take)
+        kept = _TokenSegmentSpec(
+            physical_dpu=int(source_segment.physical_dpu),
+            token_start=int(source_segment.token_start),
+            token_end=int(moved_start),
+        )
+        moved = _TokenSegmentSpec(
+            physical_dpu=int(dst_dpu),
+            token_start=int(moved_start),
+            token_end=int(source_segment.token_end),
+        )
+        slot.segments[source_idx:source_idx + 1] = [kept, moved]
+        slot.segments = self._coalesce_segments(slot.segments)
+
+        counts_after = self._segment_counts_by_dpu(slot.segments, normalized_allowed)
+        mean_after = sum(counts_after.values()) / float(len(counts_after)) if counts_after else 0.0
+        cv_after = 0.0
+        if mean_after > 0.0:
+            variance_after = sum(
+                (float(value) - mean_after) ** 2.0 for value in counts_after.values()
+            ) / float(len(counts_after))
+            cv_after = math.sqrt(variance_after) / mean_after
+        return {
+            "migrated": True,
+            "storage": self.backend_name,
+            "from_dpu": int(src_dpu),
+            "to_dpu": int(dst_dpu),
+            "token_range_start": int(moved.token_start),
+            "token_range_end": int(moved.token_end),
+            "moved_tokens": int(moved.token_count),
+            "cv_before": float(cv_before),
+            "cv_after": float(cv_after),
+            "threshold": float(threshold),
+            "counts_before": {int(dpu): int(count) for dpu, count in counts.items()},
+            "counts_after": {int(dpu): int(count) for dpu, count in counts_after.items()},
         }
 
     def qk_scores_batch(self, queries: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
@@ -3102,6 +3277,156 @@ class UpmemKVSlotStore(ResidentKVStore):
     def _blocked_slot_blocks(self, slot_info: Dict[str, object]) -> list[Dict[str, object]]:
         return list(slot_info.get("blocks", slot_info.get("segments", [])))
 
+    @staticmethod
+    def _block_counts_by_dpu(
+        blocks: Sequence[Dict[str, object]],
+        allowed_dpus: list[int] | None = None,
+    ) -> Dict[int, int]:
+        if allowed_dpus:
+            counts = {int(dpu): 0 for dpu in allowed_dpus}
+        else:
+            counts = {int(block.get("physical_dpu", 0)): 0 for block in blocks}
+        for block in blocks:
+            physical_dpu = int(block.get("physical_dpu", 0))
+            if physical_dpu not in counts:
+                continue
+            start = int(block.get("token_range_start", 0))
+            end = int(block.get("token_range_end", start + int(block.get("seq_len", 0))))
+            counts[physical_dpu] += max(0, end - start)
+        return counts
+
+    @staticmethod
+    def _counts_cv(counts: Mapping[int, int]) -> float:
+        values = [int(value) for value in counts.values()]
+        if not values:
+            return 0.0
+        mean = sum(values) / float(len(values))
+        if mean <= 0.0:
+            return 0.0
+        variance = sum((float(value) - mean) ** 2.0 for value in values) / float(len(values))
+        return math.sqrt(variance) / mean
+
+    def _rebalance_segment_plan_from_blocks(
+        self,
+        blocks: Sequence[Dict[str, object]],
+        *,
+        threshold: float,
+        allowed_dpus: list[int] | None = None,
+    ) -> tuple[list[Dict[str, int]], Dict[str, object]]:
+        normalized_allowed = None
+        if allowed_dpus:
+            normalized_allowed = sorted({int(dpu) % max(self.num_dpus, 1) for dpu in allowed_dpus})
+        counts = self._block_counts_by_dpu(blocks, normalized_allowed)
+        if len(counts) <= 1:
+            return (
+                [],
+                {
+                    "migrated": False,
+                    "reason": "single_dpu_group",
+                    "threshold": float(threshold),
+                    "counts": {int(dpu): int(count) for dpu, count in counts.items()},
+                },
+            )
+        cv_before = self._counts_cv(counts)
+        if cv_before <= float(threshold):
+            return (
+                [],
+                {
+                    "migrated": False,
+                    "reason": "below_threshold",
+                    "threshold": float(threshold),
+                    "cv": float(cv_before),
+                    "counts": {int(dpu): int(count) for dpu, count in counts.items()},
+                },
+            )
+
+        src_dpu = max(counts, key=lambda dpu: (int(counts[dpu]), -int(dpu)))
+        dst_dpu = min(counts, key=lambda dpu: (int(counts[dpu]), int(dpu)))
+        move_tokens = max(1, (int(counts[src_dpu]) - int(counts[dst_dpu])) // 2)
+        source_candidates = []
+        for idx, block in enumerate(blocks):
+            physical_dpu = int(block.get("physical_dpu", 0))
+            if physical_dpu != int(src_dpu):
+                continue
+            start = int(block.get("token_range_start", 0))
+            end = int(block.get("token_range_end", start + int(block.get("seq_len", 0))))
+            if end - start > 1:
+                source_candidates.append((idx, block, start, end))
+        if not source_candidates:
+            return (
+                [],
+                {
+                    "migrated": False,
+                    "reason": "no_splittable_range",
+                    "threshold": float(threshold),
+                    "cv": float(cv_before),
+                    "counts": {int(dpu): int(count) for dpu, count in counts.items()},
+                },
+            )
+
+        source_idx, _source_block, source_start, source_end = max(
+            source_candidates,
+            key=lambda item: (int(item[3] - item[2]), int(item[3])),
+        )
+        take = min(int(move_tokens), int(source_end - source_start) - 1)
+        moved_start = int(source_end) - int(take)
+        segment_plan: list[Dict[str, int]] = []
+        for idx, block in enumerate(blocks):
+            start = int(block.get("token_range_start", 0))
+            end = int(block.get("token_range_end", start + int(block.get("seq_len", 0))))
+            physical_dpu = int(block.get("physical_dpu", 0))
+            if int(idx) == int(source_idx):
+                segment_plan.append(
+                    {
+                        "dpu_id": int(physical_dpu),
+                        "token_range_start": int(start),
+                        "token_range_end": int(moved_start),
+                    }
+                )
+                segment_plan.append(
+                    {
+                        "dpu_id": int(dst_dpu),
+                        "token_range_start": int(moved_start),
+                        "token_range_end": int(end),
+                    }
+                )
+                continue
+            segment_plan.append(
+                {
+                    "dpu_id": int(physical_dpu),
+                    "token_range_start": int(start),
+                    "token_range_end": int(end),
+                }
+            )
+        segment_plan = [item for item in segment_plan if int(item["token_range_end"]) > int(item["token_range_start"])]
+        counts_after = self._block_counts_by_dpu(
+            [
+                {
+                    "physical_dpu": int(item["dpu_id"]),
+                    "token_range_start": int(item["token_range_start"]),
+                    "token_range_end": int(item["token_range_end"]),
+                }
+                for item in segment_plan
+            ],
+            normalized_allowed,
+        )
+        return (
+            segment_plan,
+            {
+                "migrated": True,
+                "from_dpu": int(src_dpu),
+                "to_dpu": int(dst_dpu),
+                "token_range_start": int(moved_start),
+                "token_range_end": int(source_end),
+                "moved_tokens": int(source_end - moved_start),
+                "cv_before": float(cv_before),
+                "cv_after": float(self._counts_cv(counts_after)),
+                "threshold": float(threshold),
+                "counts_before": {int(dpu): int(count) for dpu, count in counts.items()},
+                "counts_after": {int(dpu): int(count) for dpu, count in counts_after.items()},
+            },
+        )
+
     def _normalize_token_segment_plan(
         self,
         *,
@@ -3952,6 +4277,182 @@ class UpmemKVSlotStore(ResidentKVStore):
             "seq_len": int(keys.shape[0]),
             "capacity": int(capacity),
         }
+
+    def rebalance_group_if_needed(
+        self,
+        k_slot: str,
+        v_slot: str,
+        *,
+        threshold: float = 0.3,
+        allowed_dpus: list[int] | None = None,
+    ) -> Dict[str, object]:
+        key = self._slot_key(k_slot, v_slot)
+        if key not in self.slot_mapping:
+            return {
+                "migrated": False,
+                "reason": "unknown_slot",
+                "threshold": float(threshold),
+                "allowed_dpus": [] if allowed_dpus is None else [int(dpu) for dpu in allowed_dpus],
+            }
+
+        slot_info = self.slot_mapping[key]
+        if slot_info["backend"] == "host_fallback":
+            result = self.host_fallback.rebalance_group_if_needed(
+                k_slot,
+                v_slot,
+                threshold=threshold,
+                allowed_dpus=allowed_dpus,
+            )
+            result["storage"] = "host_fallback"
+            return result
+
+        if slot_info["backend"] == "dpu":
+            current_dpu = int(slot_info.get("physical_dpu", 0)) % max(self.num_dpus, 1)
+            normalized_allowed = (
+                sorted({int(dpu) % max(self.num_dpus, 1) for dpu in allowed_dpus})
+                if allowed_dpus
+                else [current_dpu]
+            )
+            if len(normalized_allowed) <= 1:
+                return {
+                    "migrated": False,
+                    "reason": "single_dpu_group",
+                    "threshold": float(threshold),
+                    "allowed_dpus": normalized_allowed,
+                }
+            target_dpu = min(
+                normalized_allowed,
+                key=lambda physical_dpu: (
+                    int(self.dpu_live_elems_by_dpu[int(physical_dpu)]),
+                    int(physical_dpu),
+                ),
+            )
+            if int(target_dpu) == int(current_dpu):
+                return {
+                    "migrated": False,
+                    "reason": "already_least_loaded",
+                    "threshold": float(threshold),
+                    "allowed_dpus": normalized_allowed,
+                }
+            keys, values = self.materialize_group(k_slot, v_slot)
+            seq_len = int(keys.shape[0])
+            segment_plan = [
+                {
+                    "dpu_id": int(target_dpu),
+                    "token_range_start": 0,
+                    "token_range_end": int(seq_len),
+                }
+            ]
+            old_info = slot_info
+            temp_key = (
+                f"{key[0]}#rebalance{time.perf_counter_ns()}",
+                f"{key[1]}#rebalance{time.perf_counter_ns()}",
+            )
+            try:
+                new_info = self._allocate_segmented_group(
+                    key=temp_key,
+                    initial_k=keys,
+                    initial_v=values,
+                    capacity=max(int(old_info.get("capacity", seq_len)), seq_len, 1),
+                    physical_dpu=int(target_dpu),
+                    group_heads=int(old_info["group_heads"]),
+                    head_dim=int(old_info["head_dim"]),
+                    allowed_dpus=normalized_allowed,
+                    segment_plan=segment_plan,
+                )
+            except Exception as exc:
+                return {
+                    "migrated": False,
+                    "reason": "rebuild_failed",
+                    "backend": "dpu",
+                    "threshold": float(threshold),
+                    "error": str(exc),
+                }
+            old_slot_id = self._slot_id_map.pop(key, None)
+            try:
+                self.helper.free_group(int(old_info["slot_id"]))
+            except Exception:
+                pass
+            self.dpu_free_ops += 1
+            self.dpu_live_slots = max(0, self.dpu_live_slots - 1)
+            elem_count = int(old_info.get("elem_count", 0))
+            self.dpu_live_slot_counts_by_dpu[current_dpu] = max(
+                0,
+                self.dpu_live_slot_counts_by_dpu[current_dpu] - 1,
+            )
+            self.dpu_live_elems_by_dpu[current_dpu] = max(
+                0,
+                self.dpu_live_elems_by_dpu[current_dpu] - elem_count,
+            )
+            if old_slot_id is not None:
+                self._remember_free_slot_id(current_dpu, int(old_slot_id))
+            self.slot_mapping[key] = new_info
+            self.helper.persistent_state_active = self.dpu_live_slots > 0
+            return {
+                "migrated": True,
+                "storage": "dpu_segmented",
+                "from_dpu": int(current_dpu),
+                "to_dpu": int(target_dpu),
+                "token_range_start": 0,
+                "token_range_end": int(seq_len),
+                "moved_tokens": int(seq_len),
+                "threshold": float(threshold),
+                "reason": "single_slot_rerouted",
+            }
+
+        if slot_info["backend"] not in {"dpu_segmented", "dpu_blocked"}:
+            return {
+                "migrated": False,
+                "reason": "unsupported_backend",
+                "backend": str(slot_info.get("backend", "")),
+                "threshold": float(threshold),
+            }
+
+        blocks = list(slot_info.get("blocks", slot_info.get("segments", [])) or [])
+        normalized_allowed = (
+            sorted({int(dpu) % max(self.num_dpus, 1) for dpu in allowed_dpus})
+            if allowed_dpus
+            else [int(dpu) for dpu in list(slot_info.get("allowed_physical_dpus", []) or [])]
+        )
+        if not normalized_allowed:
+            normalized_allowed = sorted({int(block.get("physical_dpu", 0)) for block in blocks})
+        segment_plan, plan_result = self._rebalance_segment_plan_from_blocks(
+            blocks,
+            threshold=threshold,
+            allowed_dpus=normalized_allowed,
+        )
+        if not bool(plan_result.get("migrated", False)):
+            return plan_result
+
+        keys, values = self.materialize_group(k_slot, v_slot)
+        old_blocks = list(blocks)
+        old_info = slot_info
+        temp_key = (
+            f"{key[0]}#rebalance{time.perf_counter_ns()}",
+            f"{key[1]}#rebalance{time.perf_counter_ns()}",
+        )
+        try:
+            new_info = self._allocate_segmented_group(
+                key=temp_key,
+                initial_k=keys,
+                initial_v=values,
+                capacity=max(int(old_info.get("capacity", int(keys.shape[0]))), int(keys.shape[0]), 1),
+                physical_dpu=int(plan_result["to_dpu"]),
+                group_heads=int(old_info["group_heads"]),
+                head_dim=int(old_info["head_dim"]),
+                allowed_dpus=normalized_allowed,
+                segment_plan=segment_plan,
+            )
+        except Exception as exc:
+            result = dict(plan_result)
+            result["migrated"] = False
+            result["reason"] = "rebuild_failed"
+            result["error"] = str(exc)
+            return result
+        self._free_block_infos(old_blocks)
+        self.slot_mapping[key] = new_info
+        plan_result["storage"] = "dpu_segmented"
+        return plan_result
 
     def slot_debug(self, k_slot: str, v_slot: str) -> Dict[str, object]:
         key = self._slot_key(k_slot, v_slot)
