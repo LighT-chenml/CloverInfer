@@ -1,0 +1,69 @@
+achieved_output_throughput_tps,achieved_request_throughput_rps,arrival_rate_rps,baseline,baseline_key,case_seed,dataset,dataset_slug,error,input_tokens_mean,input_truncated_count,internal_baseline,latency_from_arrival_mean_s,latency_internal_mean_s,model,model_slug,normalized_latency_mean,normalized_latency_p50,normalized_latency_p90,normalized_latency_p95,num_requests,out_of_order_completions,output_length_fallback_count,output_tokens_mean,output_truncated_count,status,wall_time_s
+0.5532167315290122,0.06915209144112652,0.1,Naive PIM,naive_pim,153865655,humaneval,humaneval,,105.0,2,disagg_pim_naive,37.134156227111816,29.640701214472454,opt-1.3b,opt-1-3b,4.641769528388977,5.261254251003265,5.387468779087067,5.403245595097542,3,0,0,8.0,3,ok,43.382635831832886
+0.3711427823530956,0.058601491950488784,0.1,Naive PIM,naive_pim,1888988201,longbench-qasper,longbench-qasper,,128.0,3,disagg_pim_naive,28.228763818740845,21.540695826212566,opt-1.3b,opt-1-3b,5.006998025708729,4.217994868755341,6.52066475947698,6.808498495817185,3,0,0,6.333333333333333,2,ok,51.193235874176025
+,,0.1,Naive PIM,naive_pim,,sharegpt,sharegpt,"RayTaskError(RuntimeError): [36mray::GlobalScheduler.submit_request()[39m (pid=1321227, ip=192.168.123.7, actor_id=a60fce3baea5b11b65fc714d01000000, repr=<src.core.scheduler.GlobalScheduler object at 0x7f54fe3da0b0>)
+  File ""/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py"", line 451, in result
+    return self.__get_result()
+  File ""/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py"", line 403, in __get_result
+    raise self._exception
+  File ""/home/cml/CloverInfer/src/core/scheduler.py"", line 2005, in submit_request
+    return await completion_future
+  File ""/home/cml/CloverInfer/src/core/scheduler.py"", line 1071, in _decode_driver_loop
+    await self._run_decode_wave(batch)
+  File ""/home/cml/CloverInfer/src/core/scheduler.py"", line 1386, in _run_decode_wave
+    attention_results = await attention.decode_layer_batch.remote(prepared_items)
+ray.exceptions.RayTaskError(RuntimeError): [36mray::AttentionNode.decode_layer_batch()[39m (pid=1321293, ip=192.168.123.7, actor_id=67331b570a672da60ae1a6c001000000, repr=<src.core.nodes.AttentionNode object at 0x7fd23b1406d0>)
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 746, in allocate_group
+    out = self._read_slot_args()
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 694, in _read_slot_args
+    return self.SLOT_ARGS_STRUCT.unpack(self._read_exact(self.SLOT_ARGS_SIZE))
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 720, in _read_exact
+    raise RuntimeError(f""kvslot helper returned incomplete output: {stderr_text.strip()}"")
+RuntimeError: kvslot helper returned incomplete output: DPU 30 out of reusable kvslot capacity
+
+The above exception was the direct cause of the following exception:
+
+[36mray::AttentionNode.decode_layer_batch()[39m (pid=1321293, ip=192.168.123.7, actor_id=67331b570a672da60ae1a6c001000000, repr=<src.core.nodes.AttentionNode object at 0x7fd23b1406d0>)
+  File ""/home/cml/CloverInfer/src/core/attention_backend.py"", line 2509, in _append_resident_kv
+    append_info = self.resident_store.append_group(
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 4061, in append_group
+    new_block = self._allocate_block_append_only(
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 3632, in _allocate_block_append_only
+    raise RuntimeError(
+RuntimeError: block allocation failed block_key=('req_695916821:layer17:group0:k#blk7', 'req_695916821:layer17:group0:v#blk7') block_idx=7 block_kind=growth slot_id=7838 physical_dpu=30 elem_count=65536 capacity=64: kvslot helper returned incomplete output: DPU 30 out of reusable kvslot capacity
+
+During handling of the above exception, another exception occurred:
+
+[36mray::AttentionNode.decode_layer_batch()[39m (pid=1321293, ip=192.168.123.7, actor_id=67331b570a672da60ae1a6c001000000, repr=<src.core.nodes.AttentionNode object at 0x7fd23b1406d0>)
+  File ""/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py"", line 451, in result
+    return self.__get_result()
+  File ""/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py"", line 403, in __get_result
+    raise self._exception
+  File ""/home/cml/CloverInfer/src/core/nodes.py"", line 540, in decode_layer_batch
+    return await self._execute_rankset_task_graph_batch(payloads)
+  File ""/home/cml/CloverInfer/src/core/nodes.py"", line 223, in _execute_rankset_task_graph_batch
+    return self._fallback_rankset_execution(
+  File ""/home/cml/CloverInfer/src/core/nodes.py"", line 186, in _fallback_rankset_execution
+    contexts = self.backend.decode_layer_batch(payloads)
+  File ""/home/cml/CloverInfer/src/core/attention_backend.py"", line 3263, in decode_layer_batch
+    records = [self._prepare_decode_record(item) for item in items]
+  File ""/home/cml/CloverInfer/src/core/attention_backend.py"", line 3263, in <listcomp>
+    records = [self._prepare_decode_record(item) for item in items]
+  File ""/home/cml/CloverInfer/src/core/attention_backend.py"", line 2872, in _prepare_decode_record
+    self._append_resident_kv(request_state, layer_idx, k_new, v_new)
+  File ""/home/cml/CloverInfer/src/core/attention_backend.py"", line 2518, in _append_resident_kv
+    self.resident_store.migrate_group_to_host_fallback(group.k_slot, group.v_slot)
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 4232, in migrate_group_to_host_fallback
+    keys, values = self.materialize_group(k_slot, v_slot)
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 4176, in materialize_group
+    k, v, info = self.helper.materialize_group(int(block[""slot_id""]))
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 787, in materialize_group
+    self._write(header)
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 697, in _write
+    proc = self._ensure_proc()
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 614, in _ensure_proc
+    raise RuntimeError(
+RuntimeError: kvslot helper exited while persistent DPU state was active:",,,disagg_pim_naive,,,opt-1.3b,opt-1-3b,,,,,,,,,,failed,
+0.46346363375976807,0.05793295421997101,0.1,Naive PIM,naive_pim,640568352,humaneval,humaneval,,103.33333333333333,1,disagg_pim_naive,36.886314471562706,19.464649041493733,qwen-1.8b,qwen-1-8b,4.610789308945338,5.230477690696716,6.222522807121277,6.346528446674347,3,0,0,8.0,3,ok,51.783998250961304
+0.45934293221657563,0.0725278314026172,0.1,Naive PIM,naive_pim,1585073890,longbench-qasper,longbench-qasper,,128.0,3,disagg_pim_naive,29.533763249715168,16.696019490559895,qwen-1.8b,qwen-1-8b,5.536709268887837,5.168435364961624,8.11844430565834,8.48719542324543,3,0,0,6.333333333333333,2,ok,41.36343169212341
+0.5718540320899478,0.07148175401124347,0.1,Naive PIM,naive_pim,989565331,sharegpt,sharegpt,,39.666666666666664,0,disagg_pim_naive,29.974403460820515,18.96747366587321,qwen-1.8b,qwen-1-8b,3.7468004326025643,3.3208180367946625,4.858568876981735,5.050787732005119,3,0,0,8.0,3,ok,41.96875190734863

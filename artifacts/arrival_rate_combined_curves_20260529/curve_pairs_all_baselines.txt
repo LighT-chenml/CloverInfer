@@ -1,0 +1,172 @@
+[opt-1.3b | humaneval | AFD]
+(0.10, mean=1.717, p50=1.726, p90=2.183, internal_mean=1.112, achieved_rps=0.101)
+(0.15, mean=1.844, p50=1.681, p90=2.928, internal_mean=1.512, achieved_rps=0.143)
+(0.20, mean=2.766, p50=2.415, p90=4.641, internal_mean=2.208, achieved_rps=0.162)
+(0.25, mean=3.513, p50=3.588, p90=5.066, internal_mean=2.871, achieved_rps=0.168)
+(0.30, mean=4.165, p50=4.595, p90=5.830, internal_mean=3.360, achieved_rps=0.173)
+(0.35, mean=4.497, p50=4.981, p90=5.935, internal_mean=3.692, achieved_rps=0.176)
+(0.40, mean=4.815, p50=5.287, p90=6.122, internal_mean=4.156, achieved_rps=0.175)
+(0.50, mean=5.775, p50=5.819, p90=6.428, internal_mean=4.634, achieved_rps=0.177)
+(0.60, mean=5.887, p50=5.896, p90=6.404, internal_mean=4.789, achieved_rps=0.180)
+(0.80, mean=6.230, p50=5.995, p90=6.572, internal_mean=5.006, achieved_rps=0.185)
+
+[opt-1.3b | humaneval | CPU-Attention]
+(0.10, mean=2.110, p50=2.028, p90=2.755, internal_mean=1.411, achieved_rps=0.099)
+(0.15, mean=2.382, p50=2.230, p90=3.465, internal_mean=1.875, achieved_rps=0.135)
+(0.20, mean=3.361, p50=3.103, p90=5.355, internal_mean=2.590, achieved_rps=0.149)
+(0.25, mean=4.179, p50=4.682, p90=5.780, internal_mean=3.262, achieved_rps=0.156)
+(0.30, mean=4.640, p50=5.107, p90=6.220, internal_mean=3.608, achieved_rps=0.165)
+(0.35, mean=4.966, p50=5.507, p90=6.461, internal_mean=4.046, achieved_rps=0.164)
+(0.40, mean=5.118, p50=5.667, p90=6.502, internal_mean=4.329, achieved_rps=0.166)
+(0.50, mean=6.137, p50=6.185, p90=6.795, internal_mean=4.849, achieved_rps=0.168)
+(0.60, mean=6.264, p50=6.299, p90=6.806, internal_mean=5.007, achieved_rps=0.170)
+(0.80, mean=6.749, p50=6.495, p90=7.072, internal_mean=5.365, achieved_rps=0.172)
+
+[opt-1.3b | humaneval | Naive PIM]
+(0.10, mean=6.909, p50=7.304, p90=9.376, internal_mean=4.517, achieved_rps=0.064)
+(0.15, mean=7.802, p50=7.913, p90=10.079, internal_mean=6.087, achieved_rps=0.076)
+(0.20, mean=8.075, p50=8.365, p90=9.990, internal_mean=6.750, achieved_rps=0.082)
+(0.25, mean=9.645, p50=9.373, p90=11.242, internal_mean=7.343, achieved_rps=0.082)
+(0.30, mean=9.877, p50=9.651, p90=11.208, internal_mean=7.607, achieved_rps=0.084)
+(0.40, mean=10.293, p50=10.123, p90=11.290, internal_mean=8.695, achieved_rps=0.084)
+
+
+[opt-1.3b | longbench-qasper | AFD]
+(0.10, mean=5.795, p50=2.801, p90=16.527, internal_mean=1.572, achieved_rps=0.123)
+(0.15, mean=4.643, p50=3.054, p90=11.358, internal_mean=1.658, achieved_rps=0.174)
+(0.20, mean=4.159, p50=3.113, p90=8.562, internal_mean=1.709, achieved_rps=0.220)
+(0.25, mean=3.814, p50=2.679, p90=6.850, internal_mean=1.833, achieved_rps=0.262)
+(0.30, mean=3.987, p50=2.648, p90=6.352, internal_mean=2.038, achieved_rps=0.293)
+(0.35, mean=5.476, p50=3.581, p90=9.067, internal_mean=2.243, achieved_rps=0.306)
+(0.40, mean=5.937, p50=3.504, p90=10.290, internal_mean=2.546, achieved_rps=0.317)
+(0.50, mean=6.531, p50=3.358, p90=12.366, internal_mean=2.908, achieved_rps=0.329)
+(0.60, mean=8.992, p50=3.833, p90=18.739, internal_mean=3.734, achieved_rps=0.319)
+(0.80, mean=11.729, p50=5.123, p90=28.415, internal_mean=4.246, achieved_rps=0.326)
+
+[opt-1.3b | longbench-qasper | CPU-Attention]
+(0.10, mean=6.231, p50=4.504, p90=16.517, internal_mean=1.362, achieved_rps=0.121)
+(0.15, mean=4.871, p50=3.053, p90=11.415, internal_mean=1.432, achieved_rps=0.170)
+(0.20, mean=4.506, p50=3.113, p90=8.559, internal_mean=1.499, achieved_rps=0.212)
+(0.25, mean=4.499, p50=2.791, p90=7.551, internal_mean=1.852, achieved_rps=0.245)
+(0.30, mean=4.788, p50=2.786, p90=7.458, internal_mean=2.037, achieved_rps=0.263)
+(0.35, mean=5.191, p50=3.782, p90=6.937, internal_mean=2.195, achieved_rps=0.276)
+(0.40, mean=5.517, p50=3.725, p90=7.516, internal_mean=2.443, achieved_rps=0.285)
+(0.50, mean=7.492, p50=3.312, p90=15.046, internal_mean=2.780, achieved_rps=0.297)
+(0.60, mean=8.618, p50=3.471, p90=19.163, internal_mean=2.999, achieved_rps=0.302)
+(0.80, mean=10.830, p50=4.813, p90=20.731, internal_mean=3.380, achieved_rps=0.314)
+
+[opt-1.3b | longbench-qasper | Naive PIM]
+(0.10, mean=10.170, p50=8.780, p90=15.441, internal_mean=5.108, achieved_rps=0.083)
+(0.15, mean=10.585, p50=9.914, p90=13.766, internal_mean=6.357, achieved_rps=0.086)
+(0.20, mean=10.317, p50=10.153, p90=12.227, internal_mean=7.217, achieved_rps=0.087)
+(0.25, mean=9.795, p50=9.884, p90=11.015, internal_mean=7.001, achieved_rps=0.092)
+(0.30, mean=9.656, p50=9.703, p90=10.318, internal_mean=7.765, achieved_rps=0.093)
+(0.40, mean=18.799, p50=10.278, p90=31.542, internal_mean=8.090, achieved_rps=0.091)
+
+
+[opt-1.3b | sharegpt | AFD]
+(0.10, mean=1.817, p50=1.535, p90=3.391, internal_mean=1.096, achieved_rps=0.101)
+(0.15, mean=1.810, p50=1.784, p90=2.706, internal_mean=1.372, achieved_rps=0.137)
+(0.20, mean=2.083, p50=1.816, p90=2.934, internal_mean=1.781, achieved_rps=0.163)
+(0.25, mean=2.949, p50=2.863, p90=4.163, internal_mean=2.578, achieved_rps=0.172)
+(0.30, mean=4.056, p50=3.918, p90=5.680, internal_mean=3.248, achieved_rps=0.176)
+(0.35, mean=4.669, p50=4.483, p90=6.455, internal_mean=3.824, achieved_rps=0.177)
+(0.40, mean=4.922, p50=4.808, p90=6.532, internal_mean=4.167, achieved_rps=0.177)
+(0.50, mean=5.895, p50=5.750, p90=7.034, internal_mean=4.716, achieved_rps=0.177)
+(0.60, mean=5.991, p50=5.858, p90=6.929, internal_mean=5.006, achieved_rps=0.180)
+(0.80, mean=6.280, p50=6.159, p90=6.962, internal_mean=5.421, achieved_rps=0.179)
+
+[opt-1.3b | sharegpt | CPU-Attention]
+(0.10, mean=2.016, p50=1.880, p90=3.392, internal_mean=1.258, achieved_rps=0.099)
+(0.15, mean=1.927, p50=1.952, p90=3.042, internal_mean=1.566, achieved_rps=0.132)
+(0.20, mean=2.647, p50=2.558, p90=3.842, internal_mean=2.142, achieved_rps=0.154)
+(0.25, mean=3.645, p50=3.603, p90=5.710, internal_mean=2.943, achieved_rps=0.161)
+(0.30, mean=4.418, p50=4.394, p90=6.156, internal_mean=3.533, achieved_rps=0.165)
+(0.35, mean=5.050, p50=4.926, p90=6.897, internal_mean=4.042, achieved_rps=0.167)
+(0.40, mean=5.308, p50=5.237, p90=6.962, internal_mean=4.400, achieved_rps=0.167)
+(0.50, mean=6.322, p50=6.172, p90=7.457, internal_mean=4.888, achieved_rps=0.167)
+(0.60, mean=6.402, p50=6.264, p90=7.335, internal_mean=5.146, achieved_rps=0.170)
+(0.80, mean=6.580, p50=6.456, p90=7.259, internal_mean=5.488, achieved_rps=0.172)
+
+[opt-1.3b | sharegpt | Naive PIM]
+(0.10, failed: kvslot capacity/helper failure)
+(0.15, failed: kvslot capacity/helper failure)
+(0.20, failed: kvslot capacity/helper failure)
+(0.25, failed: kvslot capacity/helper failure)
+
+
+[qwen-1.8b | humaneval | AFD]
+(0.10, mean=2.216, p50=2.284, p90=2.797, internal_mean=1.762, achieved_rps=0.146)
+(0.15, mean=3.370, p50=3.318, p90=4.778, internal_mean=2.829, achieved_rps=0.170)
+(0.20, mean=4.354, p50=4.698, p90=5.731, internal_mean=3.879, achieved_rps=0.174)
+(0.25, mean=5.235, p50=5.449, p90=6.777, internal_mean=4.357, achieved_rps=0.175)
+(0.30, mean=5.788, p50=5.859, p90=6.940, internal_mean=4.746, achieved_rps=0.174)
+(0.35, mean=6.272, p50=6.200, p90=7.127, internal_mean=5.106, achieved_rps=0.172)
+(0.40, mean=6.090, p50=6.027, p90=6.838, internal_mean=5.027, achieved_rps=0.179)
+(0.50, mean=6.278, p50=6.228, p90=6.876, internal_mean=5.313, achieved_rps=0.179)
+(0.60, mean=6.337, p50=6.295, p90=6.836, internal_mean=5.467, achieved_rps=0.181)
+(0.80, mean=6.483, p50=6.451, p90=6.857, internal_mean=5.704, achieved_rps=0.181)
+
+[qwen-1.8b | humaneval | CPU-Attention]
+(0.10, mean=2.254, p50=2.328, p90=2.798, internal_mean=1.915, achieved_rps=0.143)
+(0.15, mean=3.600, p50=3.530, p90=5.128, internal_mean=3.041, achieved_rps=0.166)
+(0.20, mean=4.730, p50=4.990, p90=6.034, internal_mean=3.985, achieved_rps=0.168)
+(0.25, mean=5.411, p50=5.645, p90=6.973, internal_mean=4.492, achieved_rps=0.170)
+(0.30, mean=5.971, p50=6.051, p90=7.132, internal_mean=4.831, achieved_rps=0.169)
+(0.35, mean=6.350, p50=6.279, p90=7.205, internal_mean=5.051, achieved_rps=0.170)
+(0.40, mean=6.381, p50=6.319, p90=7.129, internal_mean=5.245, achieved_rps=0.172)
+(0.50, mean=6.569, p50=6.518, p90=7.167, internal_mean=5.538, achieved_rps=0.172)
+(0.60, mean=6.660, p50=6.618, p90=7.158, internal_mean=5.721, achieved_rps=0.172)
+(0.80, mean=6.652, p50=6.621, p90=7.026, internal_mean=5.751, achieved_rps=0.176)
+
+
+[qwen-1.8b | longbench-qasper | AFD]
+(0.10, mean=6.940, p50=2.393, p90=18.852, internal_mean=1.600, achieved_rps=0.099)
+(0.15, mean=5.735, p50=1.981, p90=16.869, internal_mean=1.748, achieved_rps=0.148)
+(0.20, mean=5.019, p50=2.483, p90=12.641, internal_mean=1.914, achieved_rps=0.187)
+(0.25, mean=4.572, p50=2.389, p90=10.328, internal_mean=2.024, achieved_rps=0.219)
+(0.30, mean=4.765, p50=2.481, p90=10.883, internal_mean=2.207, achieved_rps=0.250)
+(0.35, mean=5.501, p50=3.650, p90=11.165, internal_mean=2.531, achieved_rps=0.256)
+(0.40, mean=6.273, p50=3.891, p90=12.437, internal_mean=2.779, achieved_rps=0.261)
+(0.50, mean=6.743, p50=3.910, p90=14.203, internal_mean=3.079, achieved_rps=0.270)
+(0.60, mean=7.375, p50=4.229, p90=15.832, internal_mean=3.530, achieved_rps=0.271)
+(0.80, mean=12.031, p50=4.236, p90=31.670, internal_mean=3.984, achieved_rps=0.286)
+
+[qwen-1.8b | longbench-qasper | CPU-Attention]
+(0.10, mean=6.941, p50=2.276, p90=18.846, internal_mean=1.368, achieved_rps=0.100)
+(0.15, mean=5.905, p50=1.981, p90=16.866, internal_mean=1.549, achieved_rps=0.145)
+(0.20, mean=5.348, p50=2.701, p90=12.643, internal_mean=1.824, achieved_rps=0.179)
+(0.25, mean=4.959, p50=2.576, p90=10.801, internal_mean=2.028, achieved_rps=0.208)
+(0.30, mean=5.086, p50=2.826, p90=9.150, internal_mean=2.276, achieved_rps=0.223)
+(0.35, mean=5.922, p50=3.910, p90=13.164, internal_mean=2.518, achieved_rps=0.232)
+(0.40, mean=6.791, p50=4.297, p90=15.049, internal_mean=2.643, achieved_rps=0.237)
+(0.50, mean=7.216, p50=4.275, p90=16.504, internal_mean=2.750, achieved_rps=0.247)
+(0.60, mean=7.776, p50=4.278, p90=17.571, internal_mean=3.089, achieved_rps=0.253)
+(0.80, mean=10.557, p50=4.342, p90=22.495, internal_mean=3.231, achieved_rps=0.261)
+
+
+[qwen-1.8b | sharegpt | AFD]
+(0.10, mean=1.620, p50=1.466, p90=2.457, internal_mean=1.195, achieved_rps=0.101)
+(0.15, mean=2.261, p50=2.227, p90=3.256, internal_mean=1.816, achieved_rps=0.133)
+(0.20, mean=3.107, p50=2.983, p90=4.954, internal_mean=2.479, achieved_rps=0.149)
+(0.25, mean=4.011, p50=4.144, p90=5.791, internal_mean=3.057, achieved_rps=0.158)
+(0.30, mean=4.246, p50=4.513, p90=5.886, internal_mean=3.480, achieved_rps=0.163)
+(0.35, mean=4.642, p50=4.914, p90=6.011, internal_mean=3.831, achieved_rps=0.168)
+(0.40, mean=5.084, p50=5.300, p90=6.183, internal_mean=4.095, achieved_rps=0.169)
+(0.50, mean=5.340, p50=5.617, p90=6.323, internal_mean=4.469, achieved_rps=0.172)
+(0.60, mean=5.785, p50=5.948, p90=6.541, internal_mean=4.704, achieved_rps=0.173)
+(0.80, mean=6.286, p50=6.277, p90=6.845, internal_mean=5.043, achieved_rps=0.175)
+
+[qwen-1.8b | sharegpt | CPU-Attention]
+(0.10, mean=1.758, p50=1.725, p90=2.680, internal_mean=1.297, achieved_rps=0.099)
+(0.15, mean=2.503, p50=2.543, p90=3.573, internal_mean=2.040, achieved_rps=0.128)
+(0.20, mean=3.331, p50=3.315, p90=5.271, internal_mean=2.649, achieved_rps=0.143)
+(0.25, mean=4.225, p50=4.411, p90=6.058, internal_mean=3.160, achieved_rps=0.153)
+(0.30, mean=4.474, p50=4.799, p90=6.171, internal_mean=3.621, achieved_rps=0.157)
+(0.35, mean=4.834, p50=5.143, p90=6.241, internal_mean=3.910, achieved_rps=0.163)
+(0.40, mean=5.083, p50=5.456, p90=6.417, internal_mean=4.220, achieved_rps=0.163)
+(0.50, mean=5.521, p50=5.820, p90=6.527, internal_mean=4.556, achieved_rps=0.167)
+(0.60, mean=5.980, p50=6.165, p90=6.758, internal_mean=4.764, achieved_rps=0.168)
+(0.80, mean=6.519, p50=6.511, p90=7.079, internal_mean=5.096, achieved_rps=0.170)
+
+

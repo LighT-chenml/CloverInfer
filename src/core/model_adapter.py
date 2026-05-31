@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import math
+import os
 import time
 from typing import Dict, List
 
@@ -129,10 +130,21 @@ class CausalModelAdapter:
             "low_cpu_mem_usage": True,
         }
         if self.model_type == "qwen":
-            qwen_kwargs = {
-                "use_flash_attn": False,
-            }
-            if self.device == "cpu":
+            qwen_load_mode = os.environ.get("CLOVER_QWEN_LOAD_MODE", "torch_dtype").strip().lower()
+            if qwen_load_mode not in {"torch_dtype", "device_map", "legacy"}:
+                raise ValueError(
+                    "CLOVER_QWEN_LOAD_MODE must be one of: torch_dtype, device_map, legacy"
+                )
+            qwen_kwargs = {"use_flash_attn": False}
+            if qwen_load_mode in {"torch_dtype", "device_map"}:
+                qwen_kwargs["torch_dtype"] = self.dtype
+                if qwen_load_mode == "device_map" and self.device != "cpu":
+                    qwen_kwargs["device_map"] = {"": self.device}
+                if self.dtype == torch.float16:
+                    qwen_kwargs["fp16"] = True
+                else:
+                    qwen_kwargs["fp32"] = True
+            elif self.device == "cpu":
                 qwen_kwargs["fp32"] = True
             elif self.dtype == torch.float16:
                 qwen_kwargs["fp16"] = True
@@ -144,7 +156,7 @@ class CausalModelAdapter:
                 **qwen_kwargs,
             )
             self._patch_qwen_runtime_compatibility(model)
-            if self.device != "cpu":
+            if self.device != "cpu" and qwen_load_mode != "device_map":
                 model = model.to(self.device)
             return model
 

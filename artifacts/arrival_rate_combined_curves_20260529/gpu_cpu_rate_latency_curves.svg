@@ -1,0 +1,284 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1412" height="708" viewBox="0 0 1412 708">
+<rect width="100%" height="100%" fill="#fff"/>
+<text x="48" y="30" font-family="Arial" font-size="20" font-weight="700">GPU/CPU AFD Rate-Latency Curves</text>
+<line x1="48" y1="58" x2="72" y2="58" stroke="#2563eb" stroke-width="3"/>
+<text x="80" y="63" font-family="Arial" font-size="13">AFD</text>
+<line x1="183" y1="58" x2="207" y2="58" stroke="#ea580c" stroke-width="3"/>
+<text x="215" y="63" font-family="Arial" font-size="13">CPU-Attention</text>
+<text x="48" y="88" font-family="Arial" font-size="14" font-weight="700">opt-1.3b / humaneval</text>
+<rect x="98" y="104" width="348" height="206" fill="#fafafa" stroke="#ddd"/>
+<line x1="98" y1="310.0" x2="446" y2="310.0" stroke="#e5e7eb"/>
+<text x="90" y="314.0" font-family="Arial" font-size="11" text-anchor="end" fill="#555">0</text>
+<line x1="98" y1="258.5" x2="446" y2="258.5" stroke="#e5e7eb"/>
+<text x="90" y="262.5" font-family="Arial" font-size="11" text-anchor="end" fill="#555">2</text>
+<line x1="98" y1="207.0" x2="446" y2="207.0" stroke="#e5e7eb"/>
+<text x="90" y="211.0" font-family="Arial" font-size="11" text-anchor="end" fill="#555">4</text>
+<line x1="98" y1="155.5" x2="446" y2="155.5" stroke="#e5e7eb"/>
+<text x="90" y="159.5" font-family="Arial" font-size="11" text-anchor="end" fill="#555">6</text>
+<line x1="98" y1="104.0" x2="446" y2="104.0" stroke="#e5e7eb"/>
+<text x="90" y="108.0" font-family="Arial" font-size="11" text-anchor="end" fill="#555">8</text>
+<text x="98.0" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.1</text>
+<text x="122.9" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.15</text>
+<text x="147.7" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.2</text>
+<text x="172.6" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.25</text>
+<text x="197.4" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.3</text>
+<text x="222.3" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.35</text>
+<text x="247.1" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.4</text>
+<text x="296.9" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.5</text>
+<text x="346.6" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.6</text>
+<text x="446.0" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.8</text>
+<text x="272.0" y="348" font-family="Arial" font-size="11" text-anchor="middle" fill="#333">arrival rate (rps)</text>
+<text transform="translate(60,207.0) rotate(-90)" font-family="Arial" font-size="11" text-anchor="middle" fill="#333">normalized latency</text>
+<path d="M98.0,265.8 L122.9,262.5 L147.7,238.8 L172.6,219.5 L197.4,202.7 L222.3,194.2 L247.1,186.0 L296.9,161.3 L346.6,158.4 L446.0,149.6" fill="none" stroke="#2563eb" stroke-width="2.4"/>
+<circle cx="98.0" cy="265.8" r="3" fill="#2563eb"/>
+<circle cx="122.9" cy="262.5" r="3" fill="#2563eb"/>
+<circle cx="147.7" cy="238.8" r="3" fill="#2563eb"/>
+<circle cx="172.6" cy="219.5" r="3" fill="#2563eb"/>
+<circle cx="197.4" cy="202.7" r="3" fill="#2563eb"/>
+<circle cx="222.3" cy="194.2" r="3" fill="#2563eb"/>
+<circle cx="247.1" cy="186.0" r="3" fill="#2563eb"/>
+<circle cx="296.9" cy="161.3" r="3" fill="#2563eb"/>
+<circle cx="346.6" cy="158.4" r="3" fill="#2563eb"/>
+<circle cx="446.0" cy="149.6" r="3" fill="#2563eb"/>
+<path d="M98.0,255.7 L122.9,248.7 L147.7,223.5 L172.6,202.4 L197.4,190.5 L222.3,182.1 L247.1,178.2 L296.9,152.0 L346.6,148.7 L446.0,136.2" fill="none" stroke="#ea580c" stroke-width="2.4"/>
+<circle cx="98.0" cy="255.7" r="3" fill="#ea580c"/>
+<circle cx="122.9" cy="248.7" r="3" fill="#ea580c"/>
+<circle cx="147.7" cy="223.5" r="3" fill="#ea580c"/>
+<circle cx="172.6" cy="202.4" r="3" fill="#ea580c"/>
+<circle cx="197.4" cy="190.5" r="3" fill="#ea580c"/>
+<circle cx="222.3" cy="182.1" r="3" fill="#ea580c"/>
+<circle cx="247.1" cy="178.2" r="3" fill="#ea580c"/>
+<circle cx="296.9" cy="152.0" r="3" fill="#ea580c"/>
+<circle cx="346.6" cy="148.7" r="3" fill="#ea580c"/>
+<circle cx="446.0" cy="136.2" r="3" fill="#ea580c"/>
+<text x="496" y="88" font-family="Arial" font-size="14" font-weight="700">opt-1.3b / longbench-qasper</text>
+<rect x="546" y="104" width="348" height="206" fill="#fafafa" stroke="#ddd"/>
+<line x1="546" y1="310.0" x2="894" y2="310.0" stroke="#e5e7eb"/>
+<text x="538" y="314.0" font-family="Arial" font-size="11" text-anchor="end" fill="#555">0</text>
+<line x1="546" y1="241.3" x2="894" y2="241.3" stroke="#e5e7eb"/>
+<text x="538" y="245.3" font-family="Arial" font-size="11" text-anchor="end" fill="#555">5</text>
+<line x1="546" y1="172.7" x2="894" y2="172.7" stroke="#e5e7eb"/>
+<text x="538" y="176.7" font-family="Arial" font-size="11" text-anchor="end" fill="#555">10</text>
+<line x1="546" y1="104.0" x2="894" y2="104.0" stroke="#e5e7eb"/>
+<text x="538" y="108.0" font-family="Arial" font-size="11" text-anchor="end" fill="#555">15</text>
+<line x1="546" y1="35.3" x2="894" y2="35.3" stroke="#e5e7eb"/>
+<text x="538" y="39.3" font-family="Arial" font-size="11" text-anchor="end" fill="#555">20</text>
+<text x="546.0" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.1</text>
+<text x="570.9" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.15</text>
+<text x="595.7" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.2</text>
+<text x="620.6" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.25</text>
+<text x="645.4" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.3</text>
+<text x="670.3" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.35</text>
+<text x="695.1" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.4</text>
+<text x="744.9" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.5</text>
+<text x="794.6" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.6</text>
+<text x="894.0" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.8</text>
+<text x="720.0" y="348" font-family="Arial" font-size="11" text-anchor="middle" fill="#333">arrival rate (rps)</text>
+<text transform="translate(508,207.0) rotate(-90)" font-family="Arial" font-size="11" text-anchor="middle" fill="#333">normalized latency</text>
+<path d="M546.0,230.4 L570.9,246.2 L595.7,252.9 L620.6,257.6 L645.4,255.2 L670.3,234.8 L695.1,228.5 L744.9,220.3 L794.6,186.5 L894.0,148.9" fill="none" stroke="#2563eb" stroke-width="2.4"/>
+<circle cx="546.0" cy="230.4" r="3" fill="#2563eb"/>
+<circle cx="570.9" cy="246.2" r="3" fill="#2563eb"/>
+<circle cx="595.7" cy="252.9" r="3" fill="#2563eb"/>
+<circle cx="620.6" cy="257.6" r="3" fill="#2563eb"/>
+<circle cx="645.4" cy="255.2" r="3" fill="#2563eb"/>
+<circle cx="670.3" cy="234.8" r="3" fill="#2563eb"/>
+<circle cx="695.1" cy="228.5" r="3" fill="#2563eb"/>
+<circle cx="744.9" cy="220.3" r="3" fill="#2563eb"/>
+<circle cx="794.6" cy="186.5" r="3" fill="#2563eb"/>
+<circle cx="894.0" cy="148.9" r="3" fill="#2563eb"/>
+<path d="M546.0,224.4 L570.9,243.1 L595.7,248.1 L620.6,248.2 L645.4,244.2 L670.3,238.7 L695.1,234.2 L744.9,207.1 L794.6,191.6 L894.0,161.3" fill="none" stroke="#ea580c" stroke-width="2.4"/>
+<circle cx="546.0" cy="224.4" r="3" fill="#ea580c"/>
+<circle cx="570.9" cy="243.1" r="3" fill="#ea580c"/>
+<circle cx="595.7" cy="248.1" r="3" fill="#ea580c"/>
+<circle cx="620.6" cy="248.2" r="3" fill="#ea580c"/>
+<circle cx="645.4" cy="244.2" r="3" fill="#ea580c"/>
+<circle cx="670.3" cy="238.7" r="3" fill="#ea580c"/>
+<circle cx="695.1" cy="234.2" r="3" fill="#ea580c"/>
+<circle cx="744.9" cy="207.1" r="3" fill="#ea580c"/>
+<circle cx="794.6" cy="191.6" r="3" fill="#ea580c"/>
+<circle cx="894.0" cy="161.3" r="3" fill="#ea580c"/>
+<text x="944" y="88" font-family="Arial" font-size="14" font-weight="700">opt-1.3b / sharegpt</text>
+<rect x="994" y="104" width="348" height="206" fill="#fafafa" stroke="#ddd"/>
+<line x1="994" y1="310.0" x2="1342" y2="310.0" stroke="#e5e7eb"/>
+<text x="986" y="314.0" font-family="Arial" font-size="11" text-anchor="end" fill="#555">0</text>
+<line x1="994" y1="258.5" x2="1342" y2="258.5" stroke="#e5e7eb"/>
+<text x="986" y="262.5" font-family="Arial" font-size="11" text-anchor="end" fill="#555">2</text>
+<line x1="994" y1="207.0" x2="1342" y2="207.0" stroke="#e5e7eb"/>
+<text x="986" y="211.0" font-family="Arial" font-size="11" text-anchor="end" fill="#555">4</text>
+<line x1="994" y1="155.5" x2="1342" y2="155.5" stroke="#e5e7eb"/>
+<text x="986" y="159.5" font-family="Arial" font-size="11" text-anchor="end" fill="#555">6</text>
+<line x1="994" y1="104.0" x2="1342" y2="104.0" stroke="#e5e7eb"/>
+<text x="986" y="108.0" font-family="Arial" font-size="11" text-anchor="end" fill="#555">8</text>
+<text x="994.0" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.1</text>
+<text x="1018.9" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.15</text>
+<text x="1043.7" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.2</text>
+<text x="1068.6" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.25</text>
+<text x="1093.4" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.3</text>
+<text x="1118.3" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.35</text>
+<text x="1143.1" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.4</text>
+<text x="1192.9" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.5</text>
+<text x="1242.6" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.6</text>
+<text x="1342.0" y="328" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.8</text>
+<text x="1168.0" y="348" font-family="Arial" font-size="11" text-anchor="middle" fill="#333">arrival rate (rps)</text>
+<text transform="translate(956,207.0) rotate(-90)" font-family="Arial" font-size="11" text-anchor="middle" fill="#333">normalized latency</text>
+<path d="M994.0,263.2 L1018.9,263.4 L1043.7,256.4 L1068.6,234.1 L1093.4,205.6 L1118.3,189.8 L1143.1,183.3 L1192.9,158.2 L1242.6,155.7 L1342.0,148.3" fill="none" stroke="#2563eb" stroke-width="2.4"/>
+<circle cx="994.0" cy="263.2" r="3" fill="#2563eb"/>
+<circle cx="1018.9" cy="263.4" r="3" fill="#2563eb"/>
+<circle cx="1043.7" cy="256.4" r="3" fill="#2563eb"/>
+<circle cx="1068.6" cy="234.1" r="3" fill="#2563eb"/>
+<circle cx="1093.4" cy="205.6" r="3" fill="#2563eb"/>
+<circle cx="1118.3" cy="189.8" r="3" fill="#2563eb"/>
+<circle cx="1143.1" cy="183.3" r="3" fill="#2563eb"/>
+<circle cx="1192.9" cy="158.2" r="3" fill="#2563eb"/>
+<circle cx="1242.6" cy="155.7" r="3" fill="#2563eb"/>
+<circle cx="1342.0" cy="148.3" r="3" fill="#2563eb"/>
+<path d="M994.0,258.1 L1018.9,260.4 L1043.7,241.8 L1068.6,216.1 L1093.4,196.2 L1118.3,180.0 L1143.1,173.3 L1192.9,147.2 L1242.6,145.1 L1342.0,140.6" fill="none" stroke="#ea580c" stroke-width="2.4"/>
+<circle cx="994.0" cy="258.1" r="3" fill="#ea580c"/>
+<circle cx="1018.9" cy="260.4" r="3" fill="#ea580c"/>
+<circle cx="1043.7" cy="241.8" r="3" fill="#ea580c"/>
+<circle cx="1068.6" cy="216.1" r="3" fill="#ea580c"/>
+<circle cx="1093.4" cy="196.2" r="3" fill="#ea580c"/>
+<circle cx="1118.3" cy="180.0" r="3" fill="#ea580c"/>
+<circle cx="1143.1" cy="173.3" r="3" fill="#ea580c"/>
+<circle cx="1192.9" cy="147.2" r="3" fill="#ea580c"/>
+<circle cx="1242.6" cy="145.1" r="3" fill="#ea580c"/>
+<circle cx="1342.0" cy="140.6" r="3" fill="#ea580c"/>
+<text x="48" y="396" font-family="Arial" font-size="14" font-weight="700">qwen-1.8b / humaneval</text>
+<rect x="98" y="412" width="348" height="206" fill="#fafafa" stroke="#ddd"/>
+<line x1="98" y1="618.0" x2="446" y2="618.0" stroke="#e5e7eb"/>
+<text x="90" y="622.0" font-family="Arial" font-size="11" text-anchor="end" fill="#555">0</text>
+<line x1="98" y1="566.5" x2="446" y2="566.5" stroke="#e5e7eb"/>
+<text x="90" y="570.5" font-family="Arial" font-size="11" text-anchor="end" fill="#555">2</text>
+<line x1="98" y1="515.0" x2="446" y2="515.0" stroke="#e5e7eb"/>
+<text x="90" y="519.0" font-family="Arial" font-size="11" text-anchor="end" fill="#555">4</text>
+<line x1="98" y1="463.5" x2="446" y2="463.5" stroke="#e5e7eb"/>
+<text x="90" y="467.5" font-family="Arial" font-size="11" text-anchor="end" fill="#555">6</text>
+<line x1="98" y1="412.0" x2="446" y2="412.0" stroke="#e5e7eb"/>
+<text x="90" y="416.0" font-family="Arial" font-size="11" text-anchor="end" fill="#555">8</text>
+<text x="98.0" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.1</text>
+<text x="122.9" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.15</text>
+<text x="147.7" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.2</text>
+<text x="172.6" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.25</text>
+<text x="197.4" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.3</text>
+<text x="222.3" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.35</text>
+<text x="247.1" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.4</text>
+<text x="296.9" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.5</text>
+<text x="346.6" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.6</text>
+<text x="446.0" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.8</text>
+<text x="272.0" y="656" font-family="Arial" font-size="11" text-anchor="middle" fill="#333">arrival rate (rps)</text>
+<text transform="translate(60,515.0) rotate(-90)" font-family="Arial" font-size="11" text-anchor="middle" fill="#333">normalized latency</text>
+<path d="M98.0,560.9 L122.9,531.2 L147.7,505.9 L172.6,483.2 L197.4,469.0 L222.3,456.5 L247.1,461.2 L296.9,456.4 L346.6,454.8 L446.0,451.1" fill="none" stroke="#2563eb" stroke-width="2.4"/>
+<circle cx="98.0" cy="560.9" r="3" fill="#2563eb"/>
+<circle cx="122.9" cy="531.2" r="3" fill="#2563eb"/>
+<circle cx="147.7" cy="505.9" r="3" fill="#2563eb"/>
+<circle cx="172.6" cy="483.2" r="3" fill="#2563eb"/>
+<circle cx="197.4" cy="469.0" r="3" fill="#2563eb"/>
+<circle cx="222.3" cy="456.5" r="3" fill="#2563eb"/>
+<circle cx="247.1" cy="461.2" r="3" fill="#2563eb"/>
+<circle cx="296.9" cy="456.4" r="3" fill="#2563eb"/>
+<circle cx="346.6" cy="454.8" r="3" fill="#2563eb"/>
+<circle cx="446.0" cy="451.1" r="3" fill="#2563eb"/>
+<path d="M98.0,560.0 L122.9,525.3 L147.7,496.2 L172.6,478.7 L197.4,464.3 L222.3,454.5 L247.1,453.7 L296.9,448.9 L346.6,446.5 L446.0,446.7" fill="none" stroke="#ea580c" stroke-width="2.4"/>
+<circle cx="98.0" cy="560.0" r="3" fill="#ea580c"/>
+<circle cx="122.9" cy="525.3" r="3" fill="#ea580c"/>
+<circle cx="147.7" cy="496.2" r="3" fill="#ea580c"/>
+<circle cx="172.6" cy="478.7" r="3" fill="#ea580c"/>
+<circle cx="197.4" cy="464.3" r="3" fill="#ea580c"/>
+<circle cx="222.3" cy="454.5" r="3" fill="#ea580c"/>
+<circle cx="247.1" cy="453.7" r="3" fill="#ea580c"/>
+<circle cx="296.9" cy="448.9" r="3" fill="#ea580c"/>
+<circle cx="346.6" cy="446.5" r="3" fill="#ea580c"/>
+<circle cx="446.0" cy="446.7" r="3" fill="#ea580c"/>
+<text x="496" y="396" font-family="Arial" font-size="14" font-weight="700">qwen-1.8b / longbench-qasper</text>
+<rect x="546" y="412" width="348" height="206" fill="#fafafa" stroke="#ddd"/>
+<line x1="546" y1="618.0" x2="894" y2="618.0" stroke="#e5e7eb"/>
+<text x="538" y="622.0" font-family="Arial" font-size="11" text-anchor="end" fill="#555">0</text>
+<line x1="546" y1="549.3" x2="894" y2="549.3" stroke="#e5e7eb"/>
+<text x="538" y="553.3" font-family="Arial" font-size="11" text-anchor="end" fill="#555">5</text>
+<line x1="546" y1="480.7" x2="894" y2="480.7" stroke="#e5e7eb"/>
+<text x="538" y="484.7" font-family="Arial" font-size="11" text-anchor="end" fill="#555">10</text>
+<line x1="546" y1="412.0" x2="894" y2="412.0" stroke="#e5e7eb"/>
+<text x="538" y="416.0" font-family="Arial" font-size="11" text-anchor="end" fill="#555">15</text>
+<line x1="546" y1="343.3" x2="894" y2="343.3" stroke="#e5e7eb"/>
+<text x="538" y="347.3" font-family="Arial" font-size="11" text-anchor="end" fill="#555">20</text>
+<text x="546.0" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.1</text>
+<text x="570.9" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.15</text>
+<text x="595.7" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.2</text>
+<text x="620.6" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.25</text>
+<text x="645.4" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.3</text>
+<text x="670.3" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.35</text>
+<text x="695.1" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.4</text>
+<text x="744.9" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.5</text>
+<text x="794.6" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.6</text>
+<text x="894.0" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.8</text>
+<text x="720.0" y="656" font-family="Arial" font-size="11" text-anchor="middle" fill="#333">arrival rate (rps)</text>
+<text transform="translate(508,515.0) rotate(-90)" font-family="Arial" font-size="11" text-anchor="middle" fill="#333">normalized latency</text>
+<path d="M546.0,522.7 L570.9,539.2 L595.7,549.1 L620.6,555.2 L645.4,552.6 L670.3,542.5 L695.1,531.8 L744.9,525.4 L794.6,516.7 L894.0,452.8" fill="none" stroke="#2563eb" stroke-width="2.4"/>
+<circle cx="546.0" cy="522.7" r="3" fill="#2563eb"/>
+<circle cx="570.9" cy="539.2" r="3" fill="#2563eb"/>
+<circle cx="595.7" cy="549.1" r="3" fill="#2563eb"/>
+<circle cx="620.6" cy="555.2" r="3" fill="#2563eb"/>
+<circle cx="645.4" cy="552.6" r="3" fill="#2563eb"/>
+<circle cx="670.3" cy="542.5" r="3" fill="#2563eb"/>
+<circle cx="695.1" cy="531.8" r="3" fill="#2563eb"/>
+<circle cx="744.9" cy="525.4" r="3" fill="#2563eb"/>
+<circle cx="794.6" cy="516.7" r="3" fill="#2563eb"/>
+<circle cx="894.0" cy="452.8" r="3" fill="#2563eb"/>
+<path d="M546.0,522.7 L570.9,536.9 L595.7,544.6 L620.6,549.9 L645.4,548.1 L670.3,536.7 L695.1,524.7 L744.9,518.9 L794.6,511.2 L894.0,473.0" fill="none" stroke="#ea580c" stroke-width="2.4"/>
+<circle cx="546.0" cy="522.7" r="3" fill="#ea580c"/>
+<circle cx="570.9" cy="536.9" r="3" fill="#ea580c"/>
+<circle cx="595.7" cy="544.6" r="3" fill="#ea580c"/>
+<circle cx="620.6" cy="549.9" r="3" fill="#ea580c"/>
+<circle cx="645.4" cy="548.1" r="3" fill="#ea580c"/>
+<circle cx="670.3" cy="536.7" r="3" fill="#ea580c"/>
+<circle cx="695.1" cy="524.7" r="3" fill="#ea580c"/>
+<circle cx="744.9" cy="518.9" r="3" fill="#ea580c"/>
+<circle cx="794.6" cy="511.2" r="3" fill="#ea580c"/>
+<circle cx="894.0" cy="473.0" r="3" fill="#ea580c"/>
+<text x="944" y="396" font-family="Arial" font-size="14" font-weight="700">qwen-1.8b / sharegpt</text>
+<rect x="994" y="412" width="348" height="206" fill="#fafafa" stroke="#ddd"/>
+<line x1="994" y1="618.0" x2="1342" y2="618.0" stroke="#e5e7eb"/>
+<text x="986" y="622.0" font-family="Arial" font-size="11" text-anchor="end" fill="#555">0</text>
+<line x1="994" y1="566.5" x2="1342" y2="566.5" stroke="#e5e7eb"/>
+<text x="986" y="570.5" font-family="Arial" font-size="11" text-anchor="end" fill="#555">2</text>
+<line x1="994" y1="515.0" x2="1342" y2="515.0" stroke="#e5e7eb"/>
+<text x="986" y="519.0" font-family="Arial" font-size="11" text-anchor="end" fill="#555">4</text>
+<line x1="994" y1="463.5" x2="1342" y2="463.5" stroke="#e5e7eb"/>
+<text x="986" y="467.5" font-family="Arial" font-size="11" text-anchor="end" fill="#555">6</text>
+<line x1="994" y1="412.0" x2="1342" y2="412.0" stroke="#e5e7eb"/>
+<text x="986" y="416.0" font-family="Arial" font-size="11" text-anchor="end" fill="#555">8</text>
+<text x="994.0" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.1</text>
+<text x="1018.9" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.15</text>
+<text x="1043.7" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.2</text>
+<text x="1068.6" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.25</text>
+<text x="1093.4" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.3</text>
+<text x="1118.3" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.35</text>
+<text x="1143.1" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.4</text>
+<text x="1192.9" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.5</text>
+<text x="1242.6" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.6</text>
+<text x="1342.0" y="636" font-family="Arial" font-size="10" text-anchor="middle" fill="#555">0.8</text>
+<text x="1168.0" y="656" font-family="Arial" font-size="11" text-anchor="middle" fill="#333">arrival rate (rps)</text>
+<text transform="translate(956,515.0) rotate(-90)" font-family="Arial" font-size="11" text-anchor="middle" fill="#333">normalized latency</text>
+<path d="M994.0,576.3 L1018.9,559.8 L1043.7,538.0 L1068.6,514.7 L1093.4,508.7 L1118.3,498.5 L1143.1,487.1 L1192.9,480.5 L1242.6,469.0 L1342.0,456.1" fill="none" stroke="#2563eb" stroke-width="2.4"/>
+<circle cx="994.0" cy="576.3" r="3" fill="#2563eb"/>
+<circle cx="1018.9" cy="559.8" r="3" fill="#2563eb"/>
+<circle cx="1043.7" cy="538.0" r="3" fill="#2563eb"/>
+<circle cx="1068.6" cy="514.7" r="3" fill="#2563eb"/>
+<circle cx="1093.4" cy="508.7" r="3" fill="#2563eb"/>
+<circle cx="1118.3" cy="498.5" r="3" fill="#2563eb"/>
+<circle cx="1143.1" cy="487.1" r="3" fill="#2563eb"/>
+<circle cx="1192.9" cy="480.5" r="3" fill="#2563eb"/>
+<circle cx="1242.6" cy="469.0" r="3" fill="#2563eb"/>
+<circle cx="1342.0" cy="456.1" r="3" fill="#2563eb"/>
+<path d="M994.0,572.7 L1018.9,553.5 L1043.7,532.2 L1068.6,509.2 L1093.4,502.8 L1118.3,493.5 L1143.1,487.1 L1192.9,475.8 L1242.6,464.0 L1342.0,450.1" fill="none" stroke="#ea580c" stroke-width="2.4"/>
+<circle cx="994.0" cy="572.7" r="3" fill="#ea580c"/>
+<circle cx="1018.9" cy="553.5" r="3" fill="#ea580c"/>
+<circle cx="1043.7" cy="532.2" r="3" fill="#ea580c"/>
+<circle cx="1068.6" cy="509.2" r="3" fill="#ea580c"/>
+<circle cx="1093.4" cy="502.8" r="3" fill="#ea580c"/>
+<circle cx="1118.3" cy="493.5" r="3" fill="#ea580c"/>
+<circle cx="1143.1" cy="487.1" r="3" fill="#ea580c"/>
+<circle cx="1192.9" cy="475.8" r="3" fill="#ea580c"/>
+<circle cx="1242.6" cy="464.0" r="3" fill="#ea580c"/>
+<circle cx="1342.0" cy="450.1" r="3" fill="#ea580c"/>
+</svg>

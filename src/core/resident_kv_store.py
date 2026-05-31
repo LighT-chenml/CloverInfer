@@ -163,6 +163,7 @@ def _kvslot_limit_config() -> tuple[Dict[str, str], bool]:
         ("KVSLOT_MAX_CAPACITY", "CLOVER_KVSLOT_MAX_CAPACITY", "256"),
         ("KVSLOT_MAX_HEADS", "CLOVER_KVSLOT_MAX_HEADS", "32"),
         ("KVSLOT_MAX_BATCH_ITEMS", "CLOVER_KVSLOT_MAX_BATCH_ITEMS", "32"),
+        ("KVSLOT_MAX_SLOTS_PER_DPU", "CLOVER_KVSLOT_MAX_SLOTS_PER_DPU", "64"),
         ("KVSLOT_QK_MAX_ACTIVE_DPUS", "CLOVER_KVSLOT_QK_MAX_ACTIVE_DPUS", "16"),
     ):
         raw_value = os.environ.get(clover_name)
@@ -2756,7 +2757,14 @@ class UpmemKVSlotStore(ResidentKVStore):
                 f"slot_spill_alloc_enabled={bool(self.slot_spill_alloc_enabled)} "
                 f"emergency_slot_spill_enabled={bool(getattr(self, 'emergency_slot_spill_enabled', False))}"
             )
-        return first_candidate
+        raise RuntimeError(
+            "No DPU KV element capacity remains in allowed placement set: "
+            f"preferred_dpu={preferred_dpu} "
+            f"allowed_dpus={[int(item) for item in candidates]} "
+            f"elem_count={int(elem_count)} "
+            f"pool_capacity_elems={int(self.POOL_CAPACITY_ELEMS)} "
+            f"min_headroom={min(self._dpu_capacity_headroom(int(item)) for item in candidates)}"
+        )
 
     def _dpu_capacity_headroom(self, physical_dpu: int, elem_count: int = 0) -> int:
         return max(

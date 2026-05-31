@@ -1,0 +1,13 @@
+model,dataset,baseline,low_rate_latency,first_rate_latency_gt_2x_low,first_rate_latency_gt_3x_low,max_achieved_rps,max_mean_latency,notes
+opt-1.3b,humaneval,AFD,1.717,0.25,0.5,0.185,6.230,
+opt-1.3b,humaneval,CPU-Attention,2.110,0.3,0.8,0.172,6.749,
+opt-1.3b,longbench-qasper,AFD,5.795,0.8,,0.329,11.729,short outputs: mean/p95 noisy
+opt-1.3b,longbench-qasper,CPU-Attention,6.231,,,0.314,10.830,short outputs: mean/p95 noisy
+opt-1.3b,sharegpt,AFD,1.817,0.3,0.5,0.180,6.280,
+opt-1.3b,sharegpt,CPU-Attention,2.016,0.3,0.5,0.172,6.580,
+qwen-1.8b,humaneval,AFD,2.216,0.25,,0.181,6.483,
+qwen-1.8b,humaneval,CPU-Attention,2.254,0.2,,0.176,6.660,
+qwen-1.8b,longbench-qasper,AFD,6.940,,,0.286,12.031,short outputs: mean/p95 noisy
+qwen-1.8b,longbench-qasper,CPU-Attention,6.941,,,0.261,10.557,short outputs: mean/p95 noisy
+qwen-1.8b,sharegpt,AFD,1.620,0.25,0.4,0.175,6.286,
+qwen-1.8b,sharegpt,CPU-Attention,1.758,0.25,0.5,0.170,6.519,

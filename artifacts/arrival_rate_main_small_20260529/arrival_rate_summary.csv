@@ -1,0 +1,163 @@
+achieved_output_throughput_tps,achieved_request_throughput_rps,arrival_rate_rps,baseline,baseline_key,case_seed,dataset,dataset_slug,error,input_tokens_mean,input_truncated_count,internal_baseline,latency_from_arrival_mean_s,latency_internal_mean_s,model,model_slug,normalized_latency_mean,normalized_latency_p50,normalized_latency_p90,normalized_latency_p95,num_requests,out_of_order_completions,output_length_fallback_count,output_tokens_mean,output_truncated_count,status,wall_time_s
+0.8475823429148043,0.06437334249985856,0.05,AFD,afd,868402285,humaneval,humaneval,,100.5,0,disagg_afd,29.48768885930379,11.6348637342453,opt-1.3b,opt-1-3b,2.3609530918260733,2.4550685371671404,3.9025001153349876,4.507280211895704,6,0,0,13.166666666666666,3,ok,93.20628333091736
+2.365072805810262,0.14781705036314138,0.1,AFD,afd,153865655,humaneval,humaneval,,167.83333333333334,0,disagg_afd,25.820645292599995,20.42149504025777,opt-1.3b,opt-1-3b,1.6137903307874997,1.5970933064818382,2.098285086452961,2.1787674613296986,6,0,0,16.0,6,ok,40.59071660041809
+2.017652623295924,0.1375672243156312,0.2,AFD,afd,596524077,humaneval,humaneval,,136.83333333333334,0,disagg_afd,16.66476035118103,13.357646981875101,opt-1.3b,opt-1-3b,1.1287338907519977,1.0973349884152412,1.299781359732151,1.3609137199819088,6,0,0,14.666666666666666,5,ok,43.61504006385803
+0.5956524738563015,0.06743235553090206,0.05,AFD,afd,1836347885,longbench-qasper,longbench-qasper,,512.0,6,disagg_afd,14.829128185907999,7.592586159706116,opt-1.3b,opt-1-3b,3.716463998787933,2.1264810860157013,7.9775902430216465,9.76068671544393,6,0,0,8.833333333333334,2,ok,88.97805738449097
+1.3925113653811632,0.13262013003630127,0.1,AFD,afd,1888988201,longbench-qasper,longbench-qasper,,512.0,6,disagg_afd,13.732191801071167,11.151772340138754,opt-1.3b,opt-1-3b,2.5365237653255464,1.1596174165606499,5.448195397853851,6.8661013543605804,6,0,0,10.5,3,ok,45.242000579833984
+1.4286983230123143,0.12245985625819837,0.2,AFD,afd,966019274,longbench-qasper,longbench-qasper,,512.0,6,disagg_afd,15.342895229657492,11.45292862256368,opt-1.3b,opt-1-3b,2.1916686023275056,1.1108747646212578,4.551646709442139,5.574590007464091,6,0,0,11.666666666666666,4,ok,48.99564790725708
+0.8252957355167744,0.0515809834697984,0.05,AFD,afd,1021383889,sharegpt,sharegpt,,239.33333333333334,1,disagg_afd,21.349336624145508,10.964014172554016,opt-1.3b,opt-1-3b,1.3343335390090942,1.3424009010195732,1.9719294607639313,2.015679359436035,6,0,0,16.0,6,ok,116.32193875312805
+1.9463390941759697,0.12164619338599811,0.1,AFD,afd,1379446812,sharegpt,sharegpt,,132.5,1,disagg_afd,19.167535106341045,14.692811727523804,opt-1.3b,opt-1-3b,1.1979709441463153,1.1313743814826012,1.5925148949027061,1.6135547868907452,6,0,0,16.0,6,ok,49.323368310928345
+2.1048659615471625,0.1540145825522314,0.2,AFD,afd,485242670,sharegpt,sharegpt,,250.83333333333334,1,disagg_afd,23.75769019126892,15.909885048866272,opt-1.3b,opt-1-3b,2.8152330244580903,1.7661921605467796,5.537611931562424,7.330099865794182,6,2,0,13.666666666666666,5,ok,38.95735001564026
+0.8488024361384428,0.06446600780798299,0.05,CPU-Attention,cpu_attention,868402285,humaneval,humaneval,,100.5,0,disagg_cpu,29.46644699573517,11.690100073814392,opt-1.3b,opt-1-3b,2.358551938973722,2.455127394625119,3.90281630307436,4.507645834237337,6,0,0,13.166666666666666,3,ok,93.07230591773987
+2.2063308938332216,0.13789568086457635,0.1,CPU-Attention,cpu_attention,153865655,humaneval,humaneval,,167.83333333333334,0,disagg_cpu,28.254350264867146,23.380653540293377,opt-1.3b,opt-1-3b,1.7658968915541966,1.7795764803886414,2.280837267637253,2.3613274320960045,6,0,0,16.0,6,ok,43.511152505874634
+1.945114972677735,0.13262147540984556,0.2,CPU-Attention,cpu_attention,596524077,humaneval,humaneval,,136.83333333333334,0,disagg_cpu,17.478363394737244,14.53270665804545,opt-1.3b,opt-1-3b,1.179608238240083,1.1015935614705086,1.4014408811926842,1.462580617517233,6,0,0,14.666666666666666,5,ok,45.241541624069214
+0.6024660034598808,0.06820369850489216,0.05,CPU-Attention,cpu_attention,1836347885,longbench-qasper,longbench-qasper,,512.0,6,disagg_cpu,14.661419828732809,7.663792848587036,opt-1.3b,opt-1-3b,3.5496626587377653,1.6241156682372093,7.980008443196615,9.764723698298136,6,0,0,8.833333333333334,2,ok,87.97176885604858
+1.2964716988586094,0.12347349512939138,0.1,CPU-Attention,cpu_attention,1888988201,longbench-qasper,longbench-qasper,,512.0,6,disagg_cpu,15.406898856163025,12.279335180918375,opt-1.3b,opt-1-3b,2.7457999736070633,1.3691224455833435,5.866564571857452,7.075526982545853,6,0,0,10.5,3,ok,48.593424797058105
+1.3614031175142283,0.11669169578693385,0.2,CPU-Attention,cpu_attention,966019274,longbench-qasper,longbench-qasper,,512.0,6,disagg_cpu,16.55335561434428,12.451337218284607,opt-1.3b,opt-1-3b,2.376367972128921,1.2622096166014671,4.954276601473491,6.178972224394481,6,0,0,11.666666666666666,4,ok,51.417540550231934
+0.8184559597239514,0.05115349748274696,0.05,CPU-Attention,cpu_attention,1021383889,sharegpt,sharegpt,,239.33333333333334,1,disagg_cpu,21.672492464383442,11.52562395731608,opt-1.3b,opt-1-3b,1.3545307790239651,1.372694969177246,1.9720312431454659,2.015496712177992,6,0,0,16.0,6,ok,117.29403257369995
+1.879187244339332,0.11744920277120825,0.1,CPU-Attention,cpu_attention,1379446812,sharegpt,sharegpt,,132.5,1,disagg_cpu,19.75632607936859,15.609655221303305,opt-1.3b,opt-1-3b,1.234770379960537,1.1861876100301743,1.592754915356636,1.6137784123420715,6,0,0,16.0,6,ok,51.085915088653564
+2.007863743987333,0.14691685931614634,0.2,CPU-Attention,cpu_attention,485242670,sharegpt,sharegpt,,250.83333333333334,1,disagg_cpu,24.69724214076996,18.672945777575176,opt-1.3b,opt-1-3b,2.873545490205288,1.824829213321209,5.595152482390404,7.357466034591198,6,2,0,13.666666666666666,5,ok,40.83942461013794
+,,0.05,Naive PIM,naive_pim,,humaneval,humaneval,"RayTaskError(RuntimeError): [36mray::GlobalScheduler.submit_request()[39m (pid=1280506, ip=192.168.123.7, actor_id=480edb689dfd4f5bd23b204605000000, repr=<src.core.scheduler.GlobalScheduler object at 0x7f793f00e0e0>)
+  File ""/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py"", line 451, in result
+    return self.__get_result()
+  File ""/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py"", line 403, in __get_result
+    raise self._exception
+  File ""/home/cml/CloverInfer/src/core/scheduler.py"", line 2005, in submit_request
+    return await completion_future
+  File ""/home/cml/CloverInfer/src/core/scheduler.py"", line 1071, in _decode_driver_loop
+    await self._run_decode_wave(batch)
+  File ""/home/cml/CloverInfer/src/core/scheduler.py"", line 1386, in _run_decode_wave
+    attention_results = await attention.decode_layer_batch.remote(prepared_items)
+ray.exceptions.RayTaskError(RuntimeError): [36mray::AttentionNode.decode_layer_batch()[39m (pid=1280574, ip=192.168.123.7, actor_id=c1607d7e6e9dff293c79dae105000000, repr=<src.core.nodes.AttentionNode object at 0x7f194d3a86d0>)
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 745, in allocate_group
+    out = self._read_slot_args()
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 693, in _read_slot_args
+    return self.SLOT_ARGS_STRUCT.unpack(self._read_exact(self.SLOT_ARGS_SIZE))
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 719, in _read_exact
+    raise RuntimeError(f""kvslot helper returned incomplete output: {stderr_text.strip()}"")
+RuntimeError: kvslot helper returned incomplete output: DPU 87 out of reusable kvslot capacity
+
+The above exception was the direct cause of the following exception:
+
+[36mray::AttentionNode.decode_layer_batch()[39m (pid=1280574, ip=192.168.123.7, actor_id=c1607d7e6e9dff293c79dae105000000, repr=<src.core.nodes.AttentionNode object at 0x7f194d3a86d0>)
+  File ""/home/cml/CloverInfer/src/core/attention_backend.py"", line 2509, in _append_resident_kv
+    append_info = self.resident_store.append_group(
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 4053, in append_group
+    new_block = self._allocate_block_append_only(
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 3624, in _allocate_block_append_only
+    raise RuntimeError(
+RuntimeError: block allocation failed block_key=('req_1006083839:layer5:group0:k#blk20', 'req_1006083839:layer5:group0:v#blk20') block_idx=20 block_kind=growth slot_id=6487 physical_dpu=87 elem_count=131072 capacity=128: kvslot helper returned incomplete output: DPU 87 out of reusable kvslot capacity
+
+During handling of the above exception, another exception occurred:
+
+[36mray::AttentionNode.decode_layer_batch()[39m (pid=1280574, ip=192.168.123.7, actor_id=c1607d7e6e9dff293c79dae105000000, repr=<src.core.nodes.AttentionNode object at 0x7f194d3a86d0>)
+  File ""/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py"", line 451, in result
+    return self.__get_result()
+  File ""/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py"", line 403, in __get_result
+    raise self._exception
+  File ""/home/cml/CloverInfer/src/core/nodes.py"", line 540, in decode_layer_batch
+    return await self._execute_rankset_task_graph_batch(payloads)
+  File ""/home/cml/CloverInfer/src/core/nodes.py"", line 223, in _execute_rankset_task_graph_batch
+    return self._fallback_rankset_execution(
+  File ""/home/cml/CloverInfer/src/core/nodes.py"", line 186, in _fallback_rankset_execution
+    contexts = self.backend.decode_layer_batch(payloads)
+  File ""/home/cml/CloverInfer/src/core/attention_backend.py"", line 3263, in decode_layer_batch
+    records = [self._prepare_decode_record(item) for item in items]
+  File ""/home/cml/CloverInfer/src/core/attention_backend.py"", line 3263, in <listcomp>
+    records = [self._prepare_decode_record(item) for item in items]
+  File ""/home/cml/CloverInfer/src/core/attention_backend.py"", line 2872, in _prepare_decode_record
+    self._append_resident_kv(request_state, layer_idx, k_new, v_new)
+  File ""/home/cml/CloverInfer/src/core/attention_backend.py"", line 2518, in _append_resident_kv
+    self.resident_store.migrate_group_to_host_fallback(group.k_slot, group.v_slot)
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 4224, in migrate_group_to_host_fallback
+    keys, values = self.materialize_group(k_slot, v_slot)
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 4168, in materialize_group
+    k, v, info = self.helper.materialize_group(int(block[""slot_id""]))
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 786, in materialize_group
+    self._write(header)
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 696, in _write
+    proc = self._ensure_proc()
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 613, in _ensure_proc
+    raise RuntimeError(
+RuntimeError: kvslot helper exited while persistent DPU state was active:",,,disagg_pim_naive,,,opt-1.3b,opt-1-3b,,,,,,,,,,failed,
+0.6494614175215513,0.05265903385309875,0.05,AFD,afd,133501599,humaneval,humaneval,,95.83333333333333,0,disagg_afd,25.42851495742798,10.119504888852438,qwen-1.8b,qwen-1-8b,2.038456079358806,1.8483767428181388,3.381411299109459,3.6400488391518593,6,0,0,12.333333333333334,3,ok,113.94056367874146
+1.9461611837860038,0.131201877558607,0.1,AFD,afd,640568352,humaneval,humaneval,,108.16666666666667,0,disagg_afd,18.771801471710205,15.486030260721842,qwen-1.8b,qwen-1-8b,1.2504618734572872,1.1448455439372496,1.597092404961586,1.6990866884589195,6,0,0,14.833333333333334,4,ok,45.7310528755188
+1.981904226601525,0.12786478881300162,0.2,AFD,afd,1768375002,humaneval,humaneval,,100.33333333333333,0,disagg_afd,21.938971718152363,17.73244822025299,qwen-1.8b,qwen-1-8b,1.425686920300508,1.4427602875691194,1.7762935012578964,1.783710740506649,6,0,0,15.5,5,ok,46.92456817626953
+0.7069482856957098,0.07441560902060103,0.05,AFD,afd,1001708416,longbench-qasper,longbench-qasper,,512.0,6,disagg_afd,23.689775705337524,10.113133390744528,qwen-1.8b,qwen-1-8b,8.95915054849216,3.138310106737273,22.634222626686096,28.965562760829926,6,0,0,9.5,3,ok,80.62824559211731
+1.11171018055324,0.09809207475469764,0.1,AFD,afd,1585073890,longbench-qasper,longbench-qasper,,512.0,6,disagg_afd,20.359407027562458,12.105804721514383,qwen-1.8b,qwen-1-8b,2.031712313493093,1.816449649631977,3.019096463918686,3.3709156960248947,6,0,0,11.333333333333334,3,ok,61.16702103614807
+2.167227080785728,0.1585775912770045,0.2,AFD,afd,94026037,longbench-qasper,longbench-qasper,,512.0,6,disagg_afd,32.30762116114298,26.910657087961834,qwen-1.8b,qwen-1-8b,2.410046381917265,2.3859444235761957,2.8262619197368624,2.9195171505212785,6,0,0,13.666666666666666,3,ok,37.83636736869812
+1.8224494801552895,0.12286176270709817,0.05,AFD,afd,2092685107,sharegpt,sharegpt,,106.5,1,disagg_afd,20.535003821055096,14.221319675445557,qwen-1.8b,qwen-1-8b,1.466180310205177,1.280105896294117,2.2618573995100126,2.384020617852608,6,0,0,14.833333333333334,5,ok,48.83537292480469
+1.049559573982224,0.065597473373889,0.1,AFD,afd,989565331,sharegpt,sharegpt,,229.66666666666666,2,disagg_afd,18.46200740337372,12.155790646870932,qwen-1.8b,qwen-1-8b,1.1538754627108574,1.1337154433131218,1.5972596555948257,1.69638092815876,6,0,0,16.0,6,ok,91.46693754196167
+2.0626195166245718,0.12891371978903574,0.2,AFD,afd,1992453942,sharegpt,sharegpt,,259.3333333333333,2,disagg_afd,28.541552503903706,24.393138766288757,qwen-1.8b,qwen-1-8b,1.7838470314939816,1.9670947045087814,2.194547399878502,2.2123821824789047,6,0,0,16.0,6,ok,46.542757511138916
+0.649952012251171,0.052698811804149,0.05,CPU-Attention,cpu_attention,133501599,humaneval,humaneval,,95.83333333333333,0,disagg_cpu,25.414411664009094,10.229458292325338,qwen-1.8b,qwen-1-8b,2.0366771110781916,1.8483536541461945,3.379992661376794,3.6394777360061803,6,0,0,12.333333333333334,3,ok,113.8545594215393
+1.9167056523016994,0.12921611139112582,0.1,CPU-Attention,cpu_attention,640568352,humaneval,humaneval,,108.16666666666667,0,disagg_cpu,19.12357513109843,16.389745235443115,qwen-1.8b,qwen-1-8b,1.273491225040062,1.1447187011892144,1.6410469487309456,1.7430499233305454,6,0,0,14.833333333333334,4,ok,46.43383812904358
+1.9428867986340819,0.12534753539574722,0.2,CPU-Attention,cpu_attention,1768375002,humaneval,humaneval,,100.33333333333333,0,disagg_cpu,22.567153811454773,18.614615321159363,qwen-1.8b,qwen-1-8b,1.4672257258341863,1.507993222429202,1.835206963121891,1.842615332454443,6,0,0,15.5,5,ok,47.86691641807556
+0.6972879838092096,0.07339873513781153,0.05,CPU-Attention,cpu_attention,1001708416,longbench-qasper,longbench-qasper,,512.0,6,disagg_cpu,22.57889707883199,11.4015101591746,qwen-1.8b,qwen-1-8b,7.675653035796824,2.074025422334671,19.81314069884164,27.55832246371678,6,0,0,9.5,3,ok,81.74527788162231
+1.124394380174919,0.09921126883896343,0.1,CPU-Attention,cpu_attention,1585073890,longbench-qasper,longbench-qasper,,512.0,6,disagg_cpu,20.243759234746296,14.010962526003519,qwen-1.8b,qwen-1-8b,1.9939161381787724,1.816267766058445,3.019964709877968,3.3722688034176826,6,0,0,11.333333333333334,3,ok,60.47700095176697
+1.8460278789004643,0.13507521065125347,0.2,CPU-Attention,cpu_attention,94026037,longbench-qasper,longbench-qasper,,512.0,6,disagg_cpu,38.89056897163391,33.07759606838226,qwen-1.8b,qwen-1-8b,2.908331561916404,2.8658300017317133,3.4297367771466574,3.4955641448497774,6,0,0,13.666666666666666,3,ok,44.419697523117065
+1.7767055218402792,0.11977790034878287,0.05,CPU-Attention,cpu_attention,2092685107,sharegpt,sharegpt,,106.5,1,disagg_cpu,21.373416543006897,15.386923948923746,qwen-1.8b,qwen-1-8b,1.528767910544519,1.319369301199913,2.371060988141431,2.5084747908016047,6,0,0,14.833333333333334,5,ok,50.09271311759949
+1.0524730198067531,0.06577956373792207,0.1,CPU-Attention,cpu_attention,989565331,sharegpt,sharegpt,,229.66666666666666,2,disagg_cpu,18.42033251126607,12.701963226000467,qwen-1.8b,qwen-1-8b,1.1512707819541295,1.1334580108523369,1.5971380472183228,1.6963671147823334,6,0,0,16.0,6,ok,91.21373963356018
+1.9362019365953578,0.12101262103720986,0.2,CPU-Attention,cpu_attention,1992453942,sharegpt,sharegpt,,259.3333333333333,2,disagg_cpu,31.075138926506042,26.561710715293884,qwen-1.8b,qwen-1-8b,1.9421961829066277,2.157020926475525,2.3845017850399017,2.4023553505539894,6,0,0,16.0,6,ok,49.581605195999146
+,,0.05,Naive PIM,naive_pim,,humaneval,humaneval,"RayTaskError(RuntimeError): [36mray::GlobalScheduler.submit_request()[39m (pid=1281855, ip=192.168.123.7, actor_id=6e91df2d1ce93e58281a199e05000000, repr=<src.core.scheduler.GlobalScheduler object at 0x7f9a60de6050>)
+  File ""/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py"", line 451, in result
+    return self.__get_result()
+  File ""/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py"", line 403, in __get_result
+    raise self._exception
+  File ""/home/cml/CloverInfer/src/core/scheduler.py"", line 2005, in submit_request
+    return await completion_future
+  File ""/home/cml/CloverInfer/src/core/scheduler.py"", line 1071, in _decode_driver_loop
+    await self._run_decode_wave(batch)
+  File ""/home/cml/CloverInfer/src/core/scheduler.py"", line 1386, in _run_decode_wave
+    attention_results = await attention.decode_layer_batch.remote(prepared_items)
+ray.exceptions.RayTaskError(RuntimeError): [36mray::AttentionNode.decode_layer_batch()[39m (pid=1281924, ip=192.168.123.7, actor_id=1e37a08af1a24eaf318c2d5805000000, repr=<src.core.nodes.AttentionNode object at 0x7fc9bf9b8670>)
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 745, in allocate_group
+    out = self._read_slot_args()
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 693, in _read_slot_args
+    return self.SLOT_ARGS_STRUCT.unpack(self._read_exact(self.SLOT_ARGS_SIZE))
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 719, in _read_exact
+    raise RuntimeError(f""kvslot helper returned incomplete output: {stderr_text.strip()}"")
+RuntimeError: kvslot helper returned incomplete output: DPU 24 out of reusable kvslot capacity
+
+The above exception was the direct cause of the following exception:
+
+[36mray::AttentionNode.decode_layer_batch()[39m (pid=1281924, ip=192.168.123.7, actor_id=1e37a08af1a24eaf318c2d5805000000, repr=<src.core.nodes.AttentionNode object at 0x7fc9bf9b8670>)
+  File ""/home/cml/CloverInfer/src/core/attention_backend.py"", line 2509, in _append_resident_kv
+    append_info = self.resident_store.append_group(
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 4053, in append_group
+    new_block = self._allocate_block_append_only(
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 3624, in _allocate_block_append_only
+    raise RuntimeError(
+RuntimeError: block allocation failed block_key=('req_2029479327:layer11:group0:k#blk20', 'req_2029479327:layer11:group0:v#blk20') block_idx=20 block_kind=growth slot_id=4248 physical_dpu=24 elem_count=131072 capacity=128: kvslot helper returned incomplete output: DPU 24 out of reusable kvslot capacity
+
+During handling of the above exception, another exception occurred:
+
+[36mray::AttentionNode.decode_layer_batch()[39m (pid=1281924, ip=192.168.123.7, actor_id=1e37a08af1a24eaf318c2d5805000000, repr=<src.core.nodes.AttentionNode object at 0x7fc9bf9b8670>)
+  File ""/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py"", line 451, in result
+    return self.__get_result()
+  File ""/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py"", line 403, in __get_result
+    raise self._exception
+  File ""/home/cml/CloverInfer/src/core/nodes.py"", line 540, in decode_layer_batch
+    return await self._execute_rankset_task_graph_batch(payloads)
+  File ""/home/cml/CloverInfer/src/core/nodes.py"", line 223, in _execute_rankset_task_graph_batch
+    return self._fallback_rankset_execution(
+  File ""/home/cml/CloverInfer/src/core/nodes.py"", line 186, in _fallback_rankset_execution
+    contexts = self.backend.decode_layer_batch(payloads)
+  File ""/home/cml/CloverInfer/src/core/attention_backend.py"", line 3263, in decode_layer_batch
+    records = [self._prepare_decode_record(item) for item in items]
+  File ""/home/cml/CloverInfer/src/core/attention_backend.py"", line 3263, in <listcomp>
+    records = [self._prepare_decode_record(item) for item in items]
+  File ""/home/cml/CloverInfer/src/core/attention_backend.py"", line 2872, in _prepare_decode_record
+    self._append_resident_kv(request_state, layer_idx, k_new, v_new)
+  File ""/home/cml/CloverInfer/src/core/attention_backend.py"", line 2518, in _append_resident_kv
+    self.resident_store.migrate_group_to_host_fallback(group.k_slot, group.v_slot)
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 4224, in migrate_group_to_host_fallback
+    keys, values = self.materialize_group(k_slot, v_slot)
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 4168, in materialize_group
+    k, v, info = self.helper.materialize_group(int(block[""slot_id""]))
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 786, in materialize_group
+    self._write(header)
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 696, in _write
+    proc = self._ensure_proc()
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 613, in _ensure_proc
+    raise RuntimeError(
+RuntimeError: kvslot helper exited while persistent DPU state was active:",,,disagg_pim_naive,,,qwen-1.8b,qwen-1-8b,,,,,,,,,,failed,

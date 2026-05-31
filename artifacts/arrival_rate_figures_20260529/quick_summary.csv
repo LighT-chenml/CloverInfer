@@ -1,0 +1,21 @@
+source,model,dataset,baseline,ok_points,failed_points,mean_normalized_latency,mean_output_tps
+main_small,opt-1.3b,humaneval,AFD,3,0,1.7012,1.7434
+main_small,opt-1.3b,humaneval,CPU-Attention,3,0,1.7680,1.6667
+main_small,opt-1.3b,humaneval,Naive PIM,0,1,,
+main_small,opt-1.3b,longbench-qasper,AFD,3,0,2.8149,1.1390
+main_small,opt-1.3b,longbench-qasper,CPU-Attention,3,0,2.8906,1.0868
+main_small,opt-1.3b,sharegpt,AFD,3,0,1.7825,1.6255
+main_small,opt-1.3b,sharegpt,CPU-Attention,3,0,1.8209,1.5685
+main_small,qwen-1.8b,humaneval,AFD,3,0,1.5715,1.5258
+main_small,qwen-1.8b,humaneval,CPU-Attention,3,0,1.5925,1.5032
+main_small,qwen-1.8b,humaneval,Naive PIM,0,1,,
+main_small,qwen-1.8b,longbench-qasper,AFD,3,0,4.4670,1.3286
+main_small,qwen-1.8b,longbench-qasper,CPU-Attention,3,0,4.1926,1.2226
+main_small,qwen-1.8b,sharegpt,AFD,3,0,1.4680,1.6449
+main_small,qwen-1.8b,sharegpt,CPU-Attention,3,0,1.5407,1.5885
+pim_small,opt-1.3b,humaneval,Naive PIM,3,0,4.4494,0.5865
+pim_small,opt-1.3b,longbench-qasper,Naive PIM,3,0,5.3527,0.4204
+pim_small,opt-1.3b,sharegpt,Naive PIM,2,1,4.7525,0.5536
+pim_small,qwen-1.8b,humaneval,Naive PIM,3,0,4.0850,0.5933
+pim_small,qwen-1.8b,longbench-qasper,Naive PIM,3,0,5.1927,0.5636
+pim_small,qwen-1.8b,sharegpt,Naive PIM,2,1,5.5758,0.4054

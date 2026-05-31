@@ -1,0 +1,42 @@
+achieved_output_throughput_tps,achieved_request_throughput_rps,arrival_rate_rps,baseline,baseline_key,case_seed,dataset,dataset_slug,error,input_tokens_mean,input_truncated_count,internal_baseline,latency_from_arrival_mean_s,latency_internal_mean_s,model,model_slug,normalized_latency_mean,normalized_latency_p50,normalized_latency_p90,normalized_latency_p95,num_requests,out_of_order_completions,output_length_fallback_count,output_tokens_mean,output_truncated_count,status,wall_time_s
+0.4592398598314086,0.2296199299157043,0.2,AFD,afd,596524077,humaneval,humaneval,,64.0,1,disagg_afd,4.33280348777771,4.326996088027954,opt-1.3b,opt-1-3b,2.166401743888855,2.166401743888855,2.166401743888855,2.166401743888855,1,0,0,2.0,1,ok,4.355022668838501
+1.1469091207393938,0.5734545603696969,0.2,CPU-Attention,cpu_attention,596524077,humaneval,humaneval,,64.0,1,disagg_cpu,1.7429068088531494,1.736945390701294,opt-1.3b,opt-1-3b,0.8714534044265747,0.8714534044265747,0.8714534044265747,0.8714534044265747,1,0,0,2.0,1,ok,1.7438173294067383
+,,0.2,Naive PIM,naive_pim,,humaneval,humaneval,"RayTaskError(ActorDiedError): [36mray::GlobalScheduler.initialize_cluster()[39m (pid=1278300, ip=192.168.123.7, actor_id=888198bfd0bf45d39a1d1ae202000000, repr=<src.core.scheduler.GlobalScheduler object at 0x7f445f91e020>)
+  File ""/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py"", line 451, in result
+    return self.__get_result()
+  File ""/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py"", line 403, in __get_result
+    raise self._exception
+  File ""/home/cml/CloverInfer/src/core/scheduler.py"", line 1941, in initialize_cluster
+    ""attention"": await self.attention_nodes[0].get_info.remote(),
+ray.exceptions.ActorDiedError: The actor died because of an error raised in its creation task, [36mray::AttentionNode.__init__()[39m (pid=1278367, ip=192.168.123.7, actor_id=416050caadb92248d68b1ac302000000, repr=<src.core.nodes.AttentionNode object at 0x7f99d2e946a0>)
+  File ""/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py"", line 451, in result
+    return self.__get_result()
+  File ""/home/cml/miniconda3/envs/clover_infer/lib/python3.10/concurrent/futures/_base.py"", line 403, in __get_result
+    raise self._exception
+  File ""/home/cml/CloverInfer/src/core/nodes.py"", line 105, in __init__
+    self.backend = PimNaiveAttentionBackend(attention_sparse_window=attention_sparse_window, **backend_kwargs)
+  File ""/home/cml/CloverInfer/src/core/attention_backend.py"", line 437, in __init__
+    self.resident_store = UpmemKVSlotStore(
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 2125, in __init__
+    kvslot_dir, helper_binary_path = _resolve_kvslot_helper_paths(repo_root)
+  File ""/home/cml/CloverInfer/src/core/resident_kv_store.py"", line 419, in _resolve_kvslot_helper_paths
+    raise FileNotFoundError(
+FileNotFoundError: UPMEM kvslot helper binary is missing. Searched: /home/cml/CloverInfer/src/pim/upmem_kvslot/build/host_kvslot. Build it with `make -C <repo>/src/pim/upmem_kvslot all` after installing the UPMEM toolchain, or set CLOVER_KVSLOT_HELPER. Auto-build attempts failed:
+/home/cml/CloverInfer/src/pim/upmem_kvslot: exit=2
+rm -rf build
+mkdir -p build
+dpu-upmem-dpurte-clang -O2 -DNR_TASKLETS=16 -DKVSLOT_MAX_HEADS=32 -DKVSLOT_MAX_BATCH_ITEMS=32 -DKVSLOT_MAX_CAPACITY=256 -DKVSLOT_QK_MAX_ACTIVE_DPUS=16  -I. -o build/dpu_kvslot dpu_kvslot.c
+ld.lld: error: section '.text' will not fit in region 'iram': overflowed by 552 bytes
+ld.lld: error: section '.text' will not fit in region 'iram': overflowed by 600 bytes
+ld.lld: error: section '.text' will not fit in region 'iram': overflowed by 656 bytes
+ld.lld: error: section '.text' will not fit in region 'iram': overflowed by 704 bytes
+ld.lld: error: section '.text' will not fit in region 'iram': overflowed by 1040 bytes
+ld.lld: error: section '.text' will not fit in region 'iram': overflowed by 1112 bytes
+ld.lld: error: section '.text' will not fit in region 'iram': overflowed by 552 bytes
+ld.lld: error: section '.text' will not fit in region 'iram': overflowed by 600 bytes
+ld.lld: error: section '.text' will not fit in region 'iram': overflowed by 656 bytes
+ld.lld: error: section '.text' will not fit in region 'iram': overflowed by 704 bytes
+ld.lld: error: section '.text' will not fit in region 'iram': overflowed by 1040 bytes
+ld.lld: error: section '.text' will not fit in region 'iram': overflowed by 1112 bytes
+clang-12: error: ld.lld command failed with exit code 1 (use -v to see invocation)
+make: *** [Makefile:59: build/dpu_kvslot] Error 1",,,disagg_pim_naive,,,opt-1.3b,opt-1-3b,,,,,,,,,,failed,
